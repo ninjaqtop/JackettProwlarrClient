@@ -300,9 +300,8 @@ class VideoExtractorEngine @Inject constructor() {
             // obfuscated/lazy-loaded video sources
             try {
                 val page = HeadlessBrowserHelper.createAntiDetectionPage()
-                page.navigate(pageUrl, com.microsoft.playwright.Page.NavigateOptions().setTimeout(20000.0))
-                page.waitForLoadState(com.microsoft.playwright.options.LoadState.DOMCONTENTLOADED,
-                    com.microsoft.playwright.Page.WaitForLoadStateOptions().setTimeout(15000.0))
+                page.navigate(pageUrl)
+                page.waitForLoadState()
 
                 // Execute each injection step from the AI plan
                 for (step in injectionPlan.steps) {

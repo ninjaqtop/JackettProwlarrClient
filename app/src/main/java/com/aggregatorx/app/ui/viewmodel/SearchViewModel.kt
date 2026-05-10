@@ -9,6 +9,7 @@ import com.aggregatorx.app.engine.media.DownloadState
 import com.aggregatorx.app.engine.media.VideoExtractorEngine
 import com.aggregatorx.app.engine.media.VideoExtractionResult
 import com.aggregatorx.app.engine.media.VideoStreamResolver
+import com.aggregatorx.app.engine.token.TokenManager
 import com.aggregatorx.app.engine.util.EngineUtils
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Job
@@ -30,7 +31,8 @@ class SearchViewModel @Inject constructor(
     private val repository: AggregatorRepository,
     private val videoExtractor: VideoExtractorEngine,
     private val videoStreamResolver: VideoStreamResolver,
-    private val downloadManager: DownloadManager
+    private val downloadManager: DownloadManager,
+    private val tokenManager: TokenManager
 ) : ViewModel() {
 
     private val _uiState = MutableStateFlow(SearchUiState())
@@ -55,9 +57,18 @@ class SearchViewModel @Inject constructor(
     val isDiscoveryPaused: StateFlow<Boolean> = _isDiscoveryPaused.asStateFlow()
 
     // ── Per-provider pagination state ───────────────────────────────────
-    // Maps provider ID → current page index (0-based)
     private val _providerPages = MutableStateFlow<Map<String, Int>>(emptyMap())
     val providerPages: StateFlow<Map<String, Int>> = _providerPages.asStateFlow()
+
+    // ── TOKENS tab: URLs discovered via token injection/replay ───────────
+    // Each entry is a SearchResult synthesised from a token-discovered URL.
+    private val _tokenResults = MutableStateFlow<List<SearchResult>>(emptyList())
+    val tokenResults: StateFlow<List<SearchResult>> = _tokenResults.asStateFlow()
+
+    // ── MY AI tab: preference-ranked results from liked history ──────────
+    // Populated after aggregation completes using the RankingEngine profile.
+    private val _myAiResults = MutableStateFlow<List<SearchResult>>(emptyList())
+    val myAiResults: StateFlow<List<SearchResult>> = _myAiResults.asStateFlow()
 
     // Video URL cache
     private val videoPreviewCache = java.util.concurrent.ConcurrentHashMap<String, VideoPreviewResult>()
@@ -230,6 +241,55 @@ class SearchViewModel @Inject constructor(
                 }
             
             _uiState.update { it.copy(isSearching = false, searchCompleted = true) }
+
+            // ── Post-search: token discovery pass ────────────────────────
+            // Run token harvesting against each active provider in background.
+            // Results surface in the TOKENS quick-tab.
+            launch {
+                val tokenFound = mutableListOf<SearchResult>()
+                results.filter { it.success }.forEach { providerResult ->
+                    try {
+                        val providerUrl = providerResult.provider.baseUrl
+                        val discovered = tokenManager.replayTokensForSearch(providerUrl, query)
+                        discovered.take(20).forEach { url ->
+                            tokenFound.add(
+                                SearchResult(
+                                    providerId    = providerResult.provider.id.toString(),
+                                    providerName  = providerResult.provider.name + " [TOKEN]",
+                                    title         = "Token-discovered: ${url.take(80)}",
+                                    url           = url,
+                                    relevanceScore = 75f
+                                )
+                            )
+                        }
+                    } catch (_: Exception) {}
+                }
+                if (tokenFound.isNotEmpty()) {
+                    _tokenResults.value = tokenFound.distinctBy { it.url }
+                }
+            }
+
+            // ── Post-search: MY AI preference ranking ────────────────────
+            // Score all results against the liked-URL preference profile and
+            // surface the top matches in the MY AI quick-tab.
+            launch {
+                val likedSet = _likedUrls.value
+                if (likedSet.isEmpty()) return@launch
+                val allResults = results.flatMap { it.results }
+                // Boost results whose source domain matches liked domains
+                val likedDomains = likedSet.mapNotNull { url ->
+                    try { java.net.URI(url).host } catch (_: Exception) { null }
+                }.toSet()
+                val aiRanked = allResults
+                    .map { r ->
+                        val domain = try { java.net.URI(r.url).host } catch (_: Exception) { "" }
+                        val boost  = if (domain in likedDomains) 30f else 0f
+                        r.copy(relevanceScore = r.relevanceScore + boost)
+                    }
+                    .sortedByDescending { it.relevanceScore }
+                    .take(50)
+                _myAiResults.value = aiRanked
+            }
         }
     }
     

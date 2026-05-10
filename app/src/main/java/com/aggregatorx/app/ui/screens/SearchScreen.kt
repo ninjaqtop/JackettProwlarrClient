@@ -9,6 +9,7 @@ import androidx.compose.foundation.*
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.lazy.*
 import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.foundation.BorderStroke
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.filled.*
 import androidx.compose.material.icons.outlined.*
@@ -52,6 +53,8 @@ fun SearchScreen(
     val likedUrls       by viewModel.likedUrls.collectAsState()
     val isPaused        by viewModel.isDiscoveryPaused.collectAsState()
     val providerPages   by viewModel.providerPages.collectAsState()
+    val tokenResults    by viewModel.tokenResults.collectAsState()
+    val myAiResults     by viewModel.myAiResults.collectAsState()
     val context         = LocalContext.current
     val listState       = rememberLazyListState()
     val scope           = rememberCoroutineScope()
@@ -142,27 +145,29 @@ fun SearchScreen(
 
                 providerResults.isNotEmpty() -> {
                     ResultsFeed(
-                        activeTab             = activeTab,
-                        providerResults       = providerResults,
-                        topResults            = uiState.aggregatedResults?.topResults ?: emptyList(),
-                        listState             = listState,
-                        likedUrls             = likedUrls,
-                        providerPages         = providerPages,
-                        onWatch               = { result -> viewModel.extractVideoUrl(result) },
-                        onDownload            = { result ->
+                        activeTab                = activeTab,
+                        providerResults          = providerResults,
+                        topResults               = uiState.aggregatedResults?.topResults ?: emptyList(),
+                        myAiResults              = myAiResults,
+                        tokenResults             = tokenResults,
+                        listState                = listState,
+                        likedUrls                = likedUrls,
+                        providerPages            = providerPages,
+                        onWatch                  = { result -> viewModel.extractVideoUrl(result) },
+                        onDownload               = { result ->
                             viewModel.downloadResult(result)
                             Toast.makeText(context, "Downloading: ${result.title}", Toast.LENGTH_SHORT).show()
                         },
-                        onBrowser             = { result ->
+                        onBrowser                = { result ->
                             context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(result.url)))
                         },
-                        onInApp               = { result -> viewModel.extractVideoUrl(result) },
-                        onLike                = { result -> viewModel.toggleLike(result) },
-                        onNextPage            = { id -> viewModel.nextProviderPage(id) },
-                        onPrevPage            = { id -> viewModel.prevProviderPage(id) },
-                        onRefreshProvider     = { id -> viewModel.refreshProvider(id) },
+                        onInApp                  = { result -> viewModel.extractVideoUrl(result) },
+                        onLike                   = { result -> viewModel.toggleLike(result) },
+                        onNextPage               = { id -> viewModel.nextProviderPage(id) },
+                        onPrevPage               = { id -> viewModel.prevProviderPage(id) },
+                        onRefreshProvider        = { id -> viewModel.refreshProvider(id) },
                         onExtractVideoForPreview = { url -> viewModel.extractVideoForPreview(url) },
-                        modifier              = Modifier.weight(1f)
+                        modifier                 = Modifier.weight(1f)
                     )
                 }
 
@@ -387,6 +392,8 @@ fun ResultsFeed(
     activeTab: String,
     providerResults: List<ProviderSearchResults>,
     topResults: List<SearchResult>,
+    myAiResults: List<SearchResult>,
+    tokenResults: List<SearchResult>,
     listState: LazyListState,
     likedUrls: Set<String>,
     providerPages: Map<String, Int>,
@@ -405,7 +412,7 @@ fun ResultsFeed(
     val successProviders = providerResults.filter { it.success && it.results.isNotEmpty() }
     val failedProviders  = providerResults.filter { !it.success }
 
-    // Filter results by active tab
+    // For provider-specific tabs, filter to that provider only
     val displayProviders = when (activeTab) {
         TAB_TOP, TAB_MY_AI, TAB_TOKENS -> successProviders
         else -> successProviders.filter { it.provider.id.toString() == activeTab }
@@ -417,46 +424,92 @@ fun ResultsFeed(
         contentPadding = PaddingValues(bottom = 16.dp),
         verticalArrangement = Arrangement.spacedBy(6.dp)
     ) {
-        // Top results section (shown for TOP / MY AI tabs)
-        if (activeTab == TAB_TOP || activeTab == TAB_MY_AI) {
-            if (topResults.isNotEmpty()) {
-                item(key = "top_header") {
-                    SectionHeader("🏆 TOP RESULTS", topResults.size)
-                }
-                items(topResults.take(10), key = { "top_${it.url.hashCode()}" }) { result ->
-                    ShieldedResultCard(
-                        result = result,
-                        isLiked = result.url in likedUrls,
-                        onWatch = { onWatch(result) },
-                        onDownload = { onDownload(result) },
-                        onBrowser = { onBrowser(result) },
-                        onInApp = { onInApp(result) },
-                        onLike = { onLike(result) },
-                        onExtractVideoForPreview = onExtractVideoForPreview
-                    )
-                }
-                item(key = "top_div") {
-                    HorizontalDivider(color = NeonGreen.copy(alpha = 0.15f),
-                        modifier = Modifier.padding(vertical = 8.dp))
-                }
-            }
-        }
-
-        // TOKENS tab — show token-bearing results
-        if (activeTab == TAB_TOKENS) {
-            val tokenResults = successProviders.flatMap { it.results }
-                .filter { r -> r.url.contains("token=", ignoreCase = true)
-                        || r.url.contains("key=", ignoreCase = true)
-                        || r.url.contains("auth=", ignoreCase = true) }
-            item(key = "tok_header") { SectionHeader("🔑 TOKEN RESULTS", tokenResults.size) }
-            items(tokenResults, key = { "tok_${it.url.hashCode()}" }) { result ->
+        // ── TOP tab ──────────────────────────────────────────────────────
+        if (activeTab == TAB_TOP && topResults.isNotEmpty()) {
+            item(key = "top_header") { SectionHeader("🏆 TOP RESULTS", topResults.size) }
+            items(topResults.take(10), key = { "top_${it.url.hashCode()}" }) { result ->
                 ShieldedResultCard(
                     result = result, isLiked = result.url in likedUrls,
                     onWatch = { onWatch(result) }, onDownload = { onDownload(result) },
                     onBrowser = { onBrowser(result) }, onInApp = { onInApp(result) },
-                    onLike = { onLike(result) },
-                    onExtractVideoForPreview = onExtractVideoForPreview
+                    onLike = { onLike(result) }, onExtractVideoForPreview = onExtractVideoForPreview
                 )
+            }
+            item(key = "top_div") {
+                HorizontalDivider(color = NeonGreen.copy(alpha = 0.15f),
+                    modifier = Modifier.padding(vertical = 8.dp))
+            }
+        }
+
+        // ── MY AI tab — preference-ranked results ─────────────────────────
+        if (activeTab == TAB_MY_AI) {
+            if (myAiResults.isNotEmpty()) {
+                item(key = "ai_header") { SectionHeader("🤖 MY AI — PREFERENCE RANKED", myAiResults.size) }
+                item(key = "ai_hint") {
+                    Text(
+                        "Results ranked by your liked content profile",
+                        color = TextTertiary, fontSize = 10.sp,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp)
+                    )
+                }
+                items(myAiResults, key = { "ai_${it.url.hashCode()}" }) { result ->
+                    ShieldedResultCard(
+                        result = result, isLiked = result.url in likedUrls,
+                        onWatch = { onWatch(result) }, onDownload = { onDownload(result) },
+                        onBrowser = { onBrowser(result) }, onInApp = { onInApp(result) },
+                        onLike = { onLike(result) }, onExtractVideoForPreview = onExtractVideoForPreview
+                    )
+                }
+            } else {
+                item(key = "ai_empty") {
+                    Column(
+                        modifier = Modifier.fillMaxWidth().padding(32.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Text("🤖", fontSize = 40.sp)
+                        Spacer(Modifier.height(12.dp))
+                        Text("No AI profile yet", color = TextSecondary, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                        Spacer(Modifier.height(6.dp))
+                        Text("Like results with ♥ to train your preference profile",
+                            color = TextTertiary, fontSize = 11.sp, textAlign = TextAlign.Center)
+                    }
+                }
+            }
+        }
+
+        // ── TOKENS tab — token-injection discovered results ───────────────
+        if (activeTab == TAB_TOKENS) {
+            if (tokenResults.isNotEmpty()) {
+                item(key = "tok_header") { SectionHeader("🔑 TOKEN-DISCOVERED RESULTS", tokenResults.size) }
+                item(key = "tok_hint") {
+                    Text(
+                        "Found via automated token injection, replay & mutation",
+                        color = TextTertiary, fontSize = 10.sp,
+                        modifier = Modifier.padding(horizontal = 16.dp, vertical = 2.dp)
+                    )
+                }
+                items(tokenResults, key = { "tok_${it.url.hashCode()}" }) { result ->
+                    ShieldedResultCard(
+                        result = result, isLiked = result.url in likedUrls,
+                        onWatch = { onWatch(result) }, onDownload = { onDownload(result) },
+                        onBrowser = { onBrowser(result) }, onInApp = { onInApp(result) },
+                        onLike = { onLike(result) }, onExtractVideoForPreview = onExtractVideoForPreview
+                    )
+                }
+            } else {
+                item(key = "tok_empty") {
+                    Column(
+                        modifier = Modifier.fillMaxWidth().padding(32.dp),
+                        horizontalAlignment = Alignment.CenterHorizontally
+                    ) {
+                        Text("🔑", fontSize = 40.sp)
+                        Spacer(Modifier.height(12.dp))
+                        Text("No token results yet", color = TextSecondary, fontSize = 14.sp, fontWeight = FontWeight.Bold)
+                        Spacer(Modifier.height(6.dp))
+                        Text("Token discovery runs automatically after each search",
+                            color = TextTertiary, fontSize = 11.sp, textAlign = TextAlign.Center)
+                    }
+                }
             }
         }
 
@@ -617,7 +670,7 @@ fun ShieldedResultCard(
                     )
                     Spacer(Modifier.height(3.dp))
                     Text(
-                        result.sourceTitle ?: result.url,
+                        result.providerName.ifEmpty { result.url },
                         color = TextTertiary, fontSize = 10.sp,
                         maxLines = 1, overflow = TextOverflow.Ellipsis
                     )
@@ -644,7 +697,7 @@ fun ShieldedResultCard(
             // Metadata row: duration, size, seeds
             val meta = buildList {
                 result.duration?.let { add("⏱ $it") }
-                result.fileSize?.let { add("💾 $it") }
+                result.size?.let { add("💾 $it") }
                 result.seeders?.let { if (it > 0) add("🌱 $it") }
             }
             if (meta.isNotEmpty()) {
@@ -733,22 +786,24 @@ fun ProviderResultsList(
     modifier: Modifier = Modifier
 ) {
     ResultsFeed(
-        activeTab             = TAB_TOP,
-        providerResults       = providerResults,
-        topResults            = topResults,
-        listState             = listState,
-        likedUrls             = likedUrls,
-        providerPages         = emptyMap(),
-        onWatch               = { onResultClick(it) },
-        onDownload            = { onDownload(it) },
-        onBrowser             = { onOpenExternal(it) },
-        onInApp               = { onResultClick(it) },
-        onLike                = { onLike(it) },
-        onNextPage            = {},
-        onPrevPage            = {},
-        onRefreshProvider     = {},
+        activeTab                = TAB_TOP,
+        providerResults          = providerResults,
+        topResults               = topResults,
+        myAiResults              = emptyList(),
+        tokenResults             = emptyList(),
+        listState                = listState,
+        likedUrls                = likedUrls,
+        providerPages            = emptyMap(),
+        onWatch                  = { onResultClick(it) },
+        onDownload               = { onDownload(it) },
+        onBrowser                = { onOpenExternal(it) },
+        onInApp                  = { onResultClick(it) },
+        onLike                   = { onLike(it) },
+        onNextPage               = {},
+        onPrevPage               = {},
+        onRefreshProvider        = {},
         onExtractVideoForPreview = onExtractVideoForPreview,
-        modifier              = modifier
+        modifier                 = modifier
     )
 }
 

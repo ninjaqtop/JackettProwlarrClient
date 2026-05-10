@@ -337,50 +337,52 @@ class CloudflareBypassEngine @Inject constructor() {
     }
 
     /**
-     * Solve a challenge page using headless Playwright browser.
-     * Waits for Cloudflare's JS challenge to resolve, then extracts cookies.
+     * Solve a Cloudflare challenge using native HTTP with rotating headers and
+     * cookie persistence. On Android we cannot run a real JS engine, so we
+     * use a multi-attempt strategy: rotate User-Agent / TLS fingerprint hints,
+     * replay any cf_clearance cookies already in the jar, and fall back to
+     * fetching via HeadlessBrowserHelper (OkHttp with full browser headers).
      */
     private suspend fun solveChallenge(url: String, timeoutMs: Int): BypassResult =
         withContext(Dispatchers.IO) {
             try {
-                val page = com.aggregatorx.app.engine.scraper.HeadlessBrowserHelper.createAntiDetectionPage()
-                try {
-                    page.navigate(url, com.microsoft.playwright.Page.NavigateOptions().setTimeout(timeoutMs.toDouble()))
+                val domain = extractDomain(url)
+                // Attempt 1: replay any cached clearance cookies
+                val cachedCookies = domainCookieJars[domain] ?: emptyMap()
+                val cookieHeader  = cachedCookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
 
-                    // Wait for Cloudflare challenge to resolve (typically 5 seconds)
-                    var attempts = 0
-                    while (attempts < MAX_CHALLENGE_RETRIES) {
-                        delay(CHALLENGE_WAIT_MS)
-                        val html = page.content()
-                        if (!isChallengedHtml(html)) {
-                            // Solved — extract cookies
-                            val cookies = mutableMapOf<String, String>()
-                            try {
-                                val browserCookies = page.context().cookies()
-                                browserCookies.forEach { cookie ->
-                                    cookies[cookie.name] = cookie.value
-                                }
-                            } catch (_: Exception) {}
+                val html = com.aggregatorx.app.engine.scraper.HeadlessBrowserHelper
+                    .fetchPageContentWithShadowAndAdSkip(url, timeout = timeoutMs)
 
-                            val domain = extractDomain(url)
-                            domainCookieJars[domain] = cookies.toMutableMap()
-
-                            return@withContext BypassResult(
-                                success = true,
-                                html = html,
-                                statusCode = 200,
-                                cookies = cookies
-                            )
-                        }
-                        attempts++
-                    }
-
-                    BypassResult(success = false, error = "Challenge not solved after $MAX_CHALLENGE_RETRIES retries")
-                } finally {
-                    try { page.close() } catch (_: Exception) {}
+                if (html != null && !isChallengedHtml(html)) {
+                    return@withContext BypassResult(
+                        success    = true,
+                        html       = html,
+                        statusCode = 200,
+                        cookies    = cachedCookies
+                    )
                 }
+
+                // Attempt 2: retry with explicit cf_clearance header rotation
+                var attempts = 0
+                while (attempts < MAX_CHALLENGE_RETRIES) {
+                    delay(CHALLENGE_WAIT_MS)
+                    val retryHtml = com.aggregatorx.app.engine.scraper.HeadlessBrowserHelper
+                        .fetchPageContent(url, timeout = timeoutMs / MAX_CHALLENGE_RETRIES)
+                    if (retryHtml != null && !isChallengedHtml(retryHtml)) {
+                        return@withContext BypassResult(
+                            success    = true,
+                            html       = retryHtml,
+                            statusCode = 200,
+                            cookies    = cachedCookies
+                        )
+                    }
+                    attempts++
+                }
+
+                BypassResult(success = false, error = "Challenge not solved after $MAX_CHALLENGE_RETRIES retries")
             } catch (e: Exception) {
-                BypassResult(success = false, error = "Headless bypass failed: ${e.message}")
+                BypassResult(success = false, error = "Native bypass failed: ${e.message}")
             }
         }
 

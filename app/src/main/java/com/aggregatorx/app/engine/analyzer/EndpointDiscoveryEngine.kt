@@ -273,64 +273,55 @@ class EndpointDiscoveryEngine @Inject constructor(
         baseUrl: String,
         sampleQuery: String = "test"
     ): List<String> = withContext(Dispatchers.IO) {
+        // Native implementation: use HeadlessBrowserHelper's API endpoint prober
+        // plus form-based search submission to surface XHR/fetch endpoints from
+        // the page source (script tags, data attributes, inline JSON).
         val discovered = mutableListOf<String>()
         try {
-            val page = HeadlessBrowserHelper.createAntiDetectionPage()
-            val capturedUrls = mutableListOf<String>()
+            // 1. Probe known API path patterns
+            val apiEndpoints = HeadlessBrowserHelper.discoverSearchAPIEndpoints(baseUrl, sampleQuery)
+            discovered.addAll(apiEndpoints)
 
-            // Intercept all outgoing requests
-            page.onRequest { request ->
-                val reqUrl = request.url()
-                val resourceType = request.resourceType()
-                if (resourceType in listOf("xhr", "fetch") ||
-                    reqUrl.contains("/api/") ||
-                    reqUrl.contains("/ajax/") ||
-                    reqUrl.contains("/graphql") ||
-                    reqUrl.contains("search") ||
-                    reqUrl.contains(".json")) {
-                    capturedUrls.add(reqUrl)
+            // 2. Fetch page source and extract endpoint hints from JS bundles
+            val html = HeadlessBrowserHelper.fetchPageContent(baseUrl) ?: ""
+            val endpointPatterns = listOf(
+                Regex("""['"/](api/[^'">\s]+)['"]"""),
+                Regex("""['"/](ajax/[^'">\s]+)['"]"""),
+                Regex("""['"/](graphql[^'">\s]*)['"]"""),
+                Regex("""fetch\(['"]([^'"]+)['"]"""),
+                Regex("""axios\.[a-z]+\(['"]([^'"]+)['"]"""),
+                Regex("""XMLHttpRequest[^;]+open\([^,]+,\s*['"]([^'"]+)['"]"""),
+                Regex("""url:\s*['"]([^'"]*(?:search|api|query|ajax)[^'"]*)['"]""", RegexOption.IGNORE_CASE)
+            )
+            val host = extractDomain(baseUrl)
+            for (pattern in endpointPatterns) {
+                pattern.findAll(html).forEach { m ->
+                    val path = m.groupValues[1]
+                    val full = when {
+                        path.startsWith("http") -> path
+                        path.startsWith("/")    -> "https://$host$path"
+                        else                    -> "https://$host/$path"
+                    }
+                    if (!full.contains("analytics") && !full.contains("tracking") &&
+                        !full.contains("pixel") && !full.contains(".css") &&
+                        !full.contains(".png") && !full.contains(".jpg")) {
+                        discovered.add(full)
+                    }
                 }
             }
 
-            // Navigate and let JS execute
-            page.navigate(baseUrl, com.microsoft.playwright.Page.NavigateOptions().setTimeout(DISCOVERY_TIMEOUT.toDouble()))
-            page.waitForLoadState(com.microsoft.playwright.options.LoadState.NETWORKIDLE,
-                com.microsoft.playwright.Page.WaitForLoadStateOptions().setTimeout(DISCOVERY_TIMEOUT.toDouble()))
-
-            // Try typing into search input if one exists
-            try {
-                val searchInputSelectors = listOf(
-                    "input[type='search']", "input[name='q']", "input[name='query']",
-                    "input[name='search']", "input[placeholder*='search' i]",
-                    "input[placeholder*='Search' i]", "#search", ".search-input"
-                )
-                for (sel in searchInputSelectors) {
-                    val el = page.querySelector(sel)
-                    if (el != null && el.isVisible) {
-                        el.fill(sampleQuery)
-                        Thread.sleep(500) // wait for autosuggest/AJAX
-                        // Try pressing Enter
-                        try { el.press("Enter") } catch (_: Exception) {}
-                        Thread.sleep(1500) // wait for results AJAX
-                        break
-                    }
+            // 3. Submit search form and capture the resulting URL
+            val formResult = HeadlessBrowserHelper.searchViaHeadlessForm(baseUrl, sampleQuery)
+            if (formResult != null && formResult != html) {
+                // The form action URL is a valid search endpoint — extract it
+                val doc = org.jsoup.Jsoup.parse(html, baseUrl)
+                doc.select("form").forEach { form ->
+                    val action = form.absUrl("action").ifEmpty { baseUrl }
+                    if (action.isNotEmpty()) discovered.add(action)
                 }
-            } catch (_: Exception) {}
-
-            page.close()
-
-            // Deduplicate and filter noise
-            discovered.addAll(
-                capturedUrls.distinct().filter { url ->
-                    !url.contains("analytics") && !url.contains("tracking") &&
-                    !url.contains("pixel") && !url.contains("ads.") &&
-                    !url.contains("doubleclick") && !url.contains("googlesyndication") &&
-                    !url.contains("favicon") && !url.contains(".css") &&
-                    !url.contains(".png") && !url.contains(".jpg")
-                }
-            )
+            }
         } catch (_: Exception) {}
-        discovered
+        discovered.distinct()
     }
 
     /**
