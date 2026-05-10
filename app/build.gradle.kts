@@ -11,12 +11,15 @@ android {
     namespace = "com.aggregatorx.shielded"
     compileSdk = 35
 
-    defaultConfig {
+        defaultConfig {
         applicationId = "com.aggregatorx.shielded"
         minSdk = 26
         targetSdk = 35
         versionCode = 1
         versionName = "1.0.0"
+
+        // This is the specific fix for the mergeLibDex error
+        multiDexEnabled = true
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
