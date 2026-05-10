@@ -7,6 +7,7 @@ import androidx.activity.enableEdgeToEdge
 import androidx.compose.animation.*
 import androidx.compose.animation.core.*
 import androidx.compose.foundation.background
+import androidx.compose.foundation.border
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.*
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -23,7 +24,10 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.hilt.navigation.compose.hiltViewModel
 import androidx.navigation.NavDestination.Companion.hierarchy
 import androidx.navigation.NavGraph.Companion.findStartDestination
 import androidx.navigation.compose.NavHost
@@ -32,6 +36,7 @@ import androidx.navigation.compose.currentBackStackEntryAsState
 import androidx.navigation.compose.rememberNavController
 import com.aggregatorx.app.ui.screens.*
 import com.aggregatorx.app.ui.theme.*
+import com.aggregatorx.app.ui.viewmodel.SearchViewModel
 import dagger.hilt.android.AndroidEntryPoint
 
 @AndroidEntryPoint
@@ -53,40 +58,33 @@ sealed class Screen(
     val selectedIcon: ImageVector,
     val unselectedIcon: ImageVector
 ) {
-    object Search : Screen(
-        "search",
-        "Search",
-        Icons.Filled.Search,
-        Icons.Outlined.Search
-    )
-    object Providers : Screen(
-        "providers",
-        "Providers",
-        Icons.Filled.Dns,
-        Icons.Outlined.Dns
-    )
-    object Settings : Screen(
-        "settings",
-        "Settings",
-        Icons.Filled.Settings,
-        Icons.Outlined.Settings
-    )
+    object Search : Screen("search", "SEARCH", Icons.Filled.Search, Icons.Outlined.Search)
+    object Providers : Screen("providers", "PROVIDERS", Icons.Filled.Dns, Icons.Outlined.Dns)
+    object Settings : Screen("settings", "SETTINGS", Icons.Filled.Settings, Icons.Outlined.Settings)
 }
 
+@OptIn(ExperimentalMaterial3Api::class)
 @Composable
 fun MainScreen() {
     val navController = rememberNavController()
     val navBackStackEntry by navController.currentBackStackEntryAsState()
     val currentDestination = navBackStackEntry?.destination
-    
-    val screens = listOf(
-        Screen.Search,
-        Screen.Providers,
-        Screen.Settings
-    )
-    
+
+    // Shared SearchViewModel so TopAppBar controls reach the same instance as SearchScreen
+    val searchViewModel: SearchViewModel = hiltViewModel()
+    val isDiscoveryPaused by searchViewModel.isDiscoveryPaused.collectAsState()
+
+    val screens = listOf(Screen.Search, Screen.Providers, Screen.Settings)
+
     Scaffold(
         containerColor = DarkBackground,
+        topBar = {
+            MissionControlTopBar(
+                isPaused = isDiscoveryPaused,
+                onPanicRefresh = { searchViewModel.panicRefresh() },
+                onTogglePause = { searchViewModel.toggleDiscoveryPause() }
+            )
+        },
         bottomBar = {
             FuturisticBottomBar(
                 screens = screens,
@@ -110,51 +108,136 @@ fun MainScreen() {
         ) {
             composable(
                 Screen.Search.route,
-                enterTransition = {
-                    fadeIn(animationSpec = tween(300)) + 
-                    slideInHorizontally(initialOffsetX = { -it / 4 })
-                },
-                exitTransition = {
-                    fadeOut(animationSpec = tween(300)) +
-                    slideOutHorizontally(targetOffsetX = { -it / 4 })
-                }
+                enterTransition = { fadeIn(tween(250)) + slideInHorizontally { -it / 4 } },
+                exitTransition  = { fadeOut(tween(250)) + slideOutHorizontally { -it / 4 } }
             ) {
-                SearchScreen()
+                SearchScreen(viewModel = searchViewModel)
             }
-            
             composable(
                 Screen.Providers.route,
-                enterTransition = {
-                    fadeIn(animationSpec = tween(300)) +
-                    slideInHorizontally(initialOffsetX = { 
-                        if (currentDestination?.route == Screen.Search.route) it / 4 else -it / 4 
-                    })
-                },
-                exitTransition = {
-                    fadeOut(animationSpec = tween(300)) +
-                    slideOutHorizontally(targetOffsetX = { 
-                        if (currentDestination?.route == Screen.Settings.route) -it / 4 else it / 4 
-                    })
-                }
+                enterTransition = { fadeIn(tween(250)) + slideInHorizontally { it / 4 } },
+                exitTransition  = { fadeOut(tween(250)) + slideOutHorizontally { it / 4 } }
             ) {
                 ProvidersScreen()
             }
-            
             composable(
                 Screen.Settings.route,
-                enterTransition = {
-                    fadeIn(animationSpec = tween(300)) +
-                    slideInHorizontally(initialOffsetX = { it / 4 })
-                },
-                exitTransition = {
-                    fadeOut(animationSpec = tween(300)) +
-                    slideOutHorizontally(targetOffsetX = { it / 4 })
-                }
+                enterTransition = { fadeIn(tween(250)) + slideInHorizontally { it / 4 } },
+                exitTransition  = { fadeOut(tween(250)) + slideOutHorizontally { it / 4 } }
             ) {
                 SettingsScreen()
             }
         }
     }
+}
+
+// ── MISSION CONTROL TOP BAR ─────────────────────────────────────────────────
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun MissionControlTopBar(
+    isPaused: Boolean,
+    onPanicRefresh: () -> Unit,
+    onTogglePause: () -> Unit
+) {
+    // Pulsing glow animation for the neon border
+    val infiniteTransition = rememberInfiniteTransition(label = "topbar_glow")
+    val glowAlpha by infiniteTransition.animateFloat(
+        initialValue = 0.4f,
+        targetValue  = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(900, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "glow_alpha"
+    )
+
+    TopAppBar(
+        modifier = Modifier
+            .fillMaxWidth()
+            .drawBehind {
+                // Neon green bottom border line
+                drawLine(
+                    color = NeonGreen.copy(alpha = glowAlpha),
+                    start = androidx.compose.ui.geometry.Offset(0f, size.height),
+                    end   = androidx.compose.ui.geometry.Offset(size.width, size.height),
+                    strokeWidth = 2.dp.toPx()
+                )
+            },
+        colors = TopAppBarDefaults.topAppBarColors(
+            containerColor = DarkBackground,
+            titleContentColor = NeonGreen
+        ),
+        title = {
+            Text(
+                text = "AGGREGATORX",
+                color = NeonGreen,
+                fontWeight = FontWeight.Black,
+                fontSize = 15.sp,
+                letterSpacing = 3.sp
+            )
+        },
+        actions = {
+            // ── PAUSE BUILD button ──────────────────────────────────────
+            val pauseColor = if (isPaused) AccentOrange else NeonGreen
+            val pauseIcon  = if (isPaused) Icons.Filled.PlayArrow else Icons.Filled.Pause
+            val pauseLabel = if (isPaused) "▶ PLAY" else "⏸ PAUSE"
+
+            TextButton(
+                onClick = onTogglePause,
+                modifier = Modifier
+                    .padding(end = 4.dp)
+                    .border(
+                        width = 1.dp,
+                        color = pauseColor.copy(alpha = 0.7f),
+                        shape = RoundedCornerShape(6.dp)
+                    )
+                    .clip(RoundedCornerShape(6.dp))
+            ) {
+                Icon(
+                    imageVector = pauseIcon,
+                    contentDescription = pauseLabel,
+                    tint = pauseColor,
+                    modifier = Modifier.size(14.dp)
+                )
+                Spacer(Modifier.width(4.dp))
+                Text(
+                    text = pauseLabel,
+                    color = pauseColor,
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 1.sp
+                )
+            }
+
+            // ── PANIC REFRESH button ────────────────────────────────────
+            TextButton(
+                onClick = onPanicRefresh,
+                modifier = Modifier
+                    .padding(end = 8.dp)
+                    .border(
+                        width = 1.dp,
+                        color = AccentRed.copy(alpha = 0.7f),
+                        shape = RoundedCornerShape(6.dp)
+                    )
+                    .clip(RoundedCornerShape(6.dp))
+            ) {
+                Icon(
+                    imageVector = Icons.Filled.Refresh,
+                    contentDescription = "Panic Refresh",
+                    tint = AccentRed,
+                    modifier = Modifier.size(14.dp)
+                )
+                Spacer(Modifier.width(4.dp))
+                Text(
+                    text = "🔄 PANIC",
+                    color = AccentRed,
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 1.sp
+                )
+            }
+        }
+    )
 }
 
 @Composable

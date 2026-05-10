@@ -50,11 +50,7 @@ fun SettingsScreen(viewModel: SettingsViewModel = hiltViewModel()) {
     Box(
         modifier = Modifier
             .fillMaxSize()
-            .background(
-                brush = Brush.verticalGradient(
-                    colors = listOf(DarkBackground, DarkSurface)
-                )
-            )
+            .background(DarkBackground)
     ) {
         LazyColumn(
             modifier = Modifier
@@ -81,7 +77,7 @@ fun SettingsScreen(viewModel: SettingsViewModel = hiltViewModel()) {
                                 .border(
                                     width = 1.dp,
                                     brush = Brush.horizontalGradient(
-                                        colors = listOf(CyberCyan.copy(alpha = 0.3f), CyberBlue.copy(alpha = 0.3f))
+                                        colors = listOf(NeonGreen.copy(alpha = 0.5f), NeonGreenDim.copy(alpha = 0.3f))
                                     ),
                                     shape = RoundedCornerShape(12.dp)
                                 )
@@ -231,50 +227,38 @@ fun SettingsScreen(viewModel: SettingsViewModel = hiltViewModel()) {
                 }
             }
             
-            // Analysis Features Info
+            // Advanced Site Analyzer capabilities
             item {
                 SettingsCard(
                     title = "Advanced Site Analyzer",
-                    subtitle = "What our analyzer detects",
+                    subtitle = "Full-spectrum offensive analysis engine",
                     icon = Icons.Default.BugReport
                 ) {
-                    Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
-                        AnalysisFeatureRow(
-                            icon = Icons.Default.Security,
-                            title = "Security Analysis",
-                            description = "SSL, CSP, HSTS, X-Frame-Options, Cookie flags",
-                            color = AccentGreen
-                        )
-                        AnalysisFeatureRow(
-                            icon = Icons.Default.AccountTree,
-                            title = "DOM Structure",
-                            description = "Element count, depth, forms, links, scripts",
-                            color = CyberCyan
-                        )
-                        AnalysisFeatureRow(
-                            icon = Icons.Default.Pattern,
-                            title = "Pattern Detection",
-                            description = "Search forms, result lists, pagination, video players",
-                            color = CyberBlue
-                        )
-                        AnalysisFeatureRow(
-                            icon = Icons.Default.VideoLibrary,
-                            title = "Media Detection",
-                            description = "Video players, streaming protocols, thumbnails",
-                            color = CyberPurple
-                        )
-                        AnalysisFeatureRow(
-                            icon = Icons.Default.Api,
-                            title = "API Detection",
-                            description = "REST, GraphQL endpoints, JSON feeds",
-                            color = AccentYellow
-                        )
-                        AnalysisFeatureRow(
-                            icon = Icons.Default.Speed,
-                            title = "Performance Metrics",
-                            description = "Load time, resource count, page size",
-                            color = AccentOrange
-                        )
+                    Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                        AnalysisFeatureRow(Icons.Default.Security, "Security Analysis",
+                            "SSL/TLS grade, CSP bypass vectors, HSTS, X-Frame-Options, SameSite cookie flags, CORS misconfig", AccentGreen)
+                        AnalysisFeatureRow(Icons.Default.AccountTree, "DOM Structure",
+                            "Element count, shadow DOM, iframe depth, form fields, hidden inputs, script sources", NeonGreen)
+                        AnalysisFeatureRow(Icons.Default.Pattern, "Pattern Detection",
+                            "Search forms, result lists, pagination, video players, lazy-load triggers, infinite scroll", NeonGreenDim)
+                        AnalysisFeatureRow(Icons.Default.VideoLibrary, "Media Detection",
+                            "HLS/DASH/MP4 streams, embedded players, CDN origins, DRM type, thumbnail URLs", CyberPurple)
+                        AnalysisFeatureRow(Icons.Default.Api, "API & Endpoint Discovery",
+                            "REST, GraphQL, JSON feeds, WebSocket endpoints, hidden API routes, versioned paths", AccentYellow)
+                        AnalysisFeatureRow(Icons.Default.Speed, "Performance Metrics",
+                            "TTFB, resource count, page weight, render-blocking assets, CDN detection", AccentOrange)
+                        AnalysisFeatureRow(Icons.Default.VpnKey, "Token & Auth Harvesting",
+                            "Bearer tokens, API keys, CSRF tokens, session IDs, Base64/Base44 blobs in JS bundles", AccentRed)
+                        AnalysisFeatureRow(Icons.Default.Shield, "WAF Fingerprinting",
+                            "Cloudflare, Akamai, Imperva, Sucuri detection — bypass strategy auto-selected", NeonGreen)
+                        AnalysisFeatureRow(Icons.Default.Code, "JS Bundle Analysis",
+                            "Webpack chunk extraction, obfuscated endpoint recovery, source-map parsing", NeonGreenDim)
+                        AnalysisFeatureRow(Icons.Default.NetworkCheck, "Network Topology",
+                            "IP geolocation, ASN, CDN provider, reverse proxy detection, DNS record enumeration", CyberPurple)
+                        AnalysisFeatureRow(Icons.Default.Fingerprint, "Browser Fingerprint Evasion",
+                            "Canvas noise, WebGL spoof, navigator override, TLS JA3 randomisation", AccentYellow)
+                        AnalysisFeatureRow(Icons.Default.Visibility, "OCR Vision Scan",
+                            "ML Kit OCR on thumbnails — extracts hidden text, watermarks, quality labels", AccentGreen)
                     }
                 }
             }
@@ -283,12 +267,12 @@ fun SettingsScreen(viewModel: SettingsViewModel = hiltViewModel()) {
             item {
                 SettingsCard(
                     title = "About AggregatorX",
-                    subtitle = "Version 1.0.0",
+                    subtitle = "Version 1.0.0 — Shielded Build",
                     icon = Icons.Default.Info
                 ) {
                     Column {
                         Text(
-                            text = "AggregatorX is a powerful multi-provider search aggregator with advanced site analysis capabilities.",
+                            text = "AggregatorX Shielded — unrestricted multi-provider search aggregator with full-spectrum offensive site analysis, token harvesting, ML Kit vision, and WAF bypass.",
                             style = MaterialTheme.typography.bodySmall,
                             color = TextSecondary
                         )

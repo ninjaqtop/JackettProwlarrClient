@@ -11,46 +11,46 @@ import androidx.compose.ui.platform.LocalView
 import androidx.core.view.WindowCompat
 
 /**
- * AggregatorX - DARK NEON GREEN THEME
- * Deep dark green-black backgrounds with darker neon green accents
+ * AggregatorX Shielded — Mission Control Theme
+ * Pure #000000 black backgrounds, #00FF41 neon green accents.
  */
-private val DarkNeonGreenColorScheme = darkColorScheme(
-    primary = CyberCyan, // Darker neon green
-    onPrimary = DarkBackground,
-    primaryContainer = CyberCyanDark,
-    onPrimaryContainer = TextPrimary,
-    secondary = CyberBlue, // Bright mint green
-    onSecondary = DarkBackground,
-    secondaryContainer = CyberBlueDark,
+private val MissionControlColorScheme = darkColorScheme(
+    primary             = NeonGreen,
+    onPrimary           = DarkBackground,
+    primaryContainer    = NeonGreenDark,
+    onPrimaryContainer  = TextPrimary,
+    secondary           = NeonGreenDim,
+    onSecondary         = DarkBackground,
+    secondaryContainer  = Color(0xFF003D10),
     onSecondaryContainer = TextPrimary,
-    tertiary = CyberPurple, // Lime highlight
-    onTertiary = DarkBackground,
-    tertiaryContainer = CyberPurple.copy(alpha = 0.3f),
+    tertiary            = CyberPurple,
+    onTertiary          = DarkBackground,
+    tertiaryContainer   = CyberPurple.copy(alpha = 0.2f),
     onTertiaryContainer = TextPrimary,
-    error = AccentRed,
-    onError = TextPrimary,
-    errorContainer = AccentRed.copy(alpha = 0.2f),
-    onErrorContainer = AccentRed,
-    background = DarkBackground, // Near-black with green tint
-    onBackground = TextPrimary,
-    surface = DarkSurface, // Very dark green-black
-    onSurface = TextPrimary,
-    surfaceVariant = DarkSurfaceVariant,
-    onSurfaceVariant = TextSecondary,
-    outline = TextTertiary,
-    outlineVariant = DarkCardHover,
-    inverseSurface = TextPrimary,
-    inverseOnSurface = DarkBackground,
-    inversePrimary = CyberCyanDark,
-    surfaceTint = CyberCyan.copy(alpha = 0.12f) // Neon green tint
+    error               = AccentRed,
+    onError             = TextPrimary,
+    errorContainer      = AccentRed.copy(alpha = 0.2f),
+    onErrorContainer    = AccentRed,
+    background          = DarkBackground,       // pure #000000
+    onBackground        = TextPrimary,
+    surface             = DarkSurface,          // #050505
+    onSurface           = TextPrimary,
+    surfaceVariant      = DarkSurfaceVariant,
+    onSurfaceVariant    = TextSecondary,
+    outline             = NeonGreen.copy(alpha = 0.4f),
+    outlineVariant      = DarkCardHover,
+    inverseSurface      = TextPrimary,
+    inverseOnSurface    = DarkBackground,
+    inversePrimary      = NeonGreenDark,
+    surfaceTint         = NeonGreen.copy(alpha = 0.08f)
 )
 
 @Composable
 fun AggregatorXTheme(
-    darkTheme: Boolean = true, // Always dark - neon green theme
+    darkTheme: Boolean = true, // always dark — mission control
     content: @Composable () -> Unit
 ) {
-    val colorScheme = DarkNeonGreenColorScheme
+    val colorScheme = MissionControlColorScheme
     
     val view = LocalView.current
     if (!view.isInEditMode) {

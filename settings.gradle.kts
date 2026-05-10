@@ -13,5 +13,5 @@ dependencyResolutionManagement {
     }
 }
 
-rootProject.name = "AggregatorX"
+rootProject.name = "AggregatorXShielded"
 include(":app")

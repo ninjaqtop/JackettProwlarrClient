@@ -8,15 +8,15 @@ plugins {
 }
 
 android {
-    namespace = "com.aggregatorx.app"
+    namespace = "com.aggregatorx.shielded"
     compileSdk = 35
 
     defaultConfig {
-        applicationId = "com.aggregatorx.app"
+        applicationId = "com.aggregatorx.shielded"
         minSdk = 26
         targetSdk = 35
-        versionCode = 7
-        versionName = "4.3.0"
+        versionCode = 1
+        versionName = "1.0.0"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
         vectorDrawables {
@@ -56,6 +56,8 @@ android {
     packaging {
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
+            excludes += "META-INF/INDEX.LIST"
+            excludes += "META-INF/io.netty.versions.properties"
         }
     }
 }
@@ -66,9 +68,6 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.9.0")
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.9.0")
     implementation("androidx.activity:activity-compose:1.10.1")
-
-    // Headless browser for advanced scraping (Playwright)
-    implementation("com.microsoft.playwright:playwright:1.50.0")
 
     // Compose BOM
     implementation(platform("androidx.compose:compose-bom:2025.02.00"))
@@ -126,8 +125,9 @@ dependencies {
     // Accompanist
     implementation("com.google.accompanist:accompanist-systemuicontroller:0.36.0")
     implementation("com.google.accompanist:accompanist-swiperefresh:0.36.0")
-    implementation("com.google.accompanist:accompanist-pager:0.36.0")
-    implementation("com.google.accompanist:accompanist-pager-indicators:0.36.0")
+
+    // ML Kit OCR — Vision Engine for thumbnail keyword extraction
+    implementation("com.google.mlkit:text-recognition:16.0.1")
     
     // ExoPlayer / Media3 for video playback
     implementation("androidx.media3:media3-exoplayer:1.5.1")

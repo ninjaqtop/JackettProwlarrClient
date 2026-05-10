@@ -11,6 +11,7 @@ import com.aggregatorx.app.engine.media.VideoExtractionResult
 import com.aggregatorx.app.engine.media.VideoStreamResolver
 import com.aggregatorx.app.engine.util.EngineUtils
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.Job
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import javax.inject.Inject
@@ -31,39 +32,117 @@ class SearchViewModel @Inject constructor(
     private val videoStreamResolver: VideoStreamResolver,
     private val downloadManager: DownloadManager
 ) : ViewModel() {
-    
+
     private val _uiState = MutableStateFlow(SearchUiState())
     val uiState: StateFlow<SearchUiState> = _uiState.asStateFlow()
-    
+
     private val _providerResults = MutableStateFlow<List<ProviderSearchResults>>(emptyList())
     val providerResults: StateFlow<List<ProviderSearchResults>> = _providerResults.asStateFlow()
-    
+
     private val _videoExtractionState = MutableStateFlow<VideoExtractionState>(VideoExtractionState.Idle)
     val videoExtractionState: StateFlow<VideoExtractionState> = _videoExtractionState.asStateFlow()
-    
+
     val downloads: StateFlow<Map<String, DownloadState>> = downloadManager.downloads
 
     // ── Liked-result state ──────────────────────────────────────────────
     private val _likedUrls = MutableStateFlow<Set<String>>(emptySet())
     val likedUrls: StateFlow<Set<String>> = _likedUrls.asStateFlow()
-    
-    // Video URL cache for faster repeated preview loads (caches full result with headers)
+
+    // ── MISSION CONTROL: Discovery pause flag ───────────────────────────
+    // When true, all Pass-1 and Pass-2 background coroutines are suspended.
+    // The results feed stays static and scrollable; no new data is injected.
+    private val _isDiscoveryPaused = MutableStateFlow(false)
+    val isDiscoveryPaused: StateFlow<Boolean> = _isDiscoveryPaused.asStateFlow()
+
+    // ── Per-provider pagination state ───────────────────────────────────
+    // Maps provider ID → current page index (0-based)
+    private val _providerPages = MutableStateFlow<Map<String, Int>>(emptyMap())
+    val providerPages: StateFlow<Map<String, Int>> = _providerPages.asStateFlow()
+
+    // Video URL cache
     private val videoPreviewCache = java.util.concurrent.ConcurrentHashMap<String, VideoPreviewResult>()
-    
-    // Current search job - cancel when new search starts
-    private var currentSearchJob: kotlinx.coroutines.Job? = null
-    
+
+    // Active search job — cancelled on new search or panic refresh
+    private var currentSearchJob: Job? = null
+
     init {
-        // Load recent searches
         viewModelScope.launch {
             repository.getRecentSearches().collect { searches ->
                 _uiState.update { it.copy(recentSearches = searches) }
             }
         }
-        // Pre-load liked URLs so the UI can render heart icons immediately
         viewModelScope.launch {
             _likedUrls.value = repository.getAllLikedUrls()
         }
+    }
+
+    // ── PANIC REFRESH ───────────────────────────────────────────────────
+    // Clears ViewModel cache, requests GC, and hard-restarts the discovery
+    // loop for the current query. Fixes lag / thermal spikes on long shifts.
+    fun panicRefresh() {
+        currentSearchJob?.cancel()
+        videoPreviewCache.clear()
+        _providerResults.value = emptyList()
+        _providerPages.value = emptyMap()
+        _uiState.update {
+            it.copy(
+                isSearching = false,
+                searchCompleted = false,
+                totalResults = 0,
+                successfulProviders = 0,
+                failedProviders = 0,
+                aggregatedResults = null,
+                error = null
+            )
+        }
+        @Suppress("ExplicitGarbageCollectionCall")
+        System.gc()
+        // Re-launch discovery if a query is active
+        val query = _uiState.value.currentSearchQuery
+        if (query.isNotEmpty()) {
+            _uiState.update { it.copy(query = query) }
+            search()
+        }
+    }
+
+    // ── PAUSE / RESUME DISCOVERY ────────────────────────────────────────
+    // Toggles the pause flag. When paused, the active search job is
+    // cancelled so no new data is injected. Resuming re-launches the search.
+    fun toggleDiscoveryPause() {
+        val nowPaused = !_isDiscoveryPaused.value
+        _isDiscoveryPaused.value = nowPaused
+        if (nowPaused) {
+            // Suspend all background coroutines immediately
+            currentSearchJob?.cancel()
+            currentSearchJob = null
+            _uiState.update { it.copy(isSearching = false) }
+        } else {
+            // Resume — re-launch discovery from current query
+            val query = _uiState.value.currentSearchQuery
+            if (query.isNotEmpty()) {
+                _uiState.update { it.copy(query = query) }
+                search()
+            }
+        }
+    }
+
+    // ── Per-provider pagination ─────────────────────────────────────────
+    fun nextProviderPage(providerId: String) {
+        _providerPages.update { pages ->
+            val current = pages[providerId] ?: 0
+            pages + (providerId to current + 1)
+        }
+    }
+
+    fun prevProviderPage(providerId: String) {
+        _providerPages.update { pages ->
+            val current = pages[providerId] ?: 0
+            if (current > 0) pages + (providerId to current - 1) else pages
+        }
+    }
+
+    fun refreshProvider(providerId: String) {
+        _providerPages.update { pages -> pages + (providerId to 0) }
     }
 
     /** Toggle like on a search result. Updates local set immediately for snappy UI. */
@@ -83,15 +162,15 @@ class SearchViewModel @Inject constructor(
     fun search() {
         val query = _uiState.value.query.trim()
         if (query.isEmpty()) return
-        
-        // Cancel any previous search to prevent stale results
+        // Do not start a new search while discovery is paused
+        if (_isDiscoveryPaused.value) return
+
         currentSearchJob?.cancel()
-        
+
         currentSearchJob = viewModelScope.launch {
-            // ALWAYS clear cache for each search to ensure fresh results
-            // This prevents stale results from being shown for different queries
             repository.clearSearchCache()
             videoPreviewCache.clear()
+            _providerPages.value = emptyMap()
             
             // Reset UI state immediately for responsive feedback
             _uiState.update { 

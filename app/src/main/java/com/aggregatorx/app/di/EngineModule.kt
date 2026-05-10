@@ -14,11 +14,14 @@ import com.aggregatorx.app.engine.nlp.NaturalLanguageQueryProcessor
 import com.aggregatorx.app.engine.network.ProxyVPNEngine
 import com.aggregatorx.app.engine.network.CloudflareBypassEngine
 import com.aggregatorx.app.engine.scraper.SmartNavigationEngine
+import com.aggregatorx.app.engine.token.TokenManager
+import com.aggregatorx.app.engine.vision.VisionEngine
 import dagger.Module
 import dagger.Provides
 import dagger.hilt.InstallIn
 import dagger.hilt.android.qualifiers.ApplicationContext
 import dagger.hilt.components.SingletonComponent
+import okhttp3.OkHttpClient
 import javax.inject.Singleton
 
 /**
@@ -105,6 +108,14 @@ object EngineModule {
     fun provideAICodeInjectionEngine(): AICodeInjectionEngine {
         return AICodeInjectionEngine()
     }
+
+    @Provides
+    @Singleton
+    fun provideTokenManager(httpClient: OkHttpClient): TokenManager = TokenManager(httpClient)
+
+    @Provides
+    @Singleton
+    fun provideVisionEngine(httpClient: OkHttpClient): VisionEngine = VisionEngine(httpClient)
 
     @Provides
     @Singleton
