@@ -1,4 +1,4 @@
-package com.aggregatorx.shielded
+package com.aggregatorx.app // Ensure this matches your manifest/namespace
 
 import android.app.Application
 import android.content.Context
@@ -22,10 +22,15 @@ class AggregatorXApp : Application(), SingletonImageLoader.Factory {
         instance = this
     }
 
+    /**
+     * Coil 3 Singleton ImageLoader configuration.
+     * This provides a global ImageLoader that uses OkHttp for networking.
+     */
     override fun newImageLoader(context: Context): ImageLoader {
         return ImageLoader.Builder(context)
             .components {
-                // This resolves the "Unresolved reference" build error
+                // If you get an "Unresolved reference" here, make sure 
+                // "io.coil-kt.coil3:coil-network-okhttp" is in your build.gradle.kts
                 add(OkHttpNetworkLayerFactory())
             }
             .crossfade(true)
