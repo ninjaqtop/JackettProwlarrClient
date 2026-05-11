@@ -5,7 +5,7 @@ import android.content.Context
 import androidx.multidex.MultiDex
 import coil3.ImageLoader
 import coil3.SingletonImageLoader
-import coil3.network.okhttp.OkHttpNetworkLayerFactory
+import coil3.network.okhttp3.OkHttp3NetworkFetcher
 import coil3.request.crossfade
 import dagger.hilt.android.HiltAndroidApp
 
@@ -30,7 +30,7 @@ class AggregatorXApp : Application(), SingletonImageLoader.Factory {
     override fun newImageLoader(context: Context): ImageLoader {
         return ImageLoader.Builder(context)
             .components {
-                add(OkHttpNetworkLayerFactory())
+                add(OkHttp3NetworkFetcher.Factory())
             }
             .crossfade(true)
             .build()
