@@ -223,7 +223,7 @@ class UnifiedContentEngine @Inject constructor(
                     usedProxy = result.usedProxy != null,
                     proxyInfo = result.usedProxy,
                     isValidated = result.isValidated,
-                    estimatedBitrate = result.estimatedBitrate
+                    estimatedBitrate = result.estimatedBitrate?.toLong()
                 )
             } else {
                 VideoPlaybackResult(
@@ -575,7 +575,7 @@ data class VideoPlaybackResult(
                 usedProxy = result.usedProxy != null,
                 proxyInfo = result.usedProxy,
                 isValidated = result.isValidated,
-                estimatedBitrate = result.estimatedBitrate,
+                estimatedBitrate = result.estimatedBitrate?.toLong(),
                 error = result.error,
                 suggestedRecovery = result.suggestedRecovery?.name
             )
