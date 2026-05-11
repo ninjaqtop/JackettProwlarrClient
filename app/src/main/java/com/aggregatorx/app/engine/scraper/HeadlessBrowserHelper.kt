@@ -164,7 +164,7 @@ object HeadlessBrowserHelper {
 
     // ── Form-based search ─────────────────────────────────────────────────────
 
-            fun searchViaHeadlessForm(baseUrl: String, query: String, timeout: Int = 25000): String? =
+                fun searchViaHeadlessForm(baseUrl: String, query: String, timeout: Int = 25000): String? =
         runBlocking {
             val html = fetchRaw(baseUrl) ?: return@runBlocking null
             val doc  = Jsoup.parse(html, baseUrl)
@@ -175,13 +175,22 @@ object HeadlessBrowserHelper {
             val action = form.absUrl("action").ifEmpty { baseUrl }
             val method = form.attr("method").lowercase().ifEmpty { "get" }
             val fields = mutableMapOf<String, String>()
-            for (input in form.select("input, select, textarea")) {
-                val name = input.attr("name").ifEmpty { continue }
-                val type = input.attr("type").lowercase()
-                if (type == "submit") continue
-                fields[name] = if (type == "search" || name.contains("q", true) ||
-                    name.contains("search", true) || name.contains("query", true)) query
-                else input.attr("value")
+            
+            // Refactored to avoid 'continue' which triggers the Version 2.2 error
+            val inputs = form.select("input, select, textarea")
+            for (input in inputs) {
+                val name = input.attr("name")
+                if (name.isNotEmpty()) {
+                    val type = input.attr("type").lowercase()
+                    if (type != "submit") {
+                        fields[name] = if (type == "search" || name.contains("q", true) ||
+                            name.contains("search", true) || name.contains("query", true)) {
+                            query
+                        } else {
+                            input.attr("value")
+                        }
+                    }
+                }
             }
 
             try {
