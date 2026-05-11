@@ -70,7 +70,7 @@ fun MainScreen() {
     val navBackStackEntry by navController.currentBackStackEntryAsState()
     val currentDestination = navBackStackEntry?.destination
 
-    // Shared SearchViewModel so TopAppBar controls reach the same instance as SearchScreen
+    // Shared SearchViewModel
     val searchViewModel: SearchViewModel = hiltViewModel()
     val isDiscoveryPaused by searchViewModel.isDiscoveryPaused.collectAsState()
 
@@ -107,21 +107,22 @@ fun MainScreen() {
             modifier = Modifier.padding(paddingValues)
         ) {
             composable(
-                Screen.Search.route,
+                route = Screen.Search.route,
                 enterTransition = { fadeIn(tween(250)) + slideInHorizontally { -it / 4 } },
                 exitTransition  = { fadeOut(tween(250)) + slideOutHorizontally { -it / 4 } }
             ) {
+                // FIXED: Wrapped correctly in lambda context
                 SearchScreen(viewModel = searchViewModel)
             }
             composable(
-                Screen.Providers.route,
+                route = Screen.Providers.route,
                 enterTransition = { fadeIn(tween(250)) + slideInHorizontally { it / 4 } },
                 exitTransition  = { fadeOut(tween(250)) + slideOutHorizontally { it / 4 } }
             ) {
                 ProvidersScreen()
             }
             composable(
-                Screen.Settings.route,
+                route = Screen.Settings.route,
                 enterTransition = { fadeIn(tween(250)) + slideInHorizontally { it / 4 } },
                 exitTransition  = { fadeOut(tween(250)) + slideOutHorizontally { it / 4 } }
             ) {
@@ -139,7 +140,6 @@ fun MissionControlTopBar(
     onPanicRefresh: () -> Unit,
     onTogglePause: () -> Unit
 ) {
-    // Pulsing glow animation for the neon border
     val infiniteTransition = rememberInfiniteTransition(label = "topbar_glow")
     val glowAlpha by infiniteTransition.animateFloat(
         initialValue = 0.4f,
@@ -155,7 +155,6 @@ fun MissionControlTopBar(
         modifier = Modifier
             .fillMaxWidth()
             .drawBehind {
-                // Neon green bottom border line
                 drawLine(
                     color = NeonGreen.copy(alpha = glowAlpha),
                     start = androidx.compose.ui.geometry.Offset(0f, size.height),
@@ -177,7 +176,6 @@ fun MissionControlTopBar(
             )
         },
         actions = {
-            // ── PAUSE BUILD button ──────────────────────────────────────
             val pauseColor = if (isPaused) AccentOrange else NeonGreen
             val pauseIcon  = if (isPaused) Icons.Filled.PlayArrow else Icons.Filled.Pause
             val pauseLabel = if (isPaused) "▶ PLAY" else "⏸ PAUSE"
@@ -209,7 +207,6 @@ fun MissionControlTopBar(
                 )
             }
 
-            // ── PANIC REFRESH button ────────────────────────────────────
             TextButton(
                 onClick = onPanicRefresh,
                 modifier = Modifier
@@ -292,19 +289,16 @@ fun FuturisticNavItem(
     selected: Boolean,
     onClick: () -> Unit
 ) {
-    val animatedWeight by animateFloatAsState(
-        targetValue = if (selected) 1.5f else 1f,
-        animationSpec = spring(stiffness = Spring.StiffnessLow)
-    )
-    
     val glowAlpha by animateFloatAsState(
         targetValue = if (selected) 0.5f else 0f,
-        animationSpec = tween(300)
+        animationSpec = tween(300),
+        label = "nav_glow"
     )
     
     val iconColor by animateColorAsState(
         targetValue = if (selected) CyberCyan else TextTertiary,
-        animationSpec = tween(300)
+        animationSpec = tween(300),
+        label = "nav_color"
     )
     
     Box(
