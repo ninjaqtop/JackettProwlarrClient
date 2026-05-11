@@ -4,6 +4,7 @@ import androidx.lifecycle.ViewModel
 import androidx.lifecycle.viewModelScope
 import com.aggregatorx.app.data.model.*
 import com.aggregatorx.app.data.repository.AggregatorRepository
+import com.aggregatorx.app.engine.media.AdvancedVideoExtractorEngine
 import com.aggregatorx.app.engine.media.DownloadManager
 import com.aggregatorx.app.engine.media.DownloadState
 import com.aggregatorx.app.engine.media.VideoExtractorEngine
@@ -30,6 +31,7 @@ data class VideoPreviewResult(
 class SearchViewModel @Inject constructor(
     private val repository: AggregatorRepository,
     private val videoExtractor: VideoExtractorEngine,
+    private val advancedExtractor: AdvancedVideoExtractorEngine,
     private val videoStreamResolver: VideoStreamResolver,
     private val downloadManager: DownloadManager,
     private val tokenManager: TokenManager
@@ -345,7 +347,18 @@ class SearchViewModel @Inject constructor(
         }
 
         return try {
-            // 2. Fast extraction (JSoup only – no headless browser)
+            // 2. AdvancedVideoExtractorEngine — primary (50+ site-specific + generic)
+            val advResult = advancedExtractor.extract(pageUrl)
+            if (advResult.success && !advResult.videoUrl.isNullOrEmpty() && isLikelyMediaUrl(advResult.videoUrl)) {
+                val result = VideoPreviewResult(
+                    videoUrl = advResult.videoUrl,
+                    headers = buildPlaybackHeaders(pageUrl)
+                )
+                videoPreviewCache[pageUrl] = result
+                return result
+            }
+
+            // 3. Fast extraction (JSoup only – no headless browser)
             val fastUrl = videoExtractor.extractVideoUrlForPreview(pageUrl)
             if (!fastUrl.isNullOrEmpty() && isLikelyMediaUrl(fastUrl)) {
                 val result = VideoPreviewResult(
@@ -356,7 +369,7 @@ class SearchViewModel @Inject constructor(
                 return result
             }
 
-            // 3. Full extraction (known host extractors + standard HTML + headless)
+            // 4. Full extraction (known host extractors + standard HTML + headless)
             val fullExtraction = videoExtractor.extractVideoUrl(pageUrl)
             if (fullExtraction.success && !fullExtraction.videoUrl.isNullOrEmpty()
                 && isLikelyMediaUrl(fullExtraction.videoUrl)
@@ -369,7 +382,7 @@ class SearchViewModel @Inject constructor(
                 return result
             }
 
-            // 4. Full resolution chain (proxy → headless → site-specific)
+            // 5. Full resolution chain (proxy → headless → site-specific)
             val resolved = videoStreamResolver.resolveVideoStream(pageUrl)
             if (resolved.success && !resolved.streamUrl.isNullOrEmpty()
                 && isLikelyMediaUrl(resolved.streamUrl)
@@ -461,28 +474,59 @@ class SearchViewModel @Inject constructor(
     }
     
     /**
-     * Extract video URL from a search result page
+     * Extract video URL from a search result page — Watch button handler.
+     *
+     * Resolution order:
+     *   1. AdvancedVideoExtractorEngine (50+ site-specific + generic)
+     *   2. VideoExtractorEngine (legacy fast path)
+     *   3. VideoStreamResolver (proxy → headless → site-specific chain)
      */
     fun extractVideoUrl(result: SearchResult) {
         viewModelScope.launch {
             _videoExtractionState.value = VideoExtractionState.Extracting(result.title)
-            
             try {
-                val extractionResult = videoExtractor.extractVideoUrl(result.url)
-                
-                if (extractionResult.success && extractionResult.videoUrl != null) {
+                // Step 1: AdvancedVideoExtractorEngine
+                val advResult = advancedExtractor.extract(result.url)
+                if (advResult.success && !advResult.videoUrl.isNullOrEmpty()) {
                     _videoExtractionState.value = VideoExtractionState.Success(
-                        videoUrl = extractionResult.videoUrl,
+                        videoUrl = advResult.videoUrl,
                         title = result.title,
-                        quality = extractionResult.quality,
-                        isStream = extractionResult.format in listOf("m3u8", "mpd", "hls"),
-                        headers = emptyMap()
+                        quality = advResult.quality,
+                        isStream = advResult.isStream,
+                        headers = buildPlaybackHeaders(result.url)
                     )
-                } else {
-                    _videoExtractionState.value = VideoExtractionState.Error(
-                        extractionResult.error ?: "Could not extract video URL"
-                    )
+                    return@launch
                 }
+
+                // Step 2: Legacy VideoExtractorEngine
+                val legacyResult = videoExtractor.extractVideoUrl(result.url)
+                if (legacyResult.success && !legacyResult.videoUrl.isNullOrEmpty()) {
+                    _videoExtractionState.value = VideoExtractionState.Success(
+                        videoUrl = legacyResult.videoUrl,
+                        title = result.title,
+                        quality = legacyResult.quality,
+                        isStream = legacyResult.format in listOf("m3u8", "mpd", "hls"),
+                        headers = buildPlaybackHeaders(result.url)
+                    )
+                    return@launch
+                }
+
+                // Step 3: Full resolution chain
+                val resolved = videoStreamResolver.resolveVideoStream(result.url)
+                if (resolved.success && !resolved.streamUrl.isNullOrEmpty()) {
+                    _videoExtractionState.value = VideoExtractionState.Success(
+                        videoUrl = resolved.streamUrl,
+                        title = result.title,
+                        quality = resolved.quality,
+                        isStream = resolved.streamType.name in listOf("HLS", "DASH"),
+                        headers = resolved.headers ?: buildPlaybackHeaders(result.url)
+                    )
+                    return@launch
+                }
+
+                _videoExtractionState.value = VideoExtractionState.Error(
+                    "Could not extract a playable stream from this URL. Try opening in browser."
+                )
             } catch (e: Exception) {
                 _videoExtractionState.value = VideoExtractionState.Error(
                     e.message ?: "Video extraction failed"

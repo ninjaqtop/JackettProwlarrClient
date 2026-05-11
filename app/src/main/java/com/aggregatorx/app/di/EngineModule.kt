@@ -8,6 +8,7 @@ import com.aggregatorx.app.engine.analyzer.SmartContentClassifier
 import com.aggregatorx.app.engine.analyzer.SiteAnalyzerEngine
 import com.aggregatorx.app.engine.analyzer.UniversalFormatParser
 import com.aggregatorx.app.engine.analyzer.EndpointDiscoveryEngine
+import com.aggregatorx.app.engine.media.AdvancedVideoExtractorEngine
 import com.aggregatorx.app.engine.media.VideoExtractorEngine
 import com.aggregatorx.app.engine.media.VideoStreamResolver
 import com.aggregatorx.app.engine.nlp.NaturalLanguageQueryProcessor
@@ -69,14 +70,21 @@ object EngineModule {
     fun provideVideoExtractorEngine(): VideoExtractorEngine {
         return VideoExtractorEngine()
     }
-    
+
+    @Provides
+    @Singleton
+    fun provideAdvancedVideoExtractorEngine(): AdvancedVideoExtractorEngine {
+        return AdvancedVideoExtractorEngine()
+    }
+
     @Provides
     @Singleton
     fun provideVideoStreamResolver(
         proxyVPNEngine: ProxyVPNEngine,
-        videoExtractorEngine: VideoExtractorEngine
+        videoExtractorEngine: VideoExtractorEngine,
+        advancedVideoExtractorEngine: AdvancedVideoExtractorEngine
     ): VideoStreamResolver {
-        return VideoStreamResolver(proxyVPNEngine, videoExtractorEngine)
+        return VideoStreamResolver(proxyVPNEngine, videoExtractorEngine, advancedVideoExtractorEngine)
     }
     
     @Provides

@@ -59,6 +59,68 @@ object HeadlessBrowserHelper {
             .build()
     }
 
+    // ── JS Deobfuscation ──────────────────────────────────────────────────────
+
+    /**
+     * Unpacks eval(p,a,c,k,e,d) packed JavaScript and decodes atob() calls.
+     * Returns the deobfuscated source, or the original if not packed.
+     */
+    fun deobfuscateJs(js: String): String {
+        var result = js
+        var iterations = 0
+        while (iterations++ < 5) {
+            val packed = Regex(
+                """eval\s*\(\s*function\s*\(\s*p\s*,\s*a\s*,\s*c\s*,\s*k\s*,\s*e\s*,\s*[dr]\s*\)\s*\{.+?\}\s*\(\s*'([\s\S]+?)'\s*,\s*(\d+)\s*,\s*(\d+)\s*,\s*'([\s\S]+?)'\.split\s*\(""",
+                RegexOption.DOT_MATCHES_ALL
+            ).find(result) ?: break
+            try {
+                val p = packed.groupValues[1]
+                val a = packed.groupValues[2].toIntOrNull() ?: 36
+                val c = packed.groupValues[3].toIntOrNull() ?: 0
+                val k = packed.groupValues[4].split("|")
+                val unpacked = unpackPacked(p, a, c, k)
+                if (unpacked.length > 50) result = result.replace(packed.value, unpacked) else break
+            } catch (_: Exception) { break }
+        }
+        // Decode atob() calls
+        result = Regex("""atob\s*\(\s*['"]([A-Za-z0-9+/=]{20,})['"]""").replace(result) { m ->
+            try {
+                val decoded = String(android.util.Base64.decode(m.groupValues[1], android.util.Base64.DEFAULT))
+                "\"$decoded\""
+            } catch (_: Exception) { m.value }
+        }
+        // Decode unicode escapes
+        result = Regex("""\\u([0-9a-fA-F]{4})""").replace(result) { m ->
+            m.groupValues[1].toInt(16).toChar().toString()
+        }
+        // Decode hex-encoded strings
+        result = Regex("""(?:unescape|decodeURIComponent)\s*\(\s*['"](%[0-9A-Fa-f]{2}(?:%[0-9A-Fa-f]{2})+)['"]""").replace(result) { m ->
+            try { java.net.URLDecoder.decode(m.groupValues[1], "UTF-8") } catch (_: Exception) { m.value }
+        }
+        return result
+    }
+
+    private fun unpackPacked(p: String, a: Int, c: Int, k: List<String>): String {
+        var result = p
+        var i = c - 1
+        while (i >= 0) {
+            if (k.getOrNull(i)?.isNotEmpty() == true) {
+                result = result.replace(Regex("\\b${toBase(i, a)}\\b"), k[i])
+            }
+            i--
+        }
+        return result
+    }
+
+    private fun toBase(num: Int, base: Int): String {
+        if (num == 0) return "0"
+        val chars = "0123456789abcdefghijklmnopqrstuvwxyz"
+        var n = num
+        val sb = StringBuilder()
+        while (n > 0) { sb.insert(0, chars[n % base]); n /= base }
+        return sb.toString()
+    }
+
     private val VIDEO_SOURCE_PATTERNS = listOf(
         Regex("""(?:src|file|source|url|video_url|videoUrl|stream)['":\s]+['"]?(https?://[^'">\s]+\.(?:mp4|m3u8|webm|mpd)[^'">\s]*)['"]?""", RegexOption.IGNORE_CASE),
         Regex("""['"]?(https?://[^'">\s]*\.(?:mp4|m3u8|webm|mpd|flv|mkv)[^'">\s]*)['"]?""", RegexOption.IGNORE_CASE),
@@ -266,19 +328,31 @@ object HeadlessBrowserHelper {
 
         private fun extractVideoUrlsFromHtml(html: String, baseUrl: String): List<String> {
         val found = mutableSetOf<String>()
-        for (pattern in VIDEO_SOURCE_PATTERNS) {
-            // Fix 1: Changed .forEach to a standard for loop
-            for (m in pattern.findAll(html)) {
-                val u = (m.groupValues.getOrNull(1) ?: m.value).trim().trimEnd('"', '\'')
-                if (u.startsWith("http") && u.length > 15) found.add(u)
+        // Also run on deobfuscated version
+        val deobHtml = deobfuscateJs(html)
+        for (source in listOf(html, deobHtml)) {
+            for (pattern in VIDEO_SOURCE_PATTERNS) {
+                for (m in pattern.findAll(source)) {
+                    val u = (m.groupValues.getOrNull(1) ?: m.value).trim().trimEnd('"', '\'')
+                    if (u.startsWith("http") && u.length > 15) found.add(u)
+                }
             }
         }
         try {
             val elements = Jsoup.parse(html, baseUrl).select("video[src], source[src], video > source")
-            // Fix 2: Changed .forEach to a standard for loop
             for (el in elements) {
                 val src = el.absUrl("src").ifEmpty { el.attr("src") }
                 if (src.startsWith("http")) found.add(src)
+            }
+        } catch (_: Exception) {}
+        // Also check data-* attributes
+        try {
+            val doc = Jsoup.parse(html, baseUrl)
+            listOf("data-src","data-url","data-video","data-stream","data-file","data-hls","data-mp4").forEach { attr ->
+                doc.select("[$attr]").forEach { el ->
+                    val v = el.attr(attr)
+                    if (v.startsWith("http")) found.add(v)
+                }
             }
         } catch (_: Exception) {}
         return found.toList()
