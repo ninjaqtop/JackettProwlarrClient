@@ -165,6 +165,7 @@ object HeadlessBrowserHelper {
     // ── Form-based search ─────────────────────────────────────────────────────
 
         fun searchViaHeadlessForm(baseUrl: String, query: String, timeout: Int = 25000): String? =
+            fun searchViaHeadlessForm(baseUrl: String, query: String, timeout: Int = 25000): String? =
         runBlocking {
             val html = fetchRaw(baseUrl) ?: return@runBlocking null
             val doc  = Jsoup.parse(html, baseUrl)
@@ -186,11 +187,13 @@ object HeadlessBrowserHelper {
 
             try {
                 if (method == "post") {
+                    // FIX: Replaced the .apply { fields.forEach ... } with a clean for loop
                     val bodyBuilder = FormBody.Builder()
-                    for ((k, v) in fields) {
-                        bodyBuilder.add(k, v)
+                    for (entry in fields) {
+                        bodyBuilder.add(entry.key, entry.value)
                     }
                     val body = bodyBuilder.build()
+                    
                     val req = Request.Builder().url(action).post(body).header("Referer", baseUrl).build()
                     client.newCall(req).execute().use { it.body?.string() }
                 } else {
@@ -202,6 +205,7 @@ object HeadlessBrowserHelper {
                 }
             } catch (e: Exception) { Log.w(TAG, "Form submit: ${e.message}"); html }
         }
+
 
 
     // ── API endpoint discovery ────────────────────────────────────────────────
