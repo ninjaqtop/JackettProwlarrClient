@@ -1,12 +1,11 @@
 package com.aggregatorx.app
 
-import android.app.Application
+import androidx.multidex.MultiDexApplication
 import dagger.hilt.android.HiltAndroidApp
 
 /**
  * AggregatorX - Advanced Multi-Provider Web Scraping Aggregator
- * 
- * Features:
+ * * Features:
  * - Multi-provider search with intelligent result aggregation
  * - Advanced site analyzer with DOM parsing and pattern recognition
  * - Resilient scraping with fallback mechanisms
@@ -15,7 +14,7 @@ import dagger.hilt.android.HiltAndroidApp
  * - Smart ranking system for search results
  */
 @HiltAndroidApp
-class AggregatorXApp : Application() {
+class AggregatorXApp : MultiDexApplication() {
     
     override fun onCreate() {
         super.onCreate()
