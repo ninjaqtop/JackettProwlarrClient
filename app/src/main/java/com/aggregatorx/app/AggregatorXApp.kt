@@ -1,4 +1,4 @@
-package com.aggregatorx.app // Ensure this matches your manifest/namespace
+package com.aggregatorx.app
 
 import android.app.Application
 import android.content.Context
@@ -14,6 +14,7 @@ class AggregatorXApp : Application(), SingletonImageLoader.Factory {
     
     override fun attachBaseContext(base: Context) {
         super.attachBaseContext(base)
+        // Enables multidex for devices running on API levels prior to 21
         MultiDex.install(this)
     }
     
@@ -24,13 +25,11 @@ class AggregatorXApp : Application(), SingletonImageLoader.Factory {
 
     /**
      * Coil 3 Singleton ImageLoader configuration.
-     * This provides a global ImageLoader that uses OkHttp for networking.
+     * Integrates OkHttp via the coil-network-okhttp dependency.
      */
     override fun newImageLoader(context: Context): ImageLoader {
         return ImageLoader.Builder(context)
             .components {
-                // If you get an "Unresolved reference" here, make sure 
-                // "io.coil-kt.coil3:coil-network-okhttp" is in your build.gradle.kts
                 add(OkHttpNetworkLayerFactory())
             }
             .crossfade(true)
