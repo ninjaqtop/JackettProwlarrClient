@@ -11,14 +11,14 @@ android {
     namespace = "com.aggregatorx.shielded"
     compileSdk = 35
 
-        defaultConfig {
+    defaultConfig {
         applicationId = "com.aggregatorx.shielded"
         minSdk = 26
         targetSdk = 35
         versionCode = 1
         versionName = "1.0.0"
 
-        // This is the specific fix for the mergeLibDex error
+        // Required to handle the high method count from Hilt, ML Kit, and Media3
         multiDexEnabled = true
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -66,6 +66,9 @@ android {
 }
 
 dependencies {
+    // MultiDex - Fixes the "Unresolved reference: multidex" error
+    implementation("androidx.multidex:multidex:2.0.1")
+
     // Core Android
     implementation("androidx.core:core-ktx:1.15.0")
     implementation("androidx.lifecycle:lifecycle-runtime-ktx:2.9.0")
@@ -121,7 +124,7 @@ dependencies {
     // DataStore
     implementation("androidx.datastore:datastore-preferences:1.1.2")
     
-    // Coil Image Loading (v3 - modern async image loading)
+    // Coil Image Loading (v3)
     implementation("io.coil-kt.coil3:coil-compose:3.1.0")
     implementation("io.coil-kt.coil3:coil-network-okhttp:3.1.0")
     
@@ -129,7 +132,7 @@ dependencies {
     implementation("com.google.accompanist:accompanist-systemuicontroller:0.36.0")
     implementation("com.google.accompanist:accompanist-swiperefresh:0.36.0")
 
-    // ML Kit OCR — Vision Engine for thumbnail keyword extraction
+    // ML Kit OCR
     implementation("com.google.mlkit:text-recognition:16.0.1")
     
     // ExoPlayer / Media3 for video playback
