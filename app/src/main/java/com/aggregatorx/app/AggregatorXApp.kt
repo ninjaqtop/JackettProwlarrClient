@@ -1,4 +1,4 @@
-package com.aggregatorx.app
+package com.aggregatorx.shielded
 
 import android.app.Application
 import android.content.Context
@@ -6,12 +6,9 @@ import androidx.multidex.MultiDex
 import coil3.ImageLoader
 import coil3.SingletonImageLoader
 import coil3.network.okhttp.OkHttpNetworkLayerFactory
-import coil3.request.crossfade // Ensure this exact import is here
+import coil3.request.crossfade
 import dagger.hilt.android.HiltAndroidApp
 
-/**
- * AggregatorX - Advanced Multi-Provider Web Scraping Aggregator
- */
 @HiltAndroidApp
 class AggregatorXApp : Application(), SingletonImageLoader.Factory {
     
@@ -25,12 +22,10 @@ class AggregatorXApp : Application(), SingletonImageLoader.Factory {
         instance = this
     }
 
-    /**
-     * Configures the global image loader for thumbnails and previews.
-     */
     override fun newImageLoader(context: Context): ImageLoader {
         return ImageLoader.Builder(context)
             .components {
+                // This resolves the "Unresolved reference" build error
                 add(OkHttpNetworkLayerFactory())
             }
             .crossfade(true)
