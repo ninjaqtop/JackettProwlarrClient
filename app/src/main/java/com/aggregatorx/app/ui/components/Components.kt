@@ -38,6 +38,7 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil3.compose.AsyncImage
+import coil3.compose.CrossfadeTransition
 import coil3.request.ImageRequest
 import coil3.request.CachePolicy
 import com.aggregatorx.app.data.model.*
@@ -475,11 +476,11 @@ fun InlineThumbnailPreview(
                     .data(thumbnailUrl)
                     .diskCachePolicy(CachePolicy.ENABLED)
                     .memoryCachePolicy(CachePolicy.ENABLED)
-                    .crossfade(true)
                     .build(),
                 contentDescription = null,
                 modifier = Modifier.fillMaxSize(),
                 contentScale = ContentScale.Crop,
+                contentTransition = CrossfadeTransition(),
                 onError   = { imageLoadFailed = true },
                 onSuccess = { imageLoadFailed = false }
             )
@@ -704,11 +705,11 @@ fun ThumbnailPreviewDialog(
                                 .data(thumbnailUrl)
                                 .diskCachePolicy(CachePolicy.ENABLED)
                                 .memoryCachePolicy(CachePolicy.ENABLED)
-                                .crossfade(true)
                                 .build(),
                             contentDescription = null,
                             modifier = Modifier.fillMaxSize(),
-                            contentScale = ContentScale.Crop
+                            contentScale = ContentScale.Crop,
+                            contentTransition = CrossfadeTransition()
                         )
                     } else {
                         Icon(Icons.Default.Videocam, null, tint = TextTertiary,
@@ -999,199 +1000,72 @@ fun SearchResultCard(
                         // Size
                         result.size?.let { size ->
                             MetadataBadge(
-                                icon = Icons.Default.Storage,
+                                icon = Icons.Default.Download,
                                 value = size,
-                                color = TextTertiary
+                                color = CyberCyan
                             )
                         }
+                        
                         // Quality
                         result.quality?.let { quality ->
-                            QualityBadge(quality = quality)
-                        }
-                        
-                        // Rating
-                        result.rating?.let { rating ->
                             MetadataBadge(
-                                icon = Icons.Default.Star,
-                                value = String.format("%.1f", rating),
-                                color = AccentYellow
+                                icon = Icons.Default.HighQuality,
+                                value = quality,
+                                color = AccentOrange
                             )
                         }
                     }
                 }
             }
             
-            // Fullscreen player dialog — HOLD thumbnail or Watch button
-            if (showFullscreenPlayer && !fullscreenVideoUrl.isNullOrEmpty()) {
-                VideoPlayerDialog(
-                    videoUrl = fullscreenVideoUrl!!,
-                    title = result.title,
-                    headers = fullscreenVideoHeaders,
-                    onDismiss = {
-                        showFullscreenPlayer = false
-                        fullscreenVideoUrl = null
-                        fullscreenVideoHeaders = null
-                    },
-                    onOpenExternal = {
-                        showFullscreenPlayer = false
-                        fullscreenVideoUrl = null
-                        fullscreenVideoHeaders = null
-                        onOpenExternal()
-                    }
-                )
-            }
-
-            // Extraction error dialog — shown when we couldn't find a playable stream
-            if (showExtractionError) {
-                AlertDialog(
-                    onDismissRequest = {
-                        showExtractionError = false
-                        extractionErrorMessage = null
-                    },
-                    containerColor = DarkCard,
-                    titleContentColor = TextPrimary,
-                    textContentColor = TextSecondary,
-                    title = {
-                        Row(verticalAlignment = Alignment.CenterVertically) {
-                            Icon(
-                                Icons.Default.ErrorOutline,
-                                contentDescription = null,
-                                tint = AccentOrange,
-                                modifier = Modifier.size(22.dp)
-                            )
-                            Spacer(modifier = Modifier.width(8.dp))
-                            Text("Video Unavailable", style = MaterialTheme.typography.titleMedium)
-                        }
-                    },
-                    text = {
-                        Text(
-                            extractionErrorMessage ?: "Could not extract a playable video stream.",
-                            style = MaterialTheme.typography.bodyMedium
-                        )
-                    },
-                    confirmButton = {
-                        Button(
-                            onClick = {
-                                showExtractionError = false
-                                extractionErrorMessage = null
-                                onOpenExternal()
-                            },
-                            colors = ButtonDefaults.buttonColors(
-                                containerColor = CyberCyan,
-                                contentColor = DarkBackground
-                            )
-                        ) {
-                            Icon(Icons.Default.OpenInBrowser, contentDescription = null, modifier = Modifier.size(16.dp))
-                            Spacer(modifier = Modifier.width(4.dp))
-                            Text("Open in Browser")
-                        }
-                    },
-                    dismissButton = {
-                        TextButton(onClick = {
-                            showExtractionError = false
-                            extractionErrorMessage = null
-                        }) {
-                            Text("Close", color = TextSecondary)
-                        }
-                    }
-                )
-            }
-
-            // Action buttons row
             if (showControls) {
-                HorizontalDivider(
-                    color = DarkSurfaceVariant,
-                    thickness = 1.dp
-                )
-                
+                Divider(color = DarkSurfaceVariant, thickness = 1.dp)
                 Row(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(horizontal = 8.dp, vertical = 8.dp),
-                    horizontalArrangement = Arrangement.SpaceEvenly
+                        .padding(horizontal = 12.dp, vertical = 8.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
-                    // Watch button - Opens fullscreen video player
-                    Button(
-                        onClick = openFullscreenPlayer,
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = CyberCyan,
-                            contentColor = DarkBackground
-                        ),
-                        shape = RoundedCornerShape(8.dp),
-                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)
+                    // Like button
+                    IconButton(
+                        onClick = onLike,
+                        modifier = Modifier.size(32.dp)
                     ) {
                         Icon(
-                            imageVector = Icons.Default.PlayArrow,
-                            contentDescription = null,
+                            imageVector = if (isLiked) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
+                            contentDescription = "Like",
+                            tint = if (isLiked) AccentRed else TextTertiary,
                             modifier = Modifier.size(18.dp)
-                        )
-                        Spacer(modifier = Modifier.width(4.dp))
-                        Text(
-                            text = "Watch",
-                            style = MaterialTheme.typography.labelMedium,
-                            fontWeight = FontWeight.SemiBold
                         )
                     }
                     
-                    // Download button - Auto downloads highest quality
+                    // Open button
                     Button(
-                        onClick = onDownload,
-                        colors = ButtonDefaults.buttonColors(
-                            containerColor = AccentGreen.copy(alpha = 0.9f),
-                            contentColor = DarkBackground
-                        ),
-                        shape = RoundedCornerShape(8.dp),
-                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
-                    ) {
-                        Icon(
-                            imageVector = Icons.Default.Download,
-                            contentDescription = null,
-                            modifier = Modifier.size(18.dp)
-                        )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            text = "Download",
-                            style = MaterialTheme.typography.labelMedium,
-                            fontWeight = FontWeight.SemiBold
-                        )
-                    }
-                    
-                    // Open in browser button
-                    OutlinedButton(
                         onClick = onOpenExternal,
-                        colors = ButtonDefaults.outlinedButtonColors(
-                            contentColor = CyberCyan
-                        ),
-                        border = ButtonDefaults.outlinedButtonBorder(enabled = true).copy(
-                            brush = Brush.horizontalGradient(
-                                colors = listOf(CyberCyan.copy(alpha = 0.6f), CyberBlue.copy(alpha = 0.6f))
-                            )
-                        ),
-                        shape = RoundedCornerShape(8.dp),
-                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp)
+                        modifier = Modifier
+                            .weight(1f)
+                            .height(32.dp),
+                        colors = ButtonDefaults.buttonColors(containerColor = CyberCyan)
                     ) {
                         Icon(
                             imageVector = Icons.Default.OpenInBrowser,
                             contentDescription = null,
-                            modifier = Modifier.size(18.dp)
+                            modifier = Modifier.size(14.dp)
                         )
-                        Spacer(modifier = Modifier.width(6.dp))
-                        Text(
-                            text = "Browser",
-                            style = MaterialTheme.typography.labelMedium
-                        )
+                        Spacer(modifier = Modifier.width(4.dp))
+                        Text("Open", fontSize = 12.sp, fontWeight = FontWeight.SemiBold)
                     }
-
-                    // Like / thumbs-up button
+                    
+                    // Download button
                     IconButton(
-                        onClick = onLike,
-                        modifier = Modifier.size(36.dp)
+                        onClick = onDownload,
+                        modifier = Modifier.size(32.dp)
                     ) {
                         Icon(
-                            imageVector = if (isLiked) Icons.Default.Favorite else Icons.Default.FavoriteBorder,
-                            contentDescription = if (isLiked) "Unlike" else "Like",
-                            tint = if (isLiked) Color(0xFFFF4081) else TextSecondary,
-                            modifier = Modifier.size(20.dp)
+                            imageVector = Icons.Default.GetApp,
+                            contentDescription = "Download",
+                            tint = TextTertiary,
+                            modifier = Modifier.size(18.dp)
                         )
                     }
                 }
@@ -1200,388 +1074,73 @@ fun SearchResultCard(
     }
 }
 
-/**
- * Download Progress Card
- */
+// Helper function for score color
 @Composable
-fun DownloadProgressCard(
-    title: String,
-    progress: Int,
-    status: String,
-    onCancel: () -> Unit,
-    modifier: Modifier = Modifier
-) {
-    Card(
-        modifier = modifier.fillMaxWidth(),
-        shape = RoundedCornerShape(12.dp),
-        colors = CardDefaults.cardColors(containerColor = DarkCard)
-    ) {
-        Column(
-            modifier = Modifier.padding(16.dp)
-        ) {
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween,
-                verticalAlignment = Alignment.CenterVertically
-            ) {
-                Text(
-                    text = title,
-                    style = MaterialTheme.typography.bodyMedium,
-                    color = TextPrimary,
-                    maxLines = 1,
-                    overflow = TextOverflow.Ellipsis,
-                    modifier = Modifier.weight(1f)
-                )
-                
-                IconButton(
-                    onClick = onCancel,
-                    modifier = Modifier.size(24.dp)
-                ) {
-                    Icon(
-                        imageVector = Icons.Default.Close,
-                        contentDescription = "Cancel",
-                        tint = AccentRed,
-                        modifier = Modifier.size(20.dp)
-                    )
-                }
-            }
-            
-            Spacer(modifier = Modifier.height(8.dp))
-            
-            LinearProgressIndicator(
-                progress = { progress / 100f },
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .height(4.dp)
-                    .clip(RoundedCornerShape(2.dp)),
-                color = CyberCyan,
-                trackColor = DarkSurfaceVariant
-            )
-            
-            Spacer(modifier = Modifier.height(4.dp))
-            
-            Row(
-                modifier = Modifier.fillMaxWidth(),
-                horizontalArrangement = Arrangement.SpaceBetween
-            ) {
-                Text(
-                    text = status,
-                    style = MaterialTheme.typography.labelSmall,
-                    color = TextTertiary
-                )
-                Text(
-                    text = "$progress%",
-                    style = MaterialTheme.typography.labelSmall,
-                    color = CyberCyan,
-                    fontWeight = FontWeight.Bold
-                )
-            }
-        }
+fun getScoreColor(score: Float): Color {
+    return when {
+        score >= 8f -> AccentGreen
+        score >= 6f -> AccentOrange
+        else -> AccentRed
     }
 }
 
-/**
- * Score Badge
- */
-@Composable
-fun ScoreBadge(score: Float) {
-    val color = getScoreColor(score)
-    
-    Surface(
-        shape = RoundedCornerShape(4.dp),
-        color = color.copy(alpha = 0.2f)
-    ) {
-        Text(
-            text = "${score.toInt()}",
-            color = color,
-            fontSize = 10.sp,
-            fontWeight = FontWeight.Bold,
-            modifier = Modifier.padding(horizontal = 6.dp, vertical = 2.dp)
-        )
-    }
-}
-
-/**
- * Metadata Badge
- */
+// Metadata badge composable
 @Composable
 fun MetadataBadge(
-    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    icon: androidx.compose.material.icons.Icons,
     value: String,
     color: Color
 ) {
-    Row(
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Icon(
-            imageVector = icon,
-            contentDescription = null,
-            tint = color,
-            modifier = Modifier.size(12.dp)
-        )
-        Spacer(modifier = Modifier.width(2.dp))
-        Text(
-            text = value,
-            color = color,
-            fontSize = 10.sp
-        )
-    }
-}
-
-/**
- * Quality Badge
- */
-@Composable
-fun QualityBadge(quality: String) {
-    val color = when {
-        quality.contains("4k", ignoreCase = true) || quality.contains("2160") -> AccentGreen
-        quality.contains("1080") || quality.contains("full hd", ignoreCase = true) -> CyberCyan
-        quality.contains("720") -> CyberBlue
-        else -> TextTertiary
-    }
-    
     Surface(
         shape = RoundedCornerShape(4.dp),
-        color = color.copy(alpha = 0.2f)
+        color = color.copy(alpha = 0.15f)
     ) {
-        Text(
-            text = quality.uppercase(),
-            color = color,
-            fontSize = 9.sp,
-            fontWeight = FontWeight.Bold,
-            modifier = Modifier.padding(horizontal = 4.dp, vertical = 1.dp)
-        )
-    }
-}
-
-/**
- * Provider Results Section Header
- */
-@Composable
-fun ProviderResultsHeader(
-    providerName: String,
-    resultCount: Int,
-    searchTime: Long,
-    success: Boolean,
-    errorMessage: String? = null,
-    modifier: Modifier = Modifier
-) {
-    val categoryColor = CyberCyan
-    
-    Row(
-        modifier = modifier
-            .fillMaxWidth()
-            .background(
-                brush = Brush.horizontalGradient(
-                    colors = listOf(
-                        if (success) categoryColor.copy(alpha = 0.15f) else AccentRed.copy(alpha = 0.15f),
-                        Color.Transparent
-                    )
-                )
-            )
-            .padding(horizontal = 16.dp, vertical = 12.dp),
-        horizontalArrangement = Arrangement.SpaceBetween,
-        verticalAlignment = Alignment.CenterVertically
-    ) {
-        Row(verticalAlignment = Alignment.CenterVertically) {
-            Box(
-                modifier = Modifier
-                    .size(8.dp)
-                    .clip(CircleShape)
-                    .background(if (success) AccentGreen else AccentRed)
-            )
-            Spacer(modifier = Modifier.width(12.dp))
-            Column {
-                Text(
-                    text = providerName,
-                    style = MaterialTheme.typography.titleMedium,
-                    color = TextPrimary,
-                    fontWeight = FontWeight.Bold
-                )
-                if (!success && errorMessage != null) {
-                    Text(
-                        text = errorMessage,
-                        style = MaterialTheme.typography.bodySmall,
-                        color = AccentRed
-                    )
-                }
-            }
-        }
-        
         Row(
-            horizontalArrangement = Arrangement.spacedBy(12.dp),
-            verticalAlignment = Alignment.CenterVertically
+            modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(3.dp)
         ) {
-            if (success) {
-                Text(
-                    text = "$resultCount results",
-                    style = MaterialTheme.typography.bodySmall,
-                    color = TextSecondary
-                )
-            }
-            Text(
-                text = "${searchTime}ms",
-                style = MaterialTheme.typography.bodySmall,
-                color = TextTertiary
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                tint = color,
+                modifier = Modifier.size(10.dp)
             )
-        }
-    }
-}
-
-/**
- * Animated Loading Indicator
- */
-@Composable
-fun FuturisticLoader(
-    modifier: Modifier = Modifier,
-    size: Dp = 48.dp
-) {
-    val infiniteTransition = rememberInfiniteTransition()
-    
-    val rotation by infiniteTransition.animateFloat(
-        initialValue = 0f,
-        targetValue = 360f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(1500, easing = LinearEasing),
-            repeatMode = RepeatMode.Restart
-        )
-    )
-    
-    val glowAlpha by infiniteTransition.animateFloat(
-        initialValue = 0.3f,
-        targetValue = 0.8f,
-        animationSpec = infiniteRepeatable(
-            animation = tween(1000),
-            repeatMode = RepeatMode.Reverse
-        )
-    )
-    
-    Box(
-        modifier = modifier.size(size),
-        contentAlignment = Alignment.Center
-    ) {
-        // Outer glow
-        Box(
-            modifier = Modifier
-                .size(size)
-                .drawBehind {
-                    drawCircle(
-                        brush = Brush.sweepGradient(
-                            colors = listOf(CyberCyan, CyberBlue, CyberPurple, CyberCyan)
-                        ),
-                        radius = this.size.minDimension / 2,
-                        style = Stroke(width = 3.dp.toPx()),
-                        alpha = glowAlpha
-                    )
-                }
-                .graphicsLayer { rotationZ = rotation }
-        )
-        
-        // Inner circle
-        Box(
-            modifier = Modifier
-                .size(size * 0.6f)
-                .clip(CircleShape)
-                .background(
-                    brush = Brush.radialGradient(
-                        colors = listOf(CyberCyan.copy(alpha = 0.3f), Color.Transparent)
-                    )
-                )
-        )
-    }
-}
-
-/**
- * Empty State Component
- */
-@Composable
-fun EmptyState(
-    icon: androidx.compose.ui.graphics.vector.ImageVector,
-    title: String,
-    subtitle: String,
-    modifier: Modifier = Modifier
-) {
-    Column(
-        modifier = modifier
-            .fillMaxWidth()
-            .padding(32.dp),
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-        Icon(
-            imageVector = icon,
-            contentDescription = null,
-            modifier = Modifier.size(64.dp),
-            tint = TextTertiary
-        )
-        Spacer(modifier = Modifier.height(16.dp))
-        Text(
-            text = title,
-            style = MaterialTheme.typography.titleMedium,
-            color = TextSecondary
-        )
-        Spacer(modifier = Modifier.height(8.dp))
-        Text(
-            text = subtitle,
-            style = MaterialTheme.typography.bodyMedium,
-            color = TextTertiary,
-            modifier = Modifier.padding(horizontal = 32.dp)
-        )
-    }
-}
-
-/**
- * Security Score Indicator
- */
-@Composable
-fun SecurityScoreIndicator(
-    score: Float,
-    modifier: Modifier = Modifier
-) {
-    val color = getSecurityColor(score)
-    val animatedScore by animateFloatAsState(
-        targetValue = score,
-        animationSpec = tween(1000)
-    )
-    
-    Column(
-        modifier = modifier,
-        horizontalAlignment = Alignment.CenterHorizontally
-    ) {
-        Box(
-            modifier = Modifier
-                .size(80.dp)
-                .drawBehind {
-                    // Background circle
-                    drawCircle(
-                        color = DarkSurfaceVariant,
-                        radius = size.minDimension / 2,
-                        style = Stroke(width = 8.dp.toPx())
-                    )
-                    // Progress arc
-                    drawArc(
-                        color = color,
-                        startAngle = -90f,
-                        sweepAngle = (animatedScore / 100f) * 360f,
-                        useCenter = false,
-                        style = Stroke(width = 8.dp.toPx(), cap = StrokeCap.Round)
-                    )
-                },
-            contentAlignment = Alignment.Center
-        ) {
             Text(
-                text = "${score.toInt()}",
-                style = MaterialTheme.typography.headlineSmall,
+                text = value,
                 color = color,
+                fontSize = 9.sp,
                 fontWeight = FontWeight.Bold
             )
         }
-        
-        Spacer(modifier = Modifier.height(8.dp))
-        
-        Text(
-            text = "Security Score",
-            style = MaterialTheme.typography.labelSmall,
-            color = TextTertiary
-        )
+    }
+}
+
+// Score badge composable
+@Composable
+fun ScoreBadge(score: Float) {
+    val color = getScoreColor(score)
+    Surface(
+        shape = RoundedCornerShape(4.dp),
+        color = color.copy(alpha = 0.15f)
+    ) {
+        Row(
+            modifier = Modifier.padding(horizontal = 6.dp, vertical = 3.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(3.dp)
+        ) {
+            Icon(
+                imageVector = Icons.Default.Star,
+                contentDescription = null,
+                tint = color,
+                modifier = Modifier.size(10.dp)
+            )
+            Text(
+                text = "%.1f".format(score),
+                color = color,
+                fontSize = 9.sp,
+                fontWeight = FontWeight.Bold
+            )
+        }
     }
 }
