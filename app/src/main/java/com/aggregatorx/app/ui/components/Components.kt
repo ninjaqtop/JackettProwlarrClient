@@ -38,7 +38,6 @@ import androidx.compose.ui.unit.Dp
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import coil3.compose.AsyncImage
-import coil3.compose.CrossfadeTransition
 import coil3.request.ImageRequest
 import coil3.request.CachePolicy
 import com.aggregatorx.app.data.model.*
@@ -480,7 +479,6 @@ fun InlineThumbnailPreview(
                 contentDescription = null,
                 modifier = Modifier.fillMaxSize(),
                 contentScale = ContentScale.Crop,
-                contentTransition = CrossfadeTransition(),
                 onError   = { imageLoadFailed = true },
                 onSuccess = { imageLoadFailed = false }
             )
@@ -708,8 +706,7 @@ fun ThumbnailPreviewDialog(
                                 .build(),
                             contentDescription = null,
                             modifier = Modifier.fillMaxSize(),
-                            contentScale = ContentScale.Crop,
-                            contentTransition = CrossfadeTransition()
+                            contentScale = ContentScale.Crop
                         )
                     } else {
                         Icon(Icons.Default.Videocam, null, tint = TextTertiary,
@@ -1087,7 +1084,7 @@ fun getScoreColor(score: Float): Color {
 // Metadata badge composable
 @Composable
 fun MetadataBadge(
-    icon: androidx.compose.material.icons.Icons,
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
     value: String,
     color: Color
 ) {
@@ -1110,6 +1107,121 @@ fun MetadataBadge(
                 text = value,
                 color = color,
                 fontSize = 9.sp,
+                fontWeight = FontWeight.Bold
+            )
+        }
+    }
+}
+
+// Animated futuristic loading indicator
+@Composable
+fun FuturisticLoader(size: androidx.compose.ui.unit.Dp = 48.dp) {
+    val infiniteTransition = rememberInfiniteTransition(label = "loader")
+    val angle by infiniteTransition.animateFloat(
+        initialValue = 0f,
+        targetValue = 360f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1000, easing = LinearEasing),
+            repeatMode = RepeatMode.Restart
+        ),
+        label = "angle"
+    )
+    val pulse by infiniteTransition.animateFloat(
+        initialValue = 0.6f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(600, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "pulse"
+    )
+    Box(
+        modifier = Modifier.size(size),
+        contentAlignment = Alignment.Center
+    ) {
+        androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
+            val stroke = androidx.compose.ui.graphics.drawscope.Stroke(
+                width = 4.dp.toPx(),
+                cap = androidx.compose.ui.graphics.StrokeCap.Round
+            )
+            drawArc(
+                color = NeonGreen.copy(alpha = pulse),
+                startAngle = angle,
+                sweepAngle = 270f,
+                useCenter = false,
+                style = stroke
+            )
+            drawArc(
+                color = CyberCyan.copy(alpha = pulse * 0.5f),
+                startAngle = angle + 180f,
+                sweepAngle = 90f,
+                useCenter = false,
+                style = stroke
+            )
+        }
+    }
+}
+
+// Security score ring indicator
+@Composable
+fun SecurityScoreIndicator(score: Float) {
+    val clampedScore = score.coerceIn(0f, 100f)
+    val color = when {
+        clampedScore >= 70f -> AccentGreen
+        clampedScore >= 40f -> AccentOrange
+        else -> Color(0xFFFF4444)
+    }
+    val infiniteTransition = rememberInfiniteTransition(label = "secScore")
+    val pulse by infiniteTransition.animateFloat(
+        initialValue = 0.7f,
+        targetValue = 1f,
+        animationSpec = infiniteRepeatable(
+            animation = tween(1200, easing = FastOutSlowInEasing),
+            repeatMode = RepeatMode.Reverse
+        ),
+        label = "secPulse"
+    )
+    Row(
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        Box(modifier = Modifier.size(40.dp), contentAlignment = Alignment.Center) {
+            androidx.compose.foundation.Canvas(modifier = Modifier.fillMaxSize()) {
+                val stroke = androidx.compose.ui.graphics.drawscope.Stroke(width = 4.dp.toPx())
+                // Background track
+                drawArc(
+                    color = color.copy(alpha = 0.2f),
+                    startAngle = -90f,
+                    sweepAngle = 360f,
+                    useCenter = false,
+                    style = stroke
+                )
+                // Score arc
+                drawArc(
+                    color = color.copy(alpha = pulse),
+                    startAngle = -90f,
+                    sweepAngle = 360f * (clampedScore / 100f),
+                    useCenter = false,
+                    style = stroke
+                )
+            }
+            Text(
+                text = clampedScore.toInt().toString(),
+                color = color,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Bold
+            )
+        }
+        Column {
+            Text("Security Score", color = TextSecondary, fontSize = 11.sp)
+            Text(
+                text = when {
+                    clampedScore >= 70f -> "Good"
+                    clampedScore >= 40f -> "Fair"
+                    else -> "Low"
+                },
+                color = color,
+                fontSize = 12.sp,
                 fontWeight = FontWeight.Bold
             )
         }

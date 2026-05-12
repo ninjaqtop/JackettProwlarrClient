@@ -27,10 +27,7 @@ jobs:
           cache: gradle
 
       - name: Setup Android SDK
-        uses: android-actions/setup-android@v3
-
-      - name: Accept Android SDK licenses
-        run: yes | sdkmanager --licenses || true
+        uses: android-actions/setup-android@v4
 
       - name: Cache Gradle packages
         uses: actions/cache@v4
@@ -46,24 +43,9 @@ jobs:
         run: chmod +x gradlew
 
       - name: Build Debug APK
-        run: |
-          ./gradlew assembleDebug \
-            --stacktrace \
-            --no-daemon \
-            --warning-mode all
+        run: ./gradlew assembleDebug --no-daemon --warning-mode all
         env:
           GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=512m -Dorg.gradle.daemon=false -Dkotlin.incremental=false"
-
-      - name: Verify APK exists
-        run: |
-          APK_PATH="app/build/outputs/apk/debug/app-debug.apk"
-          if [ ! -f "$APK_PATH" ]; then
-            echo "ERROR: APK not found at $APK_PATH"
-            find app/build/outputs -name "*.apk" 2>/dev/null || echo "No APKs found anywhere"
-            exit 1
-          fi
-          echo "APK found: $APK_PATH"
-          ls -lh "$APK_PATH"
 
       - name: Rename and stage APK
         run: |
