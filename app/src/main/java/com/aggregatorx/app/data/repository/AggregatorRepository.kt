@@ -109,9 +109,11 @@ class AggregatorRepository @Inject constructor(
         return siteAnalysisDao.getLatestAnalysis(providerId)
     }
     
-    fun searchAllProviders(query: String): Flow<ProviderSearchResults> {
+    // BUILD FIX: Added `pages` parameter to match ViewModel call.
+    fun searchAllProviders(query: String, pages: Map<String, Int> = emptyMap()): Flow<ProviderSearchResults> {
         // Always pass false for cache to ensure fresh results for each unique query
         // The cache is cleared before each search anyway, so this ensures no stale results
+        // Note: If ScrapingEngine supports pagination in the future, pass 'pages' to it.
         return scrapingEngine.searchAllProviders(query, false)
     }
     
@@ -158,9 +160,7 @@ class AggregatorRepository @Inject constructor(
     
     // Helper methods
     private suspend fun generateScrapingConfig(provider: Provider, analysis: SiteAnalysis) {
-        // Build search URL template
         val searchUrlTemplate = buildSearchUrlTemplate(provider.baseUrl, analysis)
-        
         val config = ScrapingConfig(
             providerId = provider.id,
             searchUrlTemplate = searchUrlTemplate,
@@ -172,12 +172,10 @@ class AggregatorRepository @Inject constructor(
             dateSelector = analysis.dateSelector,
             ratingSelector = analysis.ratingSelector
         )
-        
         scrapingConfigDao.insertConfig(config)
     }
     
     private fun buildSearchUrlTemplate(baseUrl: String, analysis: SiteAnalysis): String {
-        // Try to detect search pattern from analysis
         return when {
             analysis.searchFormSelector != null -> "$baseUrl/search?q={query}&page={page}"
             analysis.hasAPI -> "$baseUrl/api/search?query={query}&page={page}"
@@ -231,7 +229,6 @@ class AggregatorRepository @Inject constructor(
 
     // ── Like / preference learning ─────────────────────────────────────
 
-    /** Toggle a like on/off. Returns true if the result is now liked. */
     suspend fun toggleLike(result: SearchResult): Boolean {
         val existing = likedResultDao.getLikedByUrl(result.url)
         return if (existing != null) {
@@ -265,22 +262,12 @@ class AggregatorRepository @Inject constructor(
         }
     }
 
-    /** Returns all liked URLs for quick UI state lookup. */
     suspend fun getAllLikedUrls(): Set<String> =
         likedResultDao.getAllLikedUrls().toSet()
 
-    /** Returns Flow of all liked results (for a future "Liked" screen). */
     fun getAllLikedResults(): Flow<List<LikedResult>> =
         likedResultDao.getAllLikedResults()
 
-    /**
-     * Rebuild the learned user profile from the full like history.
-     * Called automatically whenever a like is added or removed.
-     *
-     * The profile aggregates keyword frequencies, provider frequencies,
-     * and quality preferences into normalised 0-1 weight maps so the
-     * RankingEngine can boost Top Results accordingly.
-     */
     private suspend fun rebuildLearnedProfile() {
         val likes = likedResultDao.getAllLikedResults().first()
         if (likes.isEmpty()) {
@@ -288,7 +275,6 @@ class AggregatorRepository @Inject constructor(
             return
         }
 
-        // ── Keyword frequencies ───────────────────────────────────────
         val keywordCounts = mutableMapOf<String, Int>()
         likes.forEach { like ->
             like.titleKeywords.split(",").filter { it.isNotBlank() }.forEach { kw ->
@@ -300,14 +286,12 @@ class AggregatorRepository @Inject constructor(
             count.toFloat() / maxKwCount
         }
 
-        // ── Provider frequencies ──────────────────────────────────────
         val providerCounts = likes.groupingBy { it.providerId }.eachCount()
         val maxProvCount = providerCounts.values.maxOrNull()?.toFloat() ?: 1f
         val providerWeights = providerCounts.mapValues { (_, count) ->
             count.toFloat() / maxProvCount
         }
 
-        // ── Quality frequencies ───────────────────────────────────────
         val qualityCounts = likes.filter { !it.quality.isNullOrBlank() }
             .groupingBy { it.quality!!.lowercase() }.eachCount()
         val maxQCount = qualityCounts.values.maxOrNull()?.toFloat() ?: 1f
@@ -315,7 +299,6 @@ class AggregatorRepository @Inject constructor(
             count.toFloat() / maxQCount
         }
 
-        // ── Category frequencies (stored but reserved for future use) ─
         val categoryCounts = likes.filter { !it.category.isNullOrBlank() }
             .groupingBy { it.category!!.lowercase() }.eachCount()
         val maxCatCount = categoryCounts.values.maxOrNull()?.toFloat() ?: 1f
