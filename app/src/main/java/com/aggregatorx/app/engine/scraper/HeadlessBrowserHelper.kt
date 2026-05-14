@@ -13,6 +13,10 @@ import org.jsoup.nodes.Document
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
 
+/**
+ * HeadlessBrowserHelper — Native Android scraping stack.
+ * Replaces Playwright with OkHttp + Jsoup + Regex for mobile performance.
+ */
 object HeadlessBrowserHelper {
 
     private const val TAG = "HeadlessBrowserHelper"
@@ -38,7 +42,8 @@ object HeadlessBrowserHelper {
             .build()
     }
 
-    // --- JS Deobfuscation Logic ---
+    // ── JS Deobfuscation ──────────────────────────────────────────────────────
+
     fun deobfuscateJs(js: String): String {
         var result = js
         var iterations = 0
@@ -81,7 +86,8 @@ object HeadlessBrowserHelper {
         return sb.toString()
     }
 
-    // --- Stub Page Implementation ---
+    // ── Native Page Stub (Playwright Compatibility) ──────────────────────────
+
     class NativePage(val pageUrl: String = "") {
         private var _html: String = ""
         fun html(): String = _html
@@ -93,6 +99,8 @@ object HeadlessBrowserHelper {
 
     fun createAntiDetectionPage(): NativePage = NativePage()
     fun close() { cookieJar.clear() }
+
+    // ── Core Fetching ────────────────────────────────────────────────────────
 
     suspend fun fetchRaw(url: String): String? = withContext(Dispatchers.IO) {
         try {
