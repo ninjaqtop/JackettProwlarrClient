@@ -14,13 +14,15 @@ import com.aggregatorx.app.engine.token.TokenManager
 import com.aggregatorx.app.engine.util.EngineUtils
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.delay
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import javax.inject.Inject
 
 /**
- * Lightweight result returned by video extraction so the UI can forward
- * both the playable URL **and** the HTTP headers that the CDN expects.
+ * Lightweight result for video extraction.
+ * Forwards both the playable URL and the specific HTTP headers (Referer/Origin)
+ * required by the source CDN to prevent 403 Forbidden errors.
  */
 data class VideoPreviewResult(
     val videoUrl: String,
@@ -48,34 +50,22 @@ class SearchViewModel @Inject constructor(
 
     val downloads: StateFlow<Map<String, DownloadState>> = downloadManager.downloads
 
-    // ── Liked-result state ──────────────────────────────────────────────
     private val _likedUrls = MutableStateFlow<Set<String>>(emptySet())
     val likedUrls: StateFlow<Set<String>> = _likedUrls.asStateFlow()
 
-    // ── MISSION CONTROL: Discovery pause flag ───────────────────────────
-    // When true, all Pass-1 and Pass-2 background coroutines are suspended.
-    // The results feed stays static and scrollable; no new data is injected.
     private val _isDiscoveryPaused = MutableStateFlow(false)
     val isDiscoveryPaused: StateFlow<Boolean> = _isDiscoveryPaused.asStateFlow()
 
-    // ── Per-provider pagination state ───────────────────────────────────
     private val _providerPages = MutableStateFlow<Map<String, Int>>(emptyMap())
     val providerPages: StateFlow<Map<String, Int>> = _providerPages.asStateFlow()
 
-    // ── TOKENS tab: URLs discovered via token injection/replay ───────────
-    // Each entry is a SearchResult synthesised from a token-discovered URL.
     private val _tokenResults = MutableStateFlow<List<SearchResult>>(emptyList())
     val tokenResults: StateFlow<List<SearchResult>> = _tokenResults.asStateFlow()
 
-    // ── MY AI tab: preference-ranked results from liked history ──────────
-    // Populated after aggregation completes using the RankingEngine profile.
     private val _myAiResults = MutableStateFlow<List<SearchResult>>(emptyList())
     val myAiResults: StateFlow<List<SearchResult>> = _myAiResults.asStateFlow()
 
-    // Video URL cache
     private val videoPreviewCache = java.util.concurrent.ConcurrentHashMap<String, VideoPreviewResult>()
-
-    // Active search job — cancelled on new search or panic refresh
     private var currentSearchJob: Job? = null
 
     init {
@@ -89,9 +79,10 @@ class SearchViewModel @Inject constructor(
         }
     }
 
-    // ── PANIC REFRESH ───────────────────────────────────────────────────
-    // Clears ViewModel cache, requests GC, and hard-restarts the discovery
-    // loop for the current query. Fixes lag / thermal spikes on long shifts.
+    /**
+     * PANIC REFRESH: Hard-resets the ViewModel state and clears memory.
+     * Use this when the app experiences lag or high battery drain during heavy scraping.
+     */
     fun panicRefresh() {
         currentSearchJob?.cancel()
         videoPreviewCache.clear()
@@ -110,7 +101,7 @@ class SearchViewModel @Inject constructor(
         }
         @Suppress("ExplicitGarbageCollectionCall")
         System.gc()
-        // Re-launch discovery if a query is active
+        
         val query = _uiState.value.currentSearchQuery
         if (query.isNotEmpty()) {
             _uiState.update { it.copy(query = query) }
@@ -118,19 +109,18 @@ class SearchViewModel @Inject constructor(
         }
     }
 
-    // ── PAUSE / RESUME DISCOVERY ────────────────────────────────────────
-    // Toggles the pause flag. When paused, the active search job is
-    // cancelled so no new data is injected. Resuming re-launches the search.
+    /**
+     * Toggles discovery pause. Suspending the job stops background data injection,
+     * allowing the user to scroll results without UI jumps.
+     */
     fun toggleDiscoveryPause() {
         val nowPaused = !_isDiscoveryPaused.value
         _isDiscoveryPaused.value = nowPaused
         if (nowPaused) {
-            // Suspend all background coroutines immediately
             currentSearchJob?.cancel()
             currentSearchJob = null
             _uiState.update { it.copy(isSearching = false) }
         } else {
-            // Resume — re-launch discovery from current query
             val query = _uiState.value.currentSearchQuery
             if (query.isNotEmpty()) {
                 _uiState.update { it.copy(query = query) }
@@ -139,7 +129,6 @@ class SearchViewModel @Inject constructor(
         }
     }
 
-    // ── Per-provider pagination ─────────────────────────────────────────
     fun nextProviderPage(providerId: String) {
         _providerPages.update { pages ->
             val current = pages[providerId] ?: 0
@@ -158,7 +147,6 @@ class SearchViewModel @Inject constructor(
         _providerPages.update { pages -> pages + (providerId to 0) }
     }
 
-    /** Toggle like on a search result. Updates local set immediately for snappy UI. */
     fun toggleLike(result: SearchResult) {
         viewModelScope.launch {
             val nowLiked = repository.toggleLike(result)
@@ -172,16 +160,17 @@ class SearchViewModel @Inject constructor(
         _uiState.update { it.copy(query = query) }
     }
     
+    /**
+     * Primary search entry point. 
+     * Runs the concurrent multi-provider scrape followed by AI-ranking passes.
+     */
     fun search() {
         val query = _uiState.value.query.trim()
-        if (query.isEmpty()) return
-        if (_isDiscoveryPaused.value) return
+        if (query.isEmpty() || _isDiscoveryPaused.value) return
 
-        // Cancel any in-flight search immediately
         currentSearchJob?.cancel()
 
         currentSearchJob = viewModelScope.launch {
-            // ── Full fresh scrape: wipe every cache and prior result ──────
             repository.clearSearchCache()
             videoPreviewCache.clear()
             _providerPages.value  = emptyMap()
@@ -206,19 +195,14 @@ class SearchViewModel @Inject constructor(
             
             repository.searchAllProviders(query)
                 .catch { e ->
-                    // Only set error if we have NO results at all — otherwise partial results are fine
                     if (results.isEmpty()) {
-                        _uiState.update { 
-                            it.copy(error = e.message ?: "Search failed") 
-                        }
+                        _uiState.update { it.copy(error = e.message ?: "Search failed", isSearching = false) }
                     }
                 }
                 .collect { providerResult ->
                     results.add(providerResult)
                     _providerResults.value = results.toList()
                     
-                    // Update aggregated results — wrap in try-catch so aggregation
-                    // failure never kills the collection loop
                     try {
                         val aggregated = repository.aggregateSearchResults(query, results)
                         _uiState.update { 
@@ -227,11 +211,10 @@ class SearchViewModel @Inject constructor(
                                 totalResults = aggregated.totalResults,
                                 successfulProviders = aggregated.successfulProviders,
                                 failedProviders = aggregated.failedProviders,
-                                error = null // clear any previous error since we got results
+                                error = null
                             ) 
                         }
                     } catch (e: Exception) {
-                        // Aggregation failed — still show raw provider results
                         _uiState.update {
                             it.copy(
                                 totalResults = results.sumOf { r -> r.results.size },
@@ -244,223 +227,120 @@ class SearchViewModel @Inject constructor(
             
             _uiState.update { it.copy(isSearching = false, searchCompleted = true) }
 
-            // ── Post-search: token discovery pass ────────────────────────
-            // Run token harvesting against each active provider in background.
-            // Results surface in the TOKENS quick-tab.
+            // PASS 1: Token Discovery (Background)
             launch {
                 val tokenFound = mutableListOf<SearchResult>()
                 results.filter { it.success }.forEach { providerResult ->
                     try {
-                        val providerUrl = providerResult.provider.baseUrl
-                        val discovered = tokenManager.replayTokensForSearch(providerUrl, query)
-                        discovered.take(20).forEach { url ->
-                            tokenFound.add(
-                                SearchResult(
-                                    providerId    = providerResult.provider.id.toString(),
-                                    providerName  = providerResult.provider.name + " [TOKEN]",
-                                    title         = "Token-discovered: ${url.take(80)}",
-                                    url           = url,
-                                    relevanceScore = 75f
-                                )
-                            )
+                        val discovered = tokenManager.replayTokensForSearch(providerResult.provider.baseUrl, query)
+                        discovered.take(15).forEach { url ->
+                            tokenFound.add(SearchResult(
+                                providerId = providerResult.provider.id,
+                                providerName = "${providerResult.provider.name} [TOKEN]",
+                                title = "Deep Link: ${url.takeLast(30)}",
+                                url = url,
+                                relevanceScore = 80f
+                            ))
                         }
                     } catch (_: Exception) {}
                 }
-                if (tokenFound.isNotEmpty()) {
-                    _tokenResults.value = tokenFound.distinctBy { it.url }
-                }
+                if (tokenFound.isNotEmpty()) _tokenResults.value = tokenFound.distinctBy { it.url }
             }
 
-            // ── Post-search: MY AI preference ranking ────────────────────
-            // Score all results against the liked-URL preference profile and
-            // surface the top matches in the MY AI quick-tab.
+            // PASS 2: MY AI Preference Ranking (Background)
             launch {
                 val likedSet = _likedUrls.value
                 if (likedSet.isEmpty()) return@launch
-                val allResults = results.flatMap { it.results }
-                // Boost results whose source domain matches liked domains
+                
                 val likedDomains = likedSet.mapNotNull { url ->
                     try { java.net.URI(url).host } catch (_: Exception) { null }
                 }.toSet()
-                val aiRanked = allResults
+
+                val aiRanked = results.flatMap { it.results }
                     .map { r ->
                         val domain = try { java.net.URI(r.url).host } catch (_: Exception) { "" }
-                        val boost  = if (domain in likedDomains) 30f else 0f
+                        val boost = if (domain in likedDomains) 40f else 0f
                         r.copy(relevanceScore = r.relevanceScore + boost)
                     }
                     .sortedByDescending { it.relevanceScore }
-                    .take(50)
+                    .take(60)
                 _myAiResults.value = aiRanked
             }
         }
     }
     
     fun clearSearch() {
-        _uiState.update { 
-            it.copy(
-                query = "",
-                aggregatedResults = null,
-                searchCompleted = false,
-                error = null
-            ) 
-        }
+        _uiState.update { it.copy(query = "", aggregatedResults = null, searchCompleted = false, error = null) }
         _providerResults.value = emptyList()
-        // Clear video URL cache when search is cleared
         videoPreviewCache.clear()
     }
     
-    fun clearError() {
-        _uiState.update { it.copy(error = null) }
-    }
+    fun clearError() { _uiState.update { it.copy(error = null) } }
     
-    fun clearSearchHistory() {
-        viewModelScope.launch {
-            repository.clearSearchHistory()
-        }
-    }
+    fun clearSearchHistory() { viewModelScope.launch { repository.clearSearchHistory() } }
     
     fun searchFromHistory(query: String) {
-        // Set query then trigger a full fresh search
         _uiState.update { it.copy(query = query) }
         search()
     }
     
     /**
-     * Extract video URL from a page URL using the FULL resolution chain:
-     *   1) Cache hit
-     *   2) VideoExtractorEngine fast (JSoup, no browser)
-     *   3) VideoExtractorEngine full (known host extractors + iframe + headless)
-     *   4) VideoStreamResolver (direct → proxy → headless → site-specific extractors)
-     *   5) Direct URL probe: if pageUrl itself looks playable, try it directly
-     *   6) Fallback: return the page URL itself for embeddable sites
-     *   7) Last resort: pass the raw URL to the player (never returns null)
-     *
-     * Returns [VideoPreviewResult] with a playable URL and HTTP headers,
-     * or **null** if no playable stream could be found.  Null is explicitly
-     * preferable to returning an HTML page URL — the caller should show
-     * an error dialog instead of feeding HTML to ExoPlayer.
+     * Resolves a page URL into a playable stream using a prioritized chain.
+     * Prevents feeding HTML to the player via isLikelyMediaUrl safety checks.
      */
     suspend fun extractVideoForPreview(pageUrl: String): VideoPreviewResult? {
-        // 1. Cache hit — only return if the cached URL still looks valid
         videoPreviewCache[pageUrl]?.let { cached ->
             if (isLikelyMediaUrl(cached.videoUrl)) return cached
-            else videoPreviewCache.remove(pageUrl)  // purge stale/bad cache entries
+            else videoPreviewCache.remove(pageUrl)
         }
 
         return try {
-            // 2. AdvancedVideoExtractorEngine — primary (50+ site-specific + generic)
+            // Priority 1: Advanced Extraction (Pattern Matching & De-obfuscation)
             val advResult = advancedExtractor.extract(pageUrl)
             if (advResult.success && !advResult.videoUrl.isNullOrEmpty() && isLikelyMediaUrl(advResult.videoUrl)) {
-                val result = VideoPreviewResult(
-                    videoUrl = advResult.videoUrl,
-                    headers = buildPlaybackHeaders(pageUrl)
-                )
-                videoPreviewCache[pageUrl] = result
-                return result
+                return cacheAndReturn(pageUrl, advResult.videoUrl)
             }
 
-            // 3. Fast extraction (JSoup only – no headless browser)
+            // Priority 2: Fast Path (DOM parsing)
             val fastUrl = videoExtractor.extractVideoUrlForPreview(pageUrl)
             if (!fastUrl.isNullOrEmpty() && isLikelyMediaUrl(fastUrl)) {
-                val result = VideoPreviewResult(
-                    videoUrl = fastUrl,
-                    headers = buildPlaybackHeaders(pageUrl)
-                )
-                videoPreviewCache[pageUrl] = result
-                return result
+                return cacheAndReturn(pageUrl, fastUrl)
             }
 
-            // 4. Full extraction (known host extractors + standard HTML + headless)
-            val fullExtraction = videoExtractor.extractVideoUrl(pageUrl)
-            if (fullExtraction.success && !fullExtraction.videoUrl.isNullOrEmpty()
-                && isLikelyMediaUrl(fullExtraction.videoUrl)
-            ) {
-                val result = VideoPreviewResult(
-                    videoUrl = fullExtraction.videoUrl,
-                    headers = buildPlaybackHeaders(pageUrl)
-                )
-                videoPreviewCache[pageUrl] = result
-                return result
-            }
-
-            // 5. Full resolution chain (proxy → headless → site-specific)
+            // Priority 3: Full Resolution (Stream Resolvers & Proxies)
             val resolved = videoStreamResolver.resolveVideoStream(pageUrl)
-            if (resolved.success && !resolved.streamUrl.isNullOrEmpty()
-                && isLikelyMediaUrl(resolved.streamUrl)
-            ) {
-                val result = VideoPreviewResult(
-                    videoUrl = resolved.streamUrl,
-                    headers = resolved.headers ?: buildPlaybackHeaders(pageUrl)
-                )
-                videoPreviewCache[pageUrl] = result
-                return result
+            if (resolved.success && !resolved.streamUrl.isNullOrEmpty() && isLikelyMediaUrl(resolved.streamUrl)) {
+                val res = VideoPreviewResult(resolved.streamUrl, resolved.headers ?: buildPlaybackHeaders(pageUrl))
+                videoPreviewCache[pageUrl] = res
+                return res
             }
 
-            // 5. Direct URL probe – if the page URL itself is a direct media link
-            if (isLikelyMediaUrl(pageUrl)) {
-                val result = VideoPreviewResult(
-                    videoUrl = pageUrl,
-                    headers = buildPlaybackHeaders(pageUrl)
-                )
-                videoPreviewCache[pageUrl] = result
-                return result
-            }
+            // Fallback: Direct probe
+            if (isLikelyMediaUrl(pageUrl)) return cacheAndReturn(pageUrl, pageUrl)
 
-            // 6. (removed) — Embeddable sites (YouTube, Vimeo, etc.) cannot be
-            //    played directly in ExoPlayer.  They would need yt-dlp or similar
-            //    which we don't bundle.  Don't pretend these are playable.
-
-            // 7. Last resort — only return the raw URL if it actually looks like
-            //    a media stream (e.g. direct .mp4 link from a CDN).
-            //    If the URL is just an HTML page, return null so the caller
-            //    can show a proper error instead of feeding HTML to ExoPlayer.
-            if (isLikelyMediaUrl(pageUrl)) {
-                val fallback = VideoPreviewResult(
-                    videoUrl = pageUrl,
-                    headers = buildPlaybackHeaders(pageUrl)
-                )
-                videoPreviewCache[pageUrl] = fallback
-                return fallback
-            }
-
-            // Extraction failed — no playable stream found
-            return null
+            null
         } catch (e: Exception) {
-            // On exception, only return raw URL if it looks like actual media
-            return if (isLikelyMediaUrl(pageUrl)) {
-                VideoPreviewResult(
-                    videoUrl = pageUrl,
-                    headers = buildPlaybackHeaders(pageUrl)
-                )
-            } else {
-                null
-            }
+            if (isLikelyMediaUrl(pageUrl)) cacheAndReturn(pageUrl, pageUrl) else null
         }
     }
 
-    /**
-     * Checks whether a URL plausibly points to a media stream rather than an HTML page.
-     * Used as a safety gate to avoid handing HTML pages to ExoPlayer.
-     */
+    private fun cacheAndReturn(pageUrl: String, videoUrl: String): VideoPreviewResult {
+        val result = VideoPreviewResult(videoUrl, buildPlaybackHeaders(pageUrl))
+        videoPreviewCache[pageUrl] = result
+        return result
+    }
+
     private fun isLikelyMediaUrl(url: String): Boolean {
-        val lowerUrl = url.lowercase()
-        val videoIndicators = listOf(
-            ".mp4", ".m3u8", ".mpd", ".webm", ".mkv", ".avi", ".mov",
-            ".flv", ".wmv", ".ts", ".m4v", ".3gp", ".f4v", ".ogv",
-            "/hls/", "/dash/", "/video/", "/stream/", "videoplayback",
-            "/get_video", "/dl/", "/media/", "/embed/",
-            "googlevideo.com", "akamaized.net", "cdn.streamtape",
-            "dood.", "filemoon.", "streamwish.", "mixdrop.", "voe.sx"
+        val lower = url.lowercase()
+        val indicators = listOf(
+            ".mp4", ".m3u8", ".mpd", ".webm", ".mkv", ".ts", "/hls/", "/dash/", 
+            "videoplayback", "googlevideo", "akamaized", "cdn", "dood.", "streamtape"
         )
-        return videoIndicators.any { lowerUrl.contains(it) }
+        return indicators.any { lower.contains(it) }
     }
 
-    /** Convenience wrapper that keeps the old String?-returning signature for callers that don't need headers. */
-    suspend fun extractVideoUrlForPreview(pageUrl: String): String? {
-        return extractVideoForPreview(pageUrl)?.videoUrl
-    }
+    suspend fun extractVideoUrlForPreview(pageUrl: String): String? = extractVideoForPreview(pageUrl)?.videoUrl
 
-    /** Build standard playback headers from the originating page URL. */
     private fun buildPlaybackHeaders(pageUrl: String): Map<String, String> {
         val origin = try {
             val uri = android.net.Uri.parse(pageUrl)
@@ -469,116 +349,65 @@ class SearchViewModel @Inject constructor(
         return mapOf(
             "User-Agent" to EngineUtils.DEFAULT_USER_AGENT,
             "Referer" to "$origin/",
-            "Origin" to origin,
-            "Accept" to "*/*"
+            "Origin" to origin
         )
     }
     
     /**
-     * Extract video URL from a search result page — Watch button handler.
-     *
-     * Resolution order:
-     *   1. AdvancedVideoExtractorEngine (50+ site-specific + generic)
-     *   2. VideoExtractorEngine (legacy fast path)
-     *   3. VideoStreamResolver (proxy → headless → site-specific chain)
+     * Comprehensive video extraction for the UI Watch action.
      */
     fun extractVideoUrl(result: SearchResult) {
         viewModelScope.launch {
             _videoExtractionState.value = VideoExtractionState.Extracting(result.title)
             try {
-                // Step 1: AdvancedVideoExtractorEngine
-                val advResult = advancedExtractor.extract(result.url)
-                if (advResult.success && !advResult.videoUrl.isNullOrEmpty()) {
+                val adv = advancedExtractor.extract(result.url)
+                if (adv.success && !adv.videoUrl.isNullOrEmpty()) {
                     _videoExtractionState.value = VideoExtractionState.Success(
-                        videoUrl = advResult.videoUrl,
+                        videoUrl = adv.videoUrl,
                         title = result.title,
-                        quality = advResult.quality,
-                        isStream = advResult.isStream,
+                        quality = adv.quality,
+                        isStream = adv.isStream,
                         headers = buildPlaybackHeaders(result.url)
                     )
                     return@launch
                 }
 
-                // Step 2: Legacy VideoExtractorEngine
-                val legacyResult = videoExtractor.extractVideoUrl(result.url)
-                if (legacyResult.success && !legacyResult.videoUrl.isNullOrEmpty()) {
+                val res = videoStreamResolver.resolveVideoStream(result.url)
+                if (res.success && !res.streamUrl.isNullOrEmpty()) {
                     _videoExtractionState.value = VideoExtractionState.Success(
-                        videoUrl = legacyResult.videoUrl,
+                        videoUrl = res.streamUrl,
                         title = result.title,
-                        quality = legacyResult.quality,
-                        isStream = legacyResult.format in listOf("m3u8", "mpd", "hls"),
-                        headers = buildPlaybackHeaders(result.url)
+                        quality = res.quality,
+                        isStream = res.streamType.name in listOf("HLS", "DASH"),
+                        headers = res.headers ?: buildPlaybackHeaders(result.url)
                     )
                     return@launch
                 }
 
-                // Step 3: Full resolution chain
-                val resolved = videoStreamResolver.resolveVideoStream(result.url)
-                if (resolved.success && !resolved.streamUrl.isNullOrEmpty()) {
-                    _videoExtractionState.value = VideoExtractionState.Success(
-                        videoUrl = resolved.streamUrl,
-                        title = result.title,
-                        quality = resolved.quality,
-                        isStream = resolved.streamType.name in listOf("HLS", "DASH"),
-                        headers = resolved.headers ?: buildPlaybackHeaders(result.url)
-                    )
-                    return@launch
-                }
-
-                _videoExtractionState.value = VideoExtractionState.Error(
-                    "Could not extract a playable stream from this URL. Try opening in browser."
-                )
+                _videoExtractionState.value = VideoExtractionState.Error("Extraction failed. Try opening in external browser.")
             } catch (e: Exception) {
-                _videoExtractionState.value = VideoExtractionState.Error(
-                    e.message ?: "Video extraction failed"
-                )
+                _videoExtractionState.value = VideoExtractionState.Error(e.message ?: "Extraction failed")
             }
         }
     }
     
-    /**
-     * Reset video extraction state
-     */
-    fun resetVideoState() {
-        _videoExtractionState.value = VideoExtractionState.Idle
-    }
+    fun resetVideoState() { _videoExtractionState.value = VideoExtractionState.Idle }
     
-    /**
-     * Start download for a search result
-     */
     fun downloadResult(result: SearchResult) {
         viewModelScope.launch {
-            try {
-                downloadManager.downloadFromPage(result.url, result.title)
-            } catch (e: Exception) {
-                _uiState.update { 
-                    it.copy(error = "Download failed: ${e.message}") 
-                }
-            }
+            try { downloadManager.downloadFromPage(result.url, result.title) } 
+            catch (e: Exception) { _uiState.update { it.copy(error = "Download failed: ${e.message}") } }
         }
     }
     
-    /**
-     * Download from extracted video URL directly
-     */
     fun downloadVideoUrl(videoUrl: String, title: String) {
         viewModelScope.launch {
-            try {
-                downloadManager.downloadDirect(videoUrl, title)
-            } catch (e: Exception) {
-                _uiState.update { 
-                    it.copy(error = "Download failed: ${e.message}") 
-                }
-            }
+            try { downloadManager.downloadDirect(videoUrl, title) } 
+            catch (e: Exception) { _uiState.update { it.copy(error = "Download failed: ${e.message}") } }
         }
     }
     
-    /**
-     * Cancel a download
-     */
-    fun cancelDownload(downloadId: String) {
-        downloadManager.cancelDownload(downloadId)
-    }
+    fun cancelDownload(downloadId: String) { downloadManager.cancelDownload(downloadId) }
 }
 
 data class SearchUiState(
@@ -594,9 +423,6 @@ data class SearchUiState(
     val error: String? = null
 )
 
-/**
- * State for video extraction process
- */
 sealed class VideoExtractionState {
     object Idle : VideoExtractionState()
     data class Extracting(val title: String) : VideoExtractionState()
