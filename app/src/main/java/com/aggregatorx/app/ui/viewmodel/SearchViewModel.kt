@@ -92,6 +92,7 @@ class SearchViewModel @Inject constructor(
             _uiState.update { it.copy(isSearching = true, currentSearchQuery = query, error = null) }
             val currentResults = if (isLoadMore) _providerResults.value.toMutableList() else mutableListOf()
 
+            // Calls Repository using the new pages parameter fix
             repository.searchAllProviders(query, pages = _providerPages.value)
                 .catch { e -> if (currentResults.isEmpty()) _uiState.update { it.copy(error = e.message) } }
                 .collect { providerResult ->
