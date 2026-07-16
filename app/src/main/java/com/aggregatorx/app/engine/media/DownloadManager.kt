@@ -9,6 +9,7 @@ import android.os.Build
 import android.os.Environment
 import androidx.core.app.NotificationCompat
 import androidx.core.content.FileProvider
+import com.aggregatorx.app.engine.network.TlsFingerprintEngine
 import com.aggregatorx.app.engine.scraper.HeadlessBrowserHelper
 import dagger.hilt.android.qualifiers.ApplicationContext
 import kotlinx.coroutines.*
@@ -46,7 +47,7 @@ class DownloadManager @Inject constructor(
     var downloadDirectory: String? = null
 ) {
     
-    private val httpClient = OkHttpClient.Builder()
+    private val httpClient = TlsFingerprintEngine().apply(OkHttpClient.Builder(), TlsFingerprintEngine.Profile.CHROME)
         .connectTimeout(60, TimeUnit.SECONDS)
         .readTimeout(180, TimeUnit.SECONDS)
         .writeTimeout(180, TimeUnit.SECONDS)

@@ -8,6 +8,7 @@ import android.webkit.WebChromeClient
 import android.webkit.WebResourceRequest
 import android.webkit.WebView
 import android.webkit.WebViewClient
+import com.aggregatorx.app.engine.network.TlsFingerprintEngine
 import com.aggregatorx.app.engine.util.EngineUtils
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
@@ -33,25 +34,16 @@ object HeadlessBrowserHelper {
 
     private const val TAG = "HeadlessBrowserHelper"
     @Volatile private var appContext: Context? = null
+    private val tlsFingerprintEngine = TlsFingerprintEngine()
     private val cookieJar = InMemoryCookieJar()
 
     private val client: OkHttpClient by lazy {
-        OkHttpClient.Builder()
+        tlsFingerprintEngine.apply(OkHttpClient.Builder(), TlsFingerprintEngine.Profile.CHROME)
             .connectTimeout(20, TimeUnit.SECONDS)
             .readTimeout(20, TimeUnit.SECONDS)
             .followRedirects(true)
             .followSslRedirects(true)
             .cookieJar(cookieJar)
-            .addInterceptor { chain ->
-                val req = chain.request().newBuilder()
-                    .header("User-Agent", EngineUtils.DEFAULT_USER_AGENT)
-                    .header("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8")
-                    .header("Accept-Language", "en-US,en;q=0.9")
-                    .header("Sec-Ch-Ua-Mobile", "?1")
-                    .header("Upgrade-Insecure-Requests", "1")
-                    .build()
-                chain.proceed(req)
-            }
             .build()
     }
 
