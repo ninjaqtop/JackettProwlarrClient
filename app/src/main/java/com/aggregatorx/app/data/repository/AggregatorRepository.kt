@@ -109,12 +109,10 @@ class AggregatorRepository @Inject constructor(
         return siteAnalysisDao.getLatestAnalysis(providerId)
     }
     
-    // BUILD FIX: Added `pages` parameter to match ViewModel call.
     fun searchAllProviders(query: String, pages: Map<String, Int> = emptyMap()): Flow<ProviderSearchResults> {
-        // Always pass false for cache to ensure fresh results for each unique query
-        // The cache is cleared before each search anyway, so this ensures no stale results
-        // Note: If ScrapingEngine supports pagination in the future, pass 'pages' to it.
-        return scrapingEngine.searchAllProviders(query, false)
+        // Always bypass cache from the UI search path so newly analyzed providers and
+        // explicit page requests are reflected immediately.
+        return scrapingEngine.searchAllProviders(query, pages, false)
     }
     
     suspend fun aggregateSearchResults(

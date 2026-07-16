@@ -1,17 +1,22 @@
 package com.aggregatorx.app.engine.analyzer
 
 import com.aggregatorx.app.data.model.*
+import com.aggregatorx.app.engine.scraper.HeadlessBrowserHelper
+import com.aggregatorx.app.engine.token.TokenManager
+import com.aggregatorx.app.engine.vision.VisionEngine
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import org.jsoup.select.Elements
+import java.net.InetAddress
 import java.net.URL
 import java.security.cert.X509Certificate
 import javax.inject.Inject
 import javax.inject.Singleton
 import javax.net.ssl.HttpsURLConnection
+import kotlinx.serialization.Serializable
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
 
@@ -29,7 +34,11 @@ import kotlinx.serialization.json.Json
  * - Results cached per URL to avoid redundant network calls
  */
 @Singleton
-class SiteAnalyzerEngine @Inject constructor() {
+class SiteAnalyzerEngine @Inject constructor(
+    private val endpointDiscoveryEngine: EndpointDiscoveryEngine,
+    private val tokenManager: TokenManager,
+    private val visionEngine: VisionEngine
+) {
 
     /** Cache: url → (SiteAnalysis, timestamp) */
     private val analysisCache = mutableMapOf<String, Pair<SiteAnalysis, Long>>()
@@ -42,6 +51,7 @@ class SiteAnalyzerEngine @Inject constructor() {
     companion object {
         private const val DEFAULT_TIMEOUT = 30000
         private const val ANALYSIS_CACHE_TTL_MS = 3_600_000L // 1 hour
+        const val CAPABILITY_REPORT_HEADER = "AggregatorX-Capability-Report"
         private val DEFAULT_USER_AGENT = com.aggregatorx.app.engine.util.EngineUtils.DEFAULT_USER_AGENT
         
         // Common selectors for pattern detection
@@ -133,7 +143,18 @@ class SiteAnalyzerEngine @Inject constructor() {
                 .headers(MODERN_REQUEST_HEADERS)
             
             val response = connection.execute()
-            val document = response.parse()
+            val responseBody = response.body()
+            val renderedHtml = try {
+                HeadlessBrowserHelper.fetchPageContentWithShadowAndAdSkip(
+                    url = normalizedUrl,
+                    waitSelector = "body",
+                    timeout = DEFAULT_TIMEOUT
+                )
+            } catch (_: Exception) {
+                null
+            }
+            val activeHtml = renderedHtml ?: responseBody
+            val document = Jsoup.parse(activeHtml, normalizedUrl)
             val loadTime = System.currentTimeMillis() - startTime
             
             // Perform all analyses
@@ -141,9 +162,21 @@ class SiteAnalyzerEngine @Inject constructor() {
             val domAnalysis = analyzeDOMStructure(document)
             val patterns = detectPatterns(document)
             val mediaAnalysis = analyzeMediaContent(document)
-            val apiAnalysis = detectAPIEndpoints(document, response.body())
+            val apiAnalysis = detectAPIEndpoints(document, activeHtml)
             val navigationStructure = analyzeNavigation(document)
             val scrapingStrategy = determineScrapingStrategy(document, patterns)
+            val capabilityReport = buildCapabilityReport(
+                url = normalizedUrl,
+                document = document,
+                html = activeHtml,
+                headers = response.headers(),
+                mediaAnalysis = mediaAnalysis,
+                apiAnalysis = apiAnalysis,
+                loadTime = loadTime
+            )
+            val enrichedHeaders = response.headers().toMutableMap().apply {
+                put(CAPABILITY_REPORT_HEADER, json.encodeToString(capabilityReport))
+            }
             
             val result = SiteAnalysis(
                 providerId = providerId,
@@ -197,7 +230,7 @@ class SiteAnalyzerEngine @Inject constructor() {
                 // Performance
                 loadTime = loadTime,
                 resourceCount = document.select("script, link, img, video").size,
-                totalSize = response.body().length.toLong(),
+                totalSize = activeHtml.length.toLong(),
                 
                 // Scraping Config
                 scrapingStrategy = scrapingStrategy,
@@ -206,7 +239,7 @@ class SiteAnalyzerEngine @Inject constructor() {
                 
                 // Raw data
                 rawHtml = document.html().take(50000), // Limit storage
-                headers = json.encodeToString(response.headers()),
+                headers = json.encodeToString(enrichedHeaders),
                 cookies = json.encodeToString(response.cookies())
             )
             analysisCache[normalizedKey] = result to System.currentTimeMillis()
@@ -931,6 +964,272 @@ class SiteAnalyzerEngine @Inject constructor() {
         
         return confidence.coerceIn(0f, 1f)
     }
+
+    private suspend fun buildCapabilityReport(
+        url: String,
+        document: Document,
+        html: String,
+        headers: Map<String, String>,
+        mediaAnalysis: MediaAnalysisResult,
+        apiAnalysis: APIAnalysisResult,
+        loadTime: Long
+    ): AnalyzerCapabilityReport {
+        val baseUrl = extractBaseUrl(url)
+        val tokenBundle = try { tokenManager.harvestTokens(url) } catch (_: Exception) { null }
+        val deepEndpoints = try { endpointDiscoveryEngine.deepDiscoverEndpoints(baseUrl, "test") } catch (_: Exception) { null }
+        val thumbnails = collectThumbnailUrls(document, baseUrl)
+        val ocrKeywords = try { visionEngine.batchExtract(thumbnails.take(8)) } catch (_: Exception) { emptyMap() }
+        val network = analyzeNetworkTopology(url, headers)
+        val waf = analyzeWafFingerprint(headers, html)
+        val jsBundle = analyzeJsBundles(document, html, baseUrl)
+        val hiddenInputs = document.select("input[type=hidden]").size
+        val formFields = document.select("input, textarea, select").size
+        val lazyLoadCount = document.select("[loading=lazy], [data-src], [data-lazy-src], [data-original], [data-srcset]").size
+        val hasInfiniteScroll = html.contains("IntersectionObserver", ignoreCase = true) ||
+            html.contains("infinite", ignoreCase = true) ||
+            document.select("[class*=infinite], [data-infinite], [data-load-more], .load-more").isNotEmpty()
+        val shadowDomSignals = html.contains("attachShadow", ignoreCase = true) ||
+            html.contains("shadowRoot", ignoreCase = true) ||
+            document.select("template[shadowroot], template[shadowrootmode]").isNotEmpty()
+        val iframeDepth = calculateIframeDepth(document)
+        val mediaUrls = extractMediaUrls(document, html, baseUrl)
+        val drmSignals = listOf("widevine", "playready", "fairplay", "encrypted-media", "eme")
+            .filter { html.contains(it, ignoreCase = true) }
+
+        return AnalyzerCapabilityReport(
+            generatedAt = System.currentTimeMillis(),
+            sections = listOf(
+                AnalyzerCapabilitySection(
+                    title = "Security Analysis",
+                    checks = listOf(
+                        capability("SSL/TLS", if (url.startsWith("https")) "active" else "missing", if (url.startsWith("https")) "HTTPS transport enabled" else "HTTP transport only"),
+                        capability("CSP", if (headers.keys.any { it.equals("Content-Security-Policy", true) }) "detected" else "missing", headers.entries.firstOrNull { it.key.equals("Content-Security-Policy", true) }?.value?.take(120) ?: "No CSP header"),
+                        capability("HSTS", if (headers.keys.any { it.equals("Strict-Transport-Security", true) }) "detected" else "missing", headers.entries.firstOrNull { it.key.equals("Strict-Transport-Security", true) }?.value ?: "No HSTS header"),
+                        capability("X-Frame-Options", if (headers.keys.any { it.equals("X-Frame-Options", true) }) "detected" else "missing", headers.entries.firstOrNull { it.key.equals("X-Frame-Options", true) }?.value ?: "No frame protection header"),
+                        capability("CORS", if (headers.keys.any { it.equals("Access-Control-Allow-Origin", true) }) "detected" else "not_detected", headers.entries.firstOrNull { it.key.equals("Access-Control-Allow-Origin", true) }?.value ?: "No public CORS header")
+                    )
+                ),
+                AnalyzerCapabilitySection(
+                    title = "DOM Structure",
+                    checks = listOf(
+                        capability("Shadow DOM", if (shadowDomSignals) "detected" else "not_detected", "Static signals: attachShadow/shadowRoot/template shadowroot"),
+                        capability("iFrame Depth", if (iframeDepth > 0) "detected" else "not_detected", iframeDepth.toString()),
+                        capability("Form Fields", if (formFields > 0) "detected" else "not_detected", "$formFields fields, $hiddenInputs hidden"),
+                        capability("Script Sources", if (document.select("script[src]").isNotEmpty()) "detected" else "not_detected", "${document.select("script[src]").size} external scripts")
+                    )
+                ),
+                AnalyzerCapabilitySection(
+                    title = "Pattern Detection",
+                    checks = listOf(
+                        capability("Search Forms", if (findSearchInput(document) != null) "detected" else "not_detected", findSearchInput(document) ?: "No search input selector"),
+                        capability("Result Lists", if (detectPatterns(document).any { it.type == PatternType.RESULT_ITEM || it.type == PatternType.RESULT_LIST }) "detected" else "not_detected", "Selector pattern analysis"),
+                        capability("Pagination", if (detectPatterns(document).any { it.type == PatternType.PAGINATION }) "detected" else "not_detected", "Pagination selectors"),
+                        capability("Lazy Load", if (lazyLoadCount > 0) "detected" else "not_detected", "$lazyLoadCount lazy-load elements"),
+                        capability("Infinite Scroll", if (hasInfiniteScroll) "detected" else "not_detected", "IntersectionObserver/load-more/static infinite-scroll signals")
+                    )
+                ),
+                AnalyzerCapabilitySection(
+                    title = "Media Detection",
+                    checks = listOf(
+                        capability("Streams", if (mediaUrls.isNotEmpty()) "detected" else "not_detected", mediaUrls.take(5).joinToString(", ").ifBlank { "No direct media URLs" }),
+                        capability("Embedded Players", if (!mediaAnalysis.playerType.isNullOrBlank()) "detected" else "not_detected", mediaAnalysis.playerType ?: "No known player"),
+                        capability("CDN Origins", if (network.cdnProvider != "Unknown") "detected" else "not_detected", network.cdnProvider),
+                        capability("DRM Type", if (drmSignals.isNotEmpty()) "detected" else "not_detected", drmSignals.joinToString(", ").ifBlank { "No static DRM/EME signal" }),
+                        capability("Thumbnail URLs", if (thumbnails.isNotEmpty()) "detected" else "not_detected", "${thumbnails.size} thumbnail candidates")
+                    )
+                ),
+                AnalyzerCapabilitySection(
+                    title = "API & Endpoint Discovery",
+                    checks = listOf(
+                        capability("Static API Detection", if (apiAnalysis.hasAPI) "detected" else "not_detected", "${apiAnalysis.endpoints.size} endpoints, type=${apiAnalysis.type ?: "unknown"}"),
+                        capability("Deep Endpoint Discovery", if ((deepEndpoints?.searchEndpoints.orEmpty() + deepEndpoints?.apiEndpoints.orEmpty()).isNotEmpty()) "detected" else "not_detected", "${deepEndpoints?.searchEndpoints?.size ?: 0} search, ${deepEndpoints?.apiEndpoints?.size ?: 0} API"),
+                        capability("GraphQL", if ((apiAnalysis.type == "GraphQL") || deepEndpoints?.hasGraphQL == true) "detected" else "not_detected", "GraphQL endpoint/signature scan"),
+                        capability("WebSocket", if (apiAnalysis.endpoints.any { it.startsWith("ws") }) "detected" else "not_detected", "Static WebSocket constructor scan")
+                    )
+                ),
+                AnalyzerCapabilitySection(
+                    title = "Performance Metrics",
+                    checks = listOf(
+                        capability("TTFB/Load Time", "active", "${loadTime}ms"),
+                        capability("Resource Count", "active", document.select("script, link, img, video, iframe").size.toString()),
+                        capability("Page Weight", "active", "${html.length} bytes"),
+                        capability("Render Blocking", if (document.select("script:not([async]):not([defer]), link[rel=stylesheet]").isNotEmpty()) "detected" else "not_detected", "${document.select("script:not([async]):not([defer]), link[rel=stylesheet]").size} candidates"),
+                        capability("CDN Detection", if (network.cdnProvider != "Unknown") "detected" else "not_detected", network.cdnProvider)
+                    )
+                ),
+                AnalyzerCapabilitySection(
+                    title = "Token & Auth Harvesting",
+                    checks = listOf(
+                        capability("Bearer Tokens", if (!tokenBundle?.bearerTokens.isNullOrEmpty()) "detected" else "not_detected", "${tokenBundle?.bearerTokens?.size ?: 0} found"),
+                        capability("API Keys", if (!tokenBundle?.apiKeys.isNullOrEmpty()) "detected" else "not_detected", "${tokenBundle?.apiKeys?.size ?: 0} found"),
+                        capability("CSRF Tokens", if (!tokenBundle?.csrfTokens.isNullOrEmpty()) "detected" else "not_detected", "${tokenBundle?.csrfTokens?.size ?: 0} found"),
+                        capability("Session IDs", if (!tokenBundle?.sessionIds.isNullOrEmpty() || !tokenBundle?.cookies.isNullOrEmpty()) "detected" else "not_detected", "${tokenBundle?.sessionIds?.size ?: 0} IDs, ${tokenBundle?.cookies?.size ?: 0} cookies"),
+                        capability("Base64/Base44 Blobs", if (!tokenBundle?.base64Blobs.isNullOrEmpty()) "detected" else "not_detected", "${tokenBundle?.base64Blobs?.size ?: 0} candidates")
+                    )
+                ),
+                AnalyzerCapabilitySection(
+                    title = "WAF Fingerprinting",
+                    checks = listOf(
+                        capability("Detected WAF/CDN", if (waf.detected) "detected" else "not_detected", waf.provider),
+                        capability("Bypass Strategy", "active", waf.strategy)
+                    )
+                ),
+                AnalyzerCapabilitySection(
+                    title = "JS Bundle Analysis",
+                    checks = listOf(
+                        capability("Webpack Chunks", if (jsBundle.webpackChunks > 0) "detected" else "not_detected", "${jsBundle.webpackChunks} chunk signals"),
+                        capability("Obfuscated Endpoints", if (jsBundle.obfuscatedEndpointSignals > 0) "detected" else "not_detected", "${jsBundle.obfuscatedEndpointSignals} endpoint-like strings"),
+                        capability("Source Maps", if (jsBundle.sourceMaps > 0) "detected" else "not_detected", "${jsBundle.sourceMaps} source-map refs")
+                    )
+                ),
+                AnalyzerCapabilitySection(
+                    title = "Network Topology",
+                    checks = listOf(
+                        capability("Resolved IPs", if (network.ips.isNotEmpty()) "detected" else "error", network.ips.joinToString(", ").ifBlank { "No DNS resolution" }),
+                        capability("CDN Provider", if (network.cdnProvider != "Unknown") "detected" else "not_detected", network.cdnProvider),
+                        capability("Reverse Proxy", if (network.reverseProxySignals.isNotEmpty()) "detected" else "not_detected", network.reverseProxySignals.joinToString(", ").ifBlank { "No static proxy headers" }),
+                        capability("ASN/GeoIP", "native_limited", "Requires external IP intelligence service; DNS resolution is active")
+                    )
+                ),
+                AnalyzerCapabilitySection(
+                    title = "Browser Fingerprint Evasion",
+                    checks = listOf(
+                        capability("Header Rotation", "active", "Browser-like User-Agent and request headers applied"),
+                        capability("Cookie Persistence", "active", "Native helper keeps an in-memory cookie jar; WebView cookies enabled"),
+                        capability("Navigator Spoof", "active", "WebView JS override for webdriver/platform/hardware/device memory"),
+                        capability("Canvas/WebGL Spoof", "active", "WebView JS overrides for canvas noise and WebGL vendor/renderer"),
+                        capability("TLS Fingerprint", "active", "Chromium WebView TLS profile used for rendered fetches"),
+                        capability("Custom JA3 Randomisation", "external_required", "Requires an external impersonation proxy or native TLS stack; not exposed by Android WebView/OkHttp APIs")
+                    )
+                ),
+                AnalyzerCapabilitySection(
+                    title = "OCR Vision Scan",
+                    checks = listOf(
+                        capability("Thumbnail OCR", if (ocrKeywords.values.any { it.isNotEmpty() }) "detected" else if (thumbnails.isNotEmpty()) "active" else "not_detected", "${ocrKeywords.values.sumOf { it.size }} keywords from ${ocrKeywords.size} thumbnails"),
+                        capability("Quality Labels", if (ocrKeywords.values.flatten().any { it.contains("720") || it.contains("1080") || it.contains("hd") }) "detected" else "not_detected", "ML Kit OCR keyword scan")
+                    )
+                )
+            )
+        )
+    }
+
+    private fun capability(name: String, status: String, detail: String): AnalyzerCapabilityCheck =
+        AnalyzerCapabilityCheck(name = name, status = status, detail = detail)
+
+    private fun collectThumbnailUrls(document: Document, baseUrl: String): List<String> {
+        return document.select("img, source, video, [data-thumb], [data-thumbnail], [data-poster], [data-image], [style*='background-image']")
+            .mapNotNull { element -> extractImageCandidate(element, baseUrl) }
+            .distinct()
+            .take(30)
+    }
+
+    private fun extractImageCandidate(element: Element, baseUrl: String): String? {
+        val srcset = element.attr("srcset").takeIf { it.isNotBlank() }
+            ?: element.attr("data-srcset").takeIf { it.isNotBlank() }
+        val fromSrcset = srcset?.split(",")
+            ?.map { it.trim().split(Regex("\\s+")).firstOrNull().orEmpty() }
+            ?.firstOrNull { it.isNotBlank() && !it.startsWith("data:", true) }
+        val raw = listOf(
+            element.attr("src"),
+            element.attr("data-src"),
+            element.attr("data-lazy-src"),
+            element.attr("data-original"),
+            element.attr("data-thumb"),
+            element.attr("data-thumbnail"),
+            element.attr("data-poster"),
+            element.attr("data-image"),
+            element.attr("poster"),
+            fromSrcset,
+            Regex("""background(?:-image)?\s*:\s*url\(['"]?([^'")]+)['"]?\)""", RegexOption.IGNORE_CASE)
+                .find(element.attr("style"))?.groupValues?.getOrNull(1)
+        ).firstOrNull { !it.isNullOrBlank() && !it.startsWith("data:", true) } ?: return null
+        return normalizeAssetUrl(raw, baseUrl)
+    }
+
+    private fun extractMediaUrls(document: Document, html: String, baseUrl: String): List<String> {
+        val urls = linkedSetOf<String>()
+        document.select("video[src], source[src], a[href], iframe[src]").forEach { element ->
+            val raw = element.attr("src").ifBlank { element.attr("href") }
+            if (raw.containsMediaSignal()) urls.add(normalizeAssetUrl(raw, baseUrl))
+        }
+        Regex("""['"`]([^'"`]+(?:\.m3u8|\.mpd|\.mp4|\.webm)[^'"`]*)['"`]""", RegexOption.IGNORE_CASE)
+            .findAll(html)
+            .forEach { match -> urls.add(normalizeAssetUrl(match.groupValues[1].replace("\\/", "/"), baseUrl)) }
+        return urls.take(20)
+    }
+
+    private fun String.containsMediaSignal(): Boolean {
+        val lower = lowercase()
+        return listOf(".m3u8", ".mpd", ".mp4", ".webm", "videoplayback", "manifest").any { lower.contains(it) }
+    }
+
+    private fun calculateIframeDepth(document: Document): Int {
+        val iframeCount = document.select("iframe").size
+        return when {
+            iframeCount == 0 -> 0
+            iframeCount < 3 -> 1
+            iframeCount < 8 -> 2
+            else -> 3
+        }
+    }
+
+    private fun analyzeNetworkTopology(url: String, headers: Map<String, String>): NetworkTopologyResult {
+        val host = try { URL(url).host } catch (_: Exception) { "" }
+        val ips = try { InetAddress.getAllByName(host).mapNotNull { it.hostAddress }.distinct() } catch (_: Exception) { emptyList() }
+        val headerText = headers.entries.joinToString(" ") { "${it.key}:${it.value}" }.lowercase()
+        val cdn = when {
+            "cloudflare" in headerText || headers.keys.any { it.equals("CF-RAY", true) } -> "Cloudflare"
+            "akamai" in headerText -> "Akamai"
+            "fastly" in headerText -> "Fastly"
+            "cloudfront" in headerText || "x-amz-cf" in headerText -> "Amazon CloudFront"
+            "bunny" in headerText -> "BunnyCDN"
+            "cdn" in headerText -> "Generic CDN"
+            else -> "Unknown"
+        }
+        val proxySignals = headers.keys.filter { key ->
+            key.equals("Via", true) || key.equals("X-Forwarded-For", true) ||
+                key.equals("X-Real-IP", true) || key.equals("X-Cache", true)
+        }
+        return NetworkTopologyResult(ips = ips, cdnProvider = cdn, reverseProxySignals = proxySignals)
+    }
+
+    private fun analyzeWafFingerprint(headers: Map<String, String>, html: String): WafFingerprintResult {
+        val combined = (headers.entries.joinToString(" ") { "${it.key}:${it.value}" } + " " + html.take(5000)).lowercase()
+        val provider = when {
+            "cf-ray" in combined || "cloudflare" in combined -> "Cloudflare"
+            "akamai" in combined || "_abck" in combined -> "Akamai"
+            "imperva" in combined || "incapsula" in combined -> "Imperva/Incapsula"
+            "sucuri" in combined -> "Sucuri"
+            "datadome" in combined -> "DataDome"
+            "perimeterx" in combined || "_px" in combined -> "PerimeterX"
+            else -> "None detected"
+        }
+        val strategy = if (provider == "None detected") {
+            "Standard browser-like headers + retries"
+        } else {
+            "CloudflareBypassEngine/native cookie replay/headless-helper fallback"
+        }
+        return WafFingerprintResult(detected = provider != "None detected", provider = provider, strategy = strategy)
+    }
+
+    private fun analyzeJsBundles(document: Document, html: String, baseUrl: String): JsBundleResult {
+        val scripts = document.select("script[src]").map { normalizeAssetUrl(it.attr("src"), baseUrl) }
+        val webpackSignals = scripts.count { it.contains("chunk", true) || it.contains("webpack", true) || it.contains("_next/", true) } +
+            Regex("""webpackJsonp|__webpack_require__|webpackChunk""").findAll(html).count()
+        val sourceMaps = Regex("""sourceMappingURL=([^*\s]+)""").findAll(html).count() +
+            scripts.count { it.endsWith(".map", true) }
+        val endpointSignals = Regex("""['"`]([^'"`]*(?:api|ajax|graphql|search|endpoint)[^'"`]*)['"`]""", RegexOption.IGNORE_CASE)
+            .findAll(html)
+            .count()
+        return JsBundleResult(webpackChunks = webpackSignals, sourceMaps = sourceMaps, obfuscatedEndpointSignals = endpointSignals)
+    }
+
+    private fun normalizeAssetUrl(url: String, baseUrl: String): String = when {
+        url.startsWith("http") -> url
+        url.startsWith("//") -> "https:$url"
+        url.startsWith("/") -> "${extractBaseUrl(baseUrl).trimEnd('/')}$url"
+        else -> "${baseUrl.trimEnd('/')}/$url"
+    }
     
     private fun findSearchInput(document: Document): String? {
         SEARCH_INPUT_SELECTORS.forEach { selector ->
@@ -1017,6 +1316,24 @@ class SiteAnalyzerEngine @Inject constructor() {
         val endpoints: List<String>,
         val type: String?
     )
+
+    data class NetworkTopologyResult(
+        val ips: List<String>,
+        val cdnProvider: String,
+        val reverseProxySignals: List<String>
+    )
+
+    data class WafFingerprintResult(
+        val detected: Boolean,
+        val provider: String,
+        val strategy: String
+    )
+
+    data class JsBundleResult(
+        val webpackChunks: Int,
+        val sourceMaps: Int,
+        val obfuscatedEndpointSignals: Int
+    )
 }
 
 @kotlinx.serialization.Serializable
@@ -1039,4 +1356,23 @@ data class NavigationItem(
     val text: String,
     val url: String,
     val hasSubmenu: Boolean
+)
+
+@Serializable
+data class AnalyzerCapabilityReport(
+    val generatedAt: Long,
+    val sections: List<AnalyzerCapabilitySection>
+)
+
+@Serializable
+data class AnalyzerCapabilitySection(
+    val title: String,
+    val checks: List<AnalyzerCapabilityCheck>
+)
+
+@Serializable
+data class AnalyzerCapabilityCheck(
+    val name: String,
+    val status: String,
+    val detail: String
 )

@@ -579,7 +579,7 @@ fun ResultsFeed(
     onExtractVideoForPreview: (suspend (String) -> VideoPreviewResult?)? = null,
     modifier: Modifier = Modifier
 ) {
-    val PAGE_SIZE = 20
+    val PAGE_SIZE = 50
     val successProviders = providerResults.filter { it.success && it.results.isNotEmpty() }
     val failedProviders  = providerResults.filter { !it.success }
 
@@ -982,8 +982,7 @@ fun ShieldedResultCard(
             ) {
                 ActionBtn("▶", "Watch",    NeonGreen,    onWatch)
                 ActionBtn("⬇", "Download", NeonGreenDim, onDownload)
-                // Browser opens in-app WebView — user stays on results screen
-                ActionBtn("↑", "Browser",  TextSecondary) { showInAppBrowser = true }
+                ActionBtn("↑", "Browser",  TextSecondary, onBrowser)
                 ActionBtn("👁", "In App",  CyberPurple,  onInApp)
                 IconButton(onClick = onLike, modifier = Modifier.size(36.dp)) {
                     Icon(

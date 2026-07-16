@@ -28,9 +28,12 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.aggregatorx.app.data.model.SiteAnalysis
+import com.aggregatorx.app.engine.analyzer.AnalyzerCapabilityReport
+import com.aggregatorx.app.engine.analyzer.SiteAnalyzerEngine
 import com.aggregatorx.app.ui.components.*
 import com.aggregatorx.app.ui.theme.*
 import com.aggregatorx.app.ui.viewmodel.SettingsViewModel
+import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.json.Json
 
 @OptIn(ExperimentalMaterial3Api::class)
@@ -586,6 +589,7 @@ fun AnalysisDetailsSheet(
     onDismiss: () -> Unit
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    val capabilityReport = remember(analysis.headers) { parseAnalyzerCapabilityReport(analysis.headers) }
     
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -688,6 +692,19 @@ fun AnalysisDetailsSheet(
                     AnalysisDetailRow("Rate Limit", "${analysis.rateLimit} req/min")
                 }
             }
+
+            capabilityReport?.sections?.forEach { section ->
+                item {
+                    AnalysisSection(title = capabilitySectionTitle(section.title), color = capabilitySectionColor(section.title)) {
+                        section.checks.forEach { check ->
+                            AnalysisDetailRow(
+                                label = "${capabilityStatusLabel(check.status)} ${check.name}",
+                                value = check.detail.take(120)
+                            )
+                        }
+                    }
+                }
+            }
         }
     }
 }
@@ -745,4 +762,52 @@ private fun formatBytes(bytes: Long): String {
         bytes < 1024 * 1024 -> "${bytes / 1024} KB"
         else -> "${bytes / (1024 * 1024)} MB"
     }
+}
+
+private val analysisJson = Json { ignoreUnknownKeys = true }
+
+private fun parseAnalyzerCapabilityReport(headers: String): AnalyzerCapabilityReport? {
+    return try {
+        val headerMap = analysisJson.decodeFromString<Map<String, String>>(headers)
+        val rawReport = headerMap[SiteAnalyzerEngine.CAPABILITY_REPORT_HEADER] ?: return null
+        analysisJson.decodeFromString<AnalyzerCapabilityReport>(rawReport)
+    } catch (_: Exception) {
+        null
+    }
+}
+
+private fun capabilityStatusLabel(status: String): String = when (status) {
+    "active" -> "ACTIVE"
+    "detected" -> "DETECTED"
+    "not_detected" -> "NONE"
+    "missing" -> "MISSING"
+    "native_limited" -> "LIMITED"
+    "external_required" -> "EXTERNAL"
+    "error" -> "ERROR"
+    else -> status.uppercase()
+}
+
+private fun capabilitySectionTitle(title: String): String = when (title) {
+    "Security Analysis" -> "🔒 $title"
+    "DOM Structure" -> "🏗️ $title"
+    "Pattern Detection" -> "🎯 $title"
+    "Media Detection" -> "🎬 $title"
+    "API & Endpoint Discovery" -> "🔌 $title"
+    "Performance Metrics" -> "⚡ $title"
+    "Token & Auth Harvesting" -> "🔑 $title"
+    "WAF Fingerprinting" -> "🛡️ $title"
+    "JS Bundle Analysis" -> "🧩 $title"
+    "Network Topology" -> "🌐 $title"
+    "Browser Fingerprint Evasion" -> "🧬 $title"
+    "OCR Vision Scan" -> "👁️ $title"
+    else -> title
+}
+
+private fun capabilitySectionColor(title: String): Color = when (title) {
+    "Security Analysis", "WAF Fingerprinting" -> AccentGreen
+    "DOM Structure", "API & Endpoint Discovery" -> CyberCyan
+    "Media Detection", "Network Topology" -> CyberPurple
+    "Performance Metrics", "Browser Fingerprint Evasion" -> AccentOrange
+    "Token & Auth Harvesting" -> AccentRed
+    else -> NeonGreen
 }

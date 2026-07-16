@@ -8,6 +8,7 @@ import com.aggregatorx.app.engine.analyzer.SmartContentClassifier
 import com.aggregatorx.app.engine.analyzer.PageType
 import com.aggregatorx.app.engine.analyzer.ContainerType
 import com.aggregatorx.app.engine.analyzer.EndpointDiscoveryEngine
+import com.aggregatorx.app.engine.analyzer.UniversalFormatParser
 import com.aggregatorx.app.engine.ai.AIDecisionEngine
 import com.aggregatorx.app.engine.nlp.NaturalLanguageQueryProcessor
 import com.aggregatorx.app.engine.nlp.ProcessedQuery
@@ -46,6 +47,7 @@ class ScrapingEngine @Inject constructor(
     private val aiDecisionEngine: AIDecisionEngine,
     private val cloudflareBypassEngine: CloudflareBypassEngine,
     private val endpointDiscoveryEngine: EndpointDiscoveryEngine,
+    private val universalFormatParser: UniversalFormatParser,
     private val nlpProcessor: NaturalLanguageQueryProcessor
 ) {
     @Volatile
@@ -61,6 +63,8 @@ class ScrapingEngine @Inject constructor(
         private const val DEFAULT_RATE_LIMIT_MS = 50L
         private const val MAX_CONCURRENT_PROVIDERS = 20
         private const val CACHE_TTL_MS = 10 * 60 * 1000L
+        private const val TARGET_RESULTS_PER_PROVIDER = 50
+        private const val MAX_PAGES_PER_PROVIDER_SEARCH = 5
         
         private val CATEGORY_URL_PATTERNS = listOf(
             "/genre/", "/category/", "/browse/", "/filter/", "/tags/",
@@ -103,12 +107,23 @@ class ScrapingEngine @Inject constructor(
      * Search across all enabled providers concurrently.
      * Guaranteed to process every provider; failures are caught and reported individually.
      */
-    fun searchAllProviders(query: String, cache: Boolean = cacheResults): Flow<ProviderSearchResults> = flow {
+    fun searchAllProviders(
+        query: String,
+        pages: Map<String, Int> = emptyMap(),
+        cache: Boolean = cacheResults
+    ): Flow<ProviderSearchResults> = flow {
         val processedQuery = nlpProcessor.processQuery(query)
         currentProcessedQuery = processedQuery
+        val cacheKey = buildString {
+            append(query)
+            if (pages.isNotEmpty()) {
+                append('|')
+                append(pages.toSortedMap().entries.joinToString(",") { "${it.key}:${it.value}" })
+            }
+        }
 
         if (cache) {
-            val cachedEntry = synchronized(resultCache) { resultCache[query] }
+            val cachedEntry = synchronized(resultCache) { resultCache[cacheKey] }
             if (cachedEntry != null && System.currentTimeMillis() - cachedEntry.timestamp < CACHE_TTL_MS) {
                 cachedEntry.results.forEach { emit(it) }
                 return@flow
@@ -135,7 +150,7 @@ class ScrapingEngine @Inject constructor(
                         processedProviders.add(provider.id)
                         try {
                             withTimeoutOrNull(perProviderTimeoutMs) {
-                                safeSearchProvider(provider, query)
+                                safeSearchProvider(provider, query, pages[provider.id] ?: 0)
                             } ?: ProviderSearchResults(
                                 provider = provider,
                                 results = emptyList(),
@@ -181,11 +196,11 @@ class ScrapingEngine @Inject constructor(
         }
 
         if (cache && results.any { it.success }) {
-            synchronized(resultCache) { resultCache[query] = CacheEntry(results) }
+            synchronized(resultCache) { resultCache[cacheKey] = CacheEntry(results) }
         }
     }.flowOn(Dispatchers.IO)
 
-    private suspend fun safeSearchProvider(provider: Provider, query: String): ProviderSearchResults {
+    private suspend fun safeSearchProvider(provider: Provider, query: String, pageOffset: Int = 0): ProviderSearchResults {
         val startTime = System.currentTimeMillis()
         val domain = extractDomain(provider.baseUrl)
         
@@ -201,7 +216,7 @@ class ScrapingEngine @Inject constructor(
                 }
                 retryWithNlpQueries(provider, query, startTime) ?: fallback
             } else {
-                val result = searchProviderSmart(provider, query)
+                val result = searchProviderSmart(provider, query, pageOffset)
                 if (result.success && result.results.isNotEmpty()) {
                     val validated = validateAndFilterResults(result.results, query)
                     if (validated.isEmpty()) {
@@ -243,7 +258,7 @@ class ScrapingEngine @Inject constructor(
                     val validated = validateAndFilterResults(result.results, originalQuery)
                     validated.forEach { if (seenUrls.add(it.url)) allResults.add(it) }
                 }
-                if (allResults.size >= 10) break
+                if (allResults.size >= TARGET_RESULTS_PER_PROVIDER) break
             } catch (e: Exception) { continue }
         }
 
@@ -256,7 +271,7 @@ class ScrapingEngine @Inject constructor(
         val queryWords = query.lowercase().split(Regex("\\s+")).filter { it.length > 2 }
         val processed = currentProcessedQuery
 
-        return results.filter { result ->
+        val structurallyValid = results.filter { result ->
             val titleLower = result.title.lowercase()
             val urlLower = result.url.lowercase()
 
@@ -266,17 +281,29 @@ class ScrapingEngine @Inject constructor(
             if (CATEGORY_URL_PATTERNS.any { urlLower.contains(it) }) return@filter false
             if (titleLower.trim() in GENERIC_CATEGORY_NAMES && result.thumbnailUrl.isNullOrEmpty()) return@filter false
             
-            // NLP-Enhanced Relevance Gate
+            true
+        }.distinctBy { it.url }
+
+        if (structurallyValid.isEmpty()) return emptyList()
+
+        val relevant = structurallyValid.filter { result ->
+            val titleLower = result.title.lowercase()
             val combined = "$titleLower ${result.description?.lowercase() ?: ""} ${result.url.lowercase()}"
+
             val hasKeyword = queryWords.any { combined.contains(it) }
             val hasConcept = processed?.conceptTerms?.any { combined.contains(it) } ?: false
             val semanticScore = processed?.let { nlpProcessor.calculateSemanticRelevance(result.title, result.description, it.concepts) } ?: 0f
 
             hasKeyword || hasConcept || semanticScore >= 15f
         }
+
+        val selected = relevant.ifEmpty { structurallyValid }
+        return selected
+            .sortedByDescending { it.relevanceScore }
+            .take(TARGET_RESULTS_PER_PROVIDER)
     }
 
-    suspend fun searchProviderSmart(provider: Provider, query: String): ProviderSearchResults {
+    suspend fun searchProviderSmart(provider: Provider, query: String, pageOffset: Int = 0): ProviderSearchResults {
         val startTime = System.currentTimeMillis()
         val processed = currentProcessedQuery
         val effectiveQuery = if (processed != null && processed.isNaturalLanguage && query == processed.originalQuery) {
@@ -290,7 +317,7 @@ class ScrapingEngine @Inject constructor(
             // 1. Search URL Discovery
             val smartSearchUrl = smartNavigationEngine.findSearchUrl(provider.baseUrl, effectiveQuery)
             if (smartSearchUrl != null) {
-                val results = scrapeWithSmartNavigation(provider, query, smartSearchUrl)
+                val results = scrapeWithSmartNavigation(provider, query, smartSearchUrl, pageOffset)
                 if (results.isNotEmpty()) {
                     updateProviderHealth(provider.id, true, System.currentTimeMillis() - startTime)
                     return ProviderSearchResults(provider, results, System.currentTimeMillis() - startTime, true)
@@ -305,33 +332,26 @@ class ScrapingEngine @Inject constructor(
             }
 
             // 3. Fallback to generic search
-            searchProvider(provider, effectiveQuery)
+            searchProvider(provider, effectiveQuery, pageOffset)
         } catch (e: Exception) {
-            searchProvider(provider, effectiveQuery)
+            searchProvider(provider, effectiveQuery, pageOffset)
         }
     }
 
-    private suspend fun scrapeWithSmartNavigation(provider: Provider, query: String, searchUrl: String): List<SearchResult> = withContext(Dispatchers.IO) {
+    private suspend fun scrapeWithSmartNavigation(provider: Provider, query: String, searchUrl: String, pageOffset: Int = 0): List<SearchResult> = withContext(Dispatchers.IO) {
         val document = fetchDocument(searchUrl)
         val (activeUrl, activeDoc) = if (smartNavigationEngine.isCategoryPage(searchUrl, document)) {
             smartNavigationEngine.navigatePastCategory(provider.baseUrl, document, query) ?: (searchUrl to document)
         } else searchUrl to document
 
-        val results = extractResultsWithThumbnails(activeDoc, provider, query)
-        if (results.size < 10) {
-            val pages = smartNavigationEngine.getPaginationLinks(activeDoc, provider.baseUrl, 2)
-            val combined = results.toMutableList()
-            pages.forEach { url ->
-                try {
-                    val pDoc = fetchDocument(url)
-                    extractResultsWithThumbnails(pDoc, provider, query).forEach { r ->
-                        if (combined.none { it.url == r.url }) combined.add(r)
-                    }
-                } catch (_: Exception) {}
-            }
-            return@withContext combined.sortedByDescending { it.relevanceScore }
-        }
-        results
+        collectPagedResults(
+            firstDoc = activeDoc,
+            firstUrl = activeUrl,
+            provider = provider,
+            query = query,
+            pageOffset = pageOffset,
+            extractor = { doc -> extractResultsWithThumbnails(doc, provider, query) }
+        )
     }
 
     private fun extractResultsWithThumbnails(document: Document, provider: Provider, query: String): List<SearchResult> {
@@ -362,7 +382,12 @@ class ScrapingEngine @Inject constructor(
         // 1. Standard Jsoup
         repeat(DEFAULT_RETRY_COUNT) { attempt ->
             try {
-                val conn = Jsoup.connect(url).userAgent(getRandomUserAgent()).timeout(timeout).followRedirects(true)
+                val conn = Jsoup.connect(url)
+                    .userAgent(getRandomUserAgent())
+                    .timeout(timeout)
+                    .followRedirects(true)
+                    .ignoreContentType(true)
+                    .ignoreHttpErrors(true)
                 val resp = conn.execute()
                 val doc = resp.parse()
                 if (resp.statusCode() in 200..299 && !doc.html().contains("cf_chl_opt")) return@withContext doc
@@ -418,7 +443,7 @@ class ScrapingEngine @Inject constructor(
     /**
      * Standard provider search using stored configs or analysis
      */
-    suspend fun searchProvider(provider: Provider, query: String): ProviderSearchResults {
+    suspend fun searchProvider(provider: Provider, query: String, pageOffset: Int = 0): ProviderSearchResults {
         val startTime = System.currentTimeMillis()
         return try {
             enforceRateLimit(provider.id)
@@ -428,9 +453,9 @@ class ScrapingEngine @Inject constructor(
             val analysis = siteAnalysisDao.getLatestAnalysis(provider.id)
             
             val results = when {
-                config != null -> scrapeWithConfig(provider, query, config)
-                analysis != null -> scrapeWithAnalysis(provider, query, analysis)
-                else -> scrapeGeneric(provider, query)
+                config != null -> scrapeWithConfig(provider, query, config, pageOffset)
+                analysis != null -> scrapeWithAnalysis(provider, query, analysis, pageOffset)
+                else -> scrapeGeneric(provider, query, pageOffset)
             }
             
             updateProviderHealth(provider.id, true, System.currentTimeMillis() - startTime)
@@ -463,10 +488,21 @@ class ScrapingEngine @Inject constructor(
 
     // --- Helper Scrapers & Logic ---
 
-    private suspend fun scrapeWithConfig(p: Provider, q: String, c: ScrapingConfig): List<SearchResult> = withContext(Dispatchers.IO) {
-        val url = c.searchUrlTemplate.replace("{baseUrl}", p.baseUrl).replace("{query}", URLEncoder.encode(q, c.encoding))
+    private suspend fun scrapeWithConfig(p: Provider, q: String, c: ScrapingConfig, pageOffset: Int = 0): List<SearchResult> = withContext(Dispatchers.IO) {
+        val requestedPage = pageOffset + 1
+        val url = c.searchUrlTemplate
+            .replace("{baseUrl}", p.baseUrl)
+            .replace("{query}", URLEncoder.encode(q, c.encoding))
+            .replace("{page}", requestedPage.toString())
         val doc = fetchDocument(url, c)
-        extractResultsWithConfig(doc, p, q, c)
+        collectPagedResults(
+            firstDoc = doc,
+            firstUrl = url,
+            provider = p,
+            query = q,
+            pageOffset = pageOffset,
+            extractor = { pageDoc -> extractResultsWithConfig(pageDoc, p, q, c) }
+        )
     }
 
     private fun extractResultsWithConfig(doc: Document, p: Provider, q: String, c: ScrapingConfig): List<SearchResult> {
@@ -474,49 +510,239 @@ class ScrapingEngine @Inject constructor(
             val title = extractText(item, c.titleSelector)
             val url = extractUrl(item, c.urlSelector, p.baseUrl)
             if (title.isEmpty() || url.isEmpty()) return@mapNotNull null
-            SearchResult(p.id, p.name, title, url, c.descriptionSelector?.let { extractText(item, it) }, 
-                c.thumbnailSelector?.let { extractImageUrl(item, it, p.baseUrl) }, relevanceScore = calculateRelevanceScore(title, q))
+            SearchResult(
+                providerId = p.id,
+                providerName = p.name,
+                title = title,
+                url = url,
+                description = c.descriptionSelector?.let { extractText(item, it) },
+                thumbnailUrl = c.thumbnailSelector?.let { extractImageUrl(item, it, p.baseUrl) },
+                relevanceScore = calculateRelevanceScore(title, q, url = url)
+            )
         }
     }
 
-    private suspend fun scrapeWithAnalysis(p: Provider, q: String, a: SiteAnalysis): List<SearchResult> = withContext(Dispatchers.IO) {
-        val url = "${p.baseUrl}/search?q=${URLEncoder.encode(q, "UTF-8")}"
+    private suspend fun scrapeWithAnalysis(p: Provider, q: String, a: SiteAnalysis, pageOffset: Int = 0): List<SearchResult> = withContext(Dispatchers.IO) {
+        val url = buildSearchUrl(p.baseUrl, q, pageOffset + 1)
         val doc = fetchDocument(url)
-        val selector = a.resultItemSelector ?: detectResultItemSelector(doc) ?: return@withContext emptyList()
-        doc.select(selector).mapNotNull { item ->
-            val title = extractBestTitle(item)
-            val u = extractUrlFromItem(item, p.baseUrl)
-            if (title.isEmpty()) null else SearchResult(p.id, p.name, title, u, relevanceScore = calculateRelevanceScore(title, q))
-        }
+        collectPagedResults(
+            firstDoc = doc,
+            firstUrl = url,
+            provider = p,
+            query = q,
+            pageOffset = pageOffset,
+            extractor = { pageDoc ->
+                val selector = a.resultItemSelector ?: detectResultItemSelector(pageDoc)
+                if (selector == null) {
+                    extractResultsGeneric(pageDoc, p, q)
+                } else {
+                    pageDoc.select(selector).mapNotNull { item ->
+                        val title = extractBestTitle(item)
+                        val u = extractUrlFromItem(item, p.baseUrl)
+                        if (title.isEmpty() || u.isEmpty() || u.contains("javascript:")) {
+                            null
+                        } else {
+                            SearchResult(
+                                providerId = p.id,
+                                providerName = p.name,
+                                title = title,
+                                url = u,
+                                description = extractBestDescription(item),
+                                thumbnailUrl = extractBestThumbnail(item, p.baseUrl),
+                                relevanceScore = calculateRelevanceScore(title, q, url = u)
+                            )
+                        }
+                    }
+                }
+            }
+        )
     }
 
-    private suspend fun scrapeGeneric(p: Provider, q: String): List<SearchResult> = withContext(Dispatchers.IO) {
+    private suspend fun scrapeGeneric(p: Provider, q: String, pageOffset: Int = 0): List<SearchResult> = withContext(Dispatchers.IO) {
         val enc = URLEncoder.encode(q, "UTF-8")
-        val patterns = listOf("${p.baseUrl}/search?q=$enc", "${p.baseUrl}/?s=$enc", "${p.baseUrl}/search/$enc")
+        val requestedPage = pageOffset + 1
+        val patterns = listOf(
+            buildSearchUrl(p.baseUrl, q, requestedPage),
+            "${p.baseUrl}/?s=$enc&paged=$requestedPage",
+            "${p.baseUrl}/?q=$enc&page=$requestedPage",
+            "${p.baseUrl}/search/$enc/page/$requestedPage",
+            "${p.baseUrl}/search/$enc"
+        )
         for (url in patterns) {
             try {
                 val doc = fetchDocument(url)
-                val results = extractResultsGeneric(doc, p, q)
+                val results = collectPagedResults(
+                    firstDoc = doc,
+                    firstUrl = url,
+                    provider = p,
+                    query = q,
+                    pageOffset = pageOffset,
+                    extractor = { pageDoc -> extractResultsGeneric(pageDoc, p, q) }
+                )
                 if (results.isNotEmpty()) return@withContext results
             } catch (_: Exception) {}
+        }
+        HeadlessBrowserHelper.searchViaHeadlessForm(p.baseUrl, q)?.let { html ->
+            val doc = Jsoup.parse(html, p.baseUrl)
+            val results = extractResultsGeneric(doc, p, q)
+            if (results.isNotEmpty()) return@withContext results
         }
         emptyList()
     }
 
     private fun extractResultsGeneric(doc: Document, p: Provider, q: String): List<SearchResult> {
+        val selectorResults = detectResultItemSelector(doc)?.let { selector ->
+            doc.select(selector).mapNotNull { item ->
+                val title = extractBestTitle(item)
+                val u = extractUrlFromItem(item, p.baseUrl)
+                if (title.isEmpty() || u.isEmpty() || u.contains("javascript:")) null
+                else SearchResult(
+                    providerId = p.id,
+                    providerName = p.name,
+                    title = title,
+                    url = u,
+                    description = extractBestDescription(item),
+                    thumbnailUrl = extractBestThumbnail(item, p.baseUrl),
+                    relevanceScore = calculateRelevanceScore(title, q, extractBestDescription(item), u)
+                )
+            }
+        }.orEmpty()
+
+        val contentLinkResults = smartNavigationEngine.extractContentLinks(doc, p.baseUrl).mapNotNull { link ->
+            val title = link.title.takeIf { it.length > 2 } ?: extractTitleFromUrl(link.url) ?: return@mapNotNull null
+            SearchResult(
+                providerId = p.id,
+                providerName = p.name,
+                title = title,
+                url = link.url,
+                thumbnailUrl = link.thumbnail,
+                duration = link.duration,
+                relevanceScore = calculateRelevanceScore(title, q, url = link.url)
+            )
+        }
+
+        val parsedResults = runBlocking {
+            try {
+                universalFormatParser.parseContent(doc, doc.location().ifEmpty { p.baseUrl }).items
+            } catch (_: Exception) {
+                emptyList()
+            }
+        }.mapNotNull { item ->
+            val title = item.title.trim()
+            val u = normalizeUrl(item.url, p.baseUrl)
+            if (title.length < 3 || u.isEmpty() || u.contains("javascript:")) null
+            else SearchResult(
+                providerId = p.id,
+                providerName = p.name,
+                title = title,
+                url = u,
+                description = item.description,
+                thumbnailUrl = item.thumbnail?.let { normalizeUrl(it, p.baseUrl) },
+                duration = item.duration,
+                quality = item.quality,
+                category = item.contentType.name.lowercase(),
+                relevanceScore = calculateRelevanceScore(title, q, item.description, u)
+            )
+        }
+
+        return (selectorResults + contentLinkResults + parsedResults)
+            .distinctBy { it.url }
+            .sortedByDescending { it.relevanceScore }
+    }
+
+    private suspend fun collectPagedResults(
+        firstDoc: Document,
+        firstUrl: String,
+        provider: Provider,
+        query: String,
+        pageOffset: Int,
+        extractor: (Document) -> List<SearchResult>
+    ): List<SearchResult> {
+        val combined = linkedMapOf<String, SearchResult>()
+
+        fun addResults(results: List<SearchResult>) {
+            results.forEach { result ->
+                if (result.url.isNotBlank() && !result.url.contains("javascript:")) {
+                    combined.putIfAbsent(result.url, result)
+                }
+            }
+        }
+
+        addResults(extractor(firstDoc))
+
+        val pageLinks = smartNavigationEngine
+            .getPaginationLinks(firstDoc, provider.baseUrl, MAX_PAGES_PER_PROVIDER_SEARCH + pageOffset)
+            .drop(pageOffset)
+            .take(MAX_PAGES_PER_PROVIDER_SEARCH)
+            .toMutableList()
+
+        if (pageLinks.isEmpty()) {
+            pageLinks.addAll(generatePageCandidates(firstUrl, pageOffset + 2, MAX_PAGES_PER_PROVIDER_SEARCH))
+        }
+
+        for (url in pageLinks.distinct()) {
+            if (combined.size >= TARGET_RESULTS_PER_PROVIDER) break
+            try {
+                val doc = fetchDocument(url)
+                addResults(extractor(doc))
+            } catch (_: Exception) {}
+        }
+
+        return combined.values
+            .sortedByDescending { it.relevanceScore }
+            .take(TARGET_RESULTS_PER_PROVIDER)
+    }
+
+    private fun generatePageCandidates(firstUrl: String, startPage: Int, maxPages: Int): List<String> {
+        if (!firstUrl.startsWith("http")) return emptyList()
+        val pageNumbers = startPage until (startPage + maxPages)
+        return pageNumbers.mapNotNull { page ->
+            when {
+                Regex("([?&]page=)\\d+").containsMatchIn(firstUrl) ->
+                    firstUrl.replace(Regex("([?&]page=)\\d+"), "\$1$page")
+                Regex("([?&]paged=)\\d+").containsMatchIn(firstUrl) ->
+                    firstUrl.replace(Regex("([?&]paged=)\\d+"), "\$1$page")
+                firstUrl.contains("?") -> "$firstUrl&page=$page"
+                else -> "${firstUrl.trimEnd('/')}/page/$page"
+            }
+        }
+    }
+
+    private fun buildSearchUrl(baseUrl: String, query: String, page: Int): String {
+        val enc = URLEncoder.encode(query, "UTF-8")
+        return "${baseUrl.trimEnd('/')}/search?q=$enc&page=$page"
+    }
+
+    private fun extractResultsFromItems(doc: Document, p: Provider, q: String): List<SearchResult> {
         val selector = detectResultItemSelector(doc) ?: return emptyList()
         return doc.select(selector).mapNotNull { item ->
             val title = extractBestTitle(item)
             val u = extractUrlFromItem(item, p.baseUrl)
-            if (title.isEmpty() || u.contains("javascript:")) null 
-            else SearchResult(p.id, p.name, title, u, extractBestDescription(item), extractBestThumbnail(item, p.baseUrl), relevanceScore = calculateRelevanceScore(title, q))
+            if (title.isEmpty() || u.isEmpty() || u.contains("javascript:")) null
+            else SearchResult(
+                providerId = p.id,
+                providerName = p.name,
+                title = title,
+                url = u,
+                description = extractBestDescription(item),
+                thumbnailUrl = extractBestThumbnail(item, p.baseUrl),
+                relevanceScore = calculateRelevanceScore(title, q, extractBestDescription(item), u)
+            )
         }
     }
 
     private suspend fun scrapeWithTabCrawl(p: Provider, q: String): List<SearchResult> {
-        val links = smartNavigationEngine.crawlCategoryTabsForQuery(p.baseUrl, q, 5)
-        return links.map { 
-            SearchResult(p.id, p.name, it.title, it.url, null, it.thumbnail, relevanceScore = calculateRelevanceScore(it.title, q))
+        val links = smartNavigationEngine.crawlCategoryTabsForQuery(p.baseUrl, q, 10)
+        return links.take(TARGET_RESULTS_PER_PROVIDER).map {
+            SearchResult(
+                providerId = p.id,
+                providerName = p.name,
+                title = it.title,
+                url = it.url,
+                thumbnailUrl = it.thumbnail,
+                duration = it.duration,
+                relevanceScore = calculateRelevanceScore(it.title, q, url = it.url)
+            )
         }
     }
 
@@ -527,7 +753,15 @@ class ScrapingEngine @Inject constructor(
 
     private fun extractAllContentFromPage(doc: Document, p: Provider): List<SearchResult> {
         return smartNavigationEngine.extractContentLinks(doc, p.baseUrl).map { 
-            SearchResult(p.id, p.name, it.title, it.url, null, it.thumbnail, 0f)
+            SearchResult(
+                providerId = p.id,
+                providerName = p.name,
+                title = it.title,
+                url = it.url,
+                thumbnailUrl = it.thumbnail,
+                duration = it.duration,
+                relevanceScore = 0f
+            )
         }
     }
 
@@ -539,13 +773,63 @@ class ScrapingEngine @Inject constructor(
     }
 
     private fun extractBestTitle(item: Element): String = item.select("h1, h2, h3, .title, .name, a").firstOrNull()?.text()?.trim() ?: ""
-    private fun extractUrlFromItem(item: Element, base: String): String = normalizeUrl(item.select("a[href]").firstOrNull()?.attr("href") ?: "", base)
+    private fun extractUrlFromItem(item: Element, base: String): String {
+        val href = item.select("a[href]").firstOrNull()?.attr("href")?.takeIf { it.isNotBlank() } ?: return ""
+        return normalizeUrl(href, base)
+    }
     private fun extractBestDescription(item: Element): String? = item.select(".description, .desc, p").firstOrNull()?.text()?.take(200)
-    private fun extractBestThumbnail(item: Element, base: String): String? = item.select("img").firstOrNull()?.let { normalizeUrl(it.attr("src"), base) }
+    private fun extractBestThumbnail(item: Element, base: String): String? {
+        val imageElement = item.select("img, source, video, [data-thumb], [data-thumbnail], [data-poster], [data-image], [style*='background-image']").firstOrNull()
+            ?: return null
+        return extractImageCandidate(imageElement, base)
+    }
     private fun extractText(el: Element, sel: String): String = el.select(sel).text().trim()
     private fun extractUrl(el: Element, sel: String, base: String): String = normalizeUrl(el.select(sel).attr("href"), base)
-    private fun extractImageUrl(el: Element, sel: String, base: String): String = normalizeUrl(el.select(sel).attr("src"), base)
-    private fun extractTitleFromUrl(url: String): String? = try { url.substringAfterLast("/").replace("-", " ").replace("_", " ").capitalize() } catch (_: Exception) { null }
+    private fun extractImageUrl(el: Element, sel: String, base: String): String {
+        val imageElement = el.select(sel).firstOrNull() ?: return ""
+        return extractImageCandidate(imageElement, base).orEmpty()
+    }
+    private fun extractImageCandidate(element: Element, base: String): String? {
+        val srcset = element.attr("srcset").takeIf { it.isNotBlank() }
+            ?: element.attr("data-srcset").takeIf { it.isNotBlank() }
+        val fromSrcset = srcset
+            ?.split(",")
+            ?.map { it.trim().split(Regex("\\s+")).firstOrNull().orEmpty() }
+            ?.firstOrNull { it.isNotBlank() && !it.startsWith("data:", ignoreCase = true) }
+
+        val raw = listOf(
+            element.attr("src"),
+            element.attr("data-src"),
+            element.attr("data-lazy-src"),
+            element.attr("data-original"),
+            element.attr("data-lazy"),
+            element.attr("data-thumb"),
+            element.attr("data-thumbnail"),
+            element.attr("data-poster"),
+            element.attr("data-image"),
+            element.attr("poster"),
+            fromSrcset,
+            extractBackgroundImageUrl(element.attr("style"))
+        ).firstOrNull { !it.isNullOrBlank() && !it.startsWith("data:", ignoreCase = true) } ?: return null
+
+        return normalizeUrl(raw, base)
+    }
+    private fun extractBackgroundImageUrl(style: String): String? {
+        if (style.isBlank()) return null
+        return Regex("""background(?:-image)?\s*:\s*url\(['"]?([^'")]+)['"]?\)""", RegexOption.IGNORE_CASE)
+            .find(style)
+            ?.groupValues
+            ?.getOrNull(1)
+    }
+    private fun extractTitleFromUrl(url: String): String? = try {
+        url.substringAfterLast("/")
+            .substringBefore("?")
+            .replace("-", " ")
+            .replace("_", " ")
+            .trim()
+            .replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
+            .takeIf { it.length > 2 }
+    } catch (_: Exception) { null }
     private fun findDescriptionInDocument(doc: Document, url: String): String? = null // Simplified for brevity
     private fun normalizeUrl(url: String, base: String): String = EngineUtils.normalizeUrl(url, base)
     private fun extractDomain(url: String): String = EngineUtils.extractDomain(url)
