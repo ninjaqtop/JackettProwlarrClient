@@ -782,6 +782,7 @@ private fun capabilityStatusLabel(status: String): String = when (status) {
     "not_detected" -> "NONE"
     "missing" -> "MISSING"
     "native_limited" -> "LIMITED"
+    "external_required" -> "EXTERNAL"
     "error" -> "ERROR"
     else -> status.uppercase()
 }

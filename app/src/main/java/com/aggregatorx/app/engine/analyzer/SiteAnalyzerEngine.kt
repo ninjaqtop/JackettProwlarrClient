@@ -1,6 +1,7 @@
 package com.aggregatorx.app.engine.analyzer
 
 import com.aggregatorx.app.data.model.*
+import com.aggregatorx.app.engine.scraper.HeadlessBrowserHelper
 import com.aggregatorx.app.engine.token.TokenManager
 import com.aggregatorx.app.engine.vision.VisionEngine
 import kotlinx.coroutines.Dispatchers
@@ -142,7 +143,18 @@ class SiteAnalyzerEngine @Inject constructor(
                 .headers(MODERN_REQUEST_HEADERS)
             
             val response = connection.execute()
-            val document = response.parse()
+            val responseBody = response.body()
+            val renderedHtml = try {
+                HeadlessBrowserHelper.fetchPageContentWithShadowAndAdSkip(
+                    url = normalizedUrl,
+                    waitSelector = "body",
+                    timeout = DEFAULT_TIMEOUT
+                )
+            } catch (_: Exception) {
+                null
+            }
+            val activeHtml = renderedHtml ?: responseBody
+            val document = Jsoup.parse(activeHtml, normalizedUrl)
             val loadTime = System.currentTimeMillis() - startTime
             
             // Perform all analyses
@@ -150,13 +162,13 @@ class SiteAnalyzerEngine @Inject constructor(
             val domAnalysis = analyzeDOMStructure(document)
             val patterns = detectPatterns(document)
             val mediaAnalysis = analyzeMediaContent(document)
-            val apiAnalysis = detectAPIEndpoints(document, response.body())
+            val apiAnalysis = detectAPIEndpoints(document, activeHtml)
             val navigationStructure = analyzeNavigation(document)
             val scrapingStrategy = determineScrapingStrategy(document, patterns)
             val capabilityReport = buildCapabilityReport(
                 url = normalizedUrl,
                 document = document,
-                html = response.body(),
+                html = activeHtml,
                 headers = response.headers(),
                 mediaAnalysis = mediaAnalysis,
                 apiAnalysis = apiAnalysis,
@@ -218,7 +230,7 @@ class SiteAnalyzerEngine @Inject constructor(
                 // Performance
                 loadTime = loadTime,
                 resourceCount = document.select("script, link, img, video").size,
-                totalSize = response.body().length.toLong(),
+                totalSize = activeHtml.length.toLong(),
                 
                 // Scraping Config
                 scrapingStrategy = scrapingStrategy,
@@ -1083,9 +1095,11 @@ class SiteAnalyzerEngine @Inject constructor(
                     title = "Browser Fingerprint Evasion",
                     checks = listOf(
                         capability("Header Rotation", "active", "Browser-like User-Agent and request headers applied"),
-                        capability("Cookie Persistence", "active", "Native helper keeps an in-memory cookie jar"),
-                        capability("Canvas/WebGL Spoof", "native_limited", "Requires a real WebView/browser JS runtime"),
-                        capability("TLS JA3 Randomisation", "native_limited", "OkHttp TLS fingerprint cannot be arbitrarily randomized safely")
+                        capability("Cookie Persistence", "active", "Native helper keeps an in-memory cookie jar; WebView cookies enabled"),
+                        capability("Navigator Spoof", "active", "WebView JS override for webdriver/platform/hardware/device memory"),
+                        capability("Canvas/WebGL Spoof", "active", "WebView JS overrides for canvas noise and WebGL vendor/renderer"),
+                        capability("TLS Fingerprint", "active", "Chromium WebView TLS profile used for rendered fetches"),
+                        capability("Custom JA3 Randomisation", "external_required", "Requires an external impersonation proxy or native TLS stack; not exposed by Android WebView/OkHttp APIs")
                     )
                 ),
                 AnalyzerCapabilitySection(

@@ -7,6 +7,7 @@ import coil3.ImageLoader
 import coil3.SingletonImageLoader
 import coil3.network.okhttp.OkHttpNetworkFetcherFactory
 import coil3.request.crossfade
+import com.aggregatorx.app.engine.scraper.HeadlessBrowserHelper
 import com.aggregatorx.app.engine.util.EngineUtils
 import dagger.hilt.android.HiltAndroidApp
 import okhttp3.OkHttpClient
@@ -23,6 +24,7 @@ class AggregatorXApp : Application(), SingletonImageLoader.Factory {
     override fun onCreate() {
         super.onCreate()
         instance = this
+        HeadlessBrowserHelper.configure(this)
     }
 
     /**
