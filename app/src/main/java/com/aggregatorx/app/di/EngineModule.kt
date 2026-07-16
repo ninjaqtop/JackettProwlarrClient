@@ -89,8 +89,12 @@ object EngineModule {
     
     @Provides
     @Singleton
-    fun provideSiteAnalyzerEngine(): SiteAnalyzerEngine {
-        return SiteAnalyzerEngine()
+    fun provideSiteAnalyzerEngine(
+        endpointDiscoveryEngine: EndpointDiscoveryEngine,
+        tokenManager: TokenManager,
+        visionEngine: VisionEngine
+    ): SiteAnalyzerEngine {
+        return SiteAnalyzerEngine(endpointDiscoveryEngine, tokenManager, visionEngine)
     }
     
     @Provides
