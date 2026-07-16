@@ -579,7 +579,7 @@ fun ResultsFeed(
     onExtractVideoForPreview: (suspend (String) -> VideoPreviewResult?)? = null,
     modifier: Modifier = Modifier
 ) {
-    val PAGE_SIZE = 20
+    val PAGE_SIZE = 50
     val successProviders = providerResults.filter { it.success && it.results.isNotEmpty() }
     val failedProviders  = providerResults.filter { !it.success }
 
