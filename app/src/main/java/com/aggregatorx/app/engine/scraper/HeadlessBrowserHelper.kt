@@ -94,6 +94,8 @@ object HeadlessBrowserHelper {
         internal fun setHtml(h: String) { _html = h }
         fun navigate(url: String): NativePage = runBlocking { fetchNativePage(url) ?: this@NativePage }
         fun content(): String = _html
+        fun waitForLoadState() {}
+        fun evaluate(jsCode: String): Any? = extractVideoUrlsFromHtml(_html, pageUrl)
         fun close() {}
     }
 
@@ -110,6 +112,70 @@ object HeadlessBrowserHelper {
                 resp.body?.string()
             }
         } catch (e: Exception) { Log.w(TAG, "Fetch error: ${e.message}"); null }
+    }
+
+    suspend fun fetchPageContent(url: String, timeout: Int = 20000): String? =
+        fetchWithTimeout(url, timeout)
+
+    suspend fun fetchPageContentWithShadowAndAdSkip(
+        url: String,
+        waitSelector: String? = null,
+        timeout: Int = 20000
+    ): String? {
+        val html = fetchWithTimeout(url, timeout) ?: return null
+        val doc = Jsoup.parse(html, url)
+        removeObstructiveElements(doc)
+        return doc.html()
+    }
+
+    suspend fun fetchContentByClickingTabs(baseUrl: String, query: String, timeout: Int = 20000): String? =
+        withContext(Dispatchers.IO) {
+            val html = fetchWithTimeout(baseUrl, timeout) ?: return@withContext null
+            val doc = Jsoup.parse(html, baseUrl)
+            val queryTerms = query.lowercase().split(Regex("\\s+")).filter { it.length > 2 }
+            val tabUrl = doc.select("a[href]").firstOrNull { link ->
+                val combined = "${link.text()} ${link.attr("href")}".lowercase()
+                queryTerms.any { combined.contains(it) } ||
+                    listOf("search", "video", "movie", "latest", "popular").any { combined.contains(it) }
+            }?.let { normalizeUrl(it.attr("href"), baseUrl) }
+
+            if (tabUrl == null) html else fetchWithTimeout(tabUrl, timeout) ?: html
+        }
+
+    suspend fun discoverSearchAPIEndpoints(baseUrl: String, sampleQuery: String = "test"): List<String> =
+        withContext(Dispatchers.IO) {
+            val html = fetchWithTimeout(baseUrl, 20000).orEmpty()
+            val discovered = linkedSetOf<String>()
+            val patterns = listOf(
+                Regex("""(?:fetch|axios\.[a-z]+|\$\.ajax|\$\.get|\$\.post)\s*\(\s*['"`]([^'"`]+)['"`]""", RegexOption.IGNORE_CASE),
+                Regex("""['"`]([^'"`]*(?:api|ajax|graphql|search|suggest|autocomplete)[^'"`]*)['"`]""", RegexOption.IGNORE_CASE),
+                Regex("""url\s*:\s*['"`]([^'"`]+)['"`]""", RegexOption.IGNORE_CASE)
+            )
+
+            patterns.forEach { pattern ->
+                pattern.findAll(html).forEach { match ->
+                    val candidate = match.groupValues.getOrNull(1).orEmpty()
+                    if (candidate.isNotBlank() && !candidate.startsWith("data:")) {
+                        discovered.add(normalizeUrl(candidate.replace("{query}", sampleQuery), baseUrl))
+                    }
+                }
+            }
+
+            val encoded = URLEncoder.encode(sampleQuery, "UTF-8")
+            listOf(
+                "/api/search?q=$encoded",
+                "/ajax/search?q=$encoded",
+                "/suggest?q=$encoded",
+                "/autocomplete?q=$encoded",
+                "/wp-json/wp/v2/search?search=$encoded"
+            ).forEach { discovered.add(normalizeUrl(it, baseUrl)) }
+
+            discovered.take(30)
+        }
+
+    fun extractVideoUrls(pageUrl: String): List<String> = runBlocking {
+        val html = fetchWithTimeout(pageUrl, 25000) ?: return@runBlocking emptyList()
+        extractVideoUrlsFromHtml(html, pageUrl)
     }
 
     private suspend fun fetchNativePage(url: String): NativePage? {
@@ -153,6 +219,83 @@ object HeadlessBrowserHelper {
     private fun extractHost(url: String): String = try {
         val uri = java.net.URI(url); "${uri.scheme}://${uri.host}"
     } catch (_: Exception) { url }
+
+    private suspend fun fetchWithTimeout(url: String, timeout: Int): String? = withContext(Dispatchers.IO) {
+        try {
+            val req = Request.Builder()
+                .url(url)
+                .header("Referer", extractHost(url) + "/")
+                .build()
+            client.newBuilder()
+                .connectTimeout(timeout.toLong(), TimeUnit.MILLISECONDS)
+                .readTimeout(timeout.toLong(), TimeUnit.MILLISECONDS)
+                .build()
+                .newCall(req)
+                .execute()
+                .use { resp ->
+                    if (!resp.isSuccessful) null else resp.body?.string()
+                }
+        } catch (e: Exception) {
+            Log.w(TAG, "Fetch error: ${e.message}")
+            null
+        }
+    }
+
+    private fun removeObstructiveElements(document: Document) {
+        document.select(
+            ".ad, .ads, .advertisement, .popup, .modal, .overlay, " +
+                "[class*='cookie'], [id*='cookie'], [class*='banner'], iframe[src*='ad']"
+        ).remove()
+    }
+
+    private fun extractVideoUrlsFromHtml(html: String, baseUrl: String): List<String> {
+        val urls = linkedSetOf<String>()
+        val doc = Jsoup.parse(html, baseUrl)
+
+        doc.select("video[src], source[src], a[href], iframe[src]").forEach { element ->
+            val raw = element.attr("src").ifBlank { element.attr("href") }
+            if (raw.isLikelyVideoUrl()) urls.add(normalizeUrl(raw, baseUrl))
+        }
+
+        val scriptText = doc.select("script").joinToString("\n") { it.html() }
+        val patterns = listOf(
+            Regex("""https?:\\/\\/[^'"\\\s]+?\.(?:m3u8|mpd|mp4|webm)(?:\?[^'"\\\s]*)?""", RegexOption.IGNORE_CASE),
+            Regex("""https?://[^'"\s]+?\.(?:m3u8|mpd|mp4|webm)(?:\?[^'"\s]*)?""", RegexOption.IGNORE_CASE),
+            Regex("""['"`]([^'"`]+?\.(?:m3u8|mpd|mp4|webm)(?:\?[^'"`]*)?)['"`]""", RegexOption.IGNORE_CASE),
+            Regex("""(?:file|src|source|url)\s*[:=]\s*['"`]([^'"`]+)['"`]""", RegexOption.IGNORE_CASE)
+        )
+
+        patterns.forEach { pattern ->
+            pattern.findAll("$html\n$scriptText").forEach { match ->
+                val raw = (match.groupValues.getOrNull(1)?.takeIf { it.isNotBlank() } ?: match.value)
+                    .replace("\\/", "/")
+                    .trim('\'', '"', '`')
+                if (raw.isLikelyVideoUrl()) urls.add(normalizeUrl(raw, baseUrl))
+            }
+        }
+
+        return urls.sortedByDescending { url ->
+            when {
+                url.contains("1080") -> 100
+                url.contains("720") -> 80
+                url.contains(".m3u8", ignoreCase = true) -> 90
+                url.contains(".mpd", ignoreCase = true) -> 85
+                else -> 50
+            }
+        }
+    }
+
+    private fun String.isLikelyVideoUrl(): Boolean {
+        val lower = lowercase()
+        return listOf(".m3u8", ".mpd", ".mp4", ".webm", "videoplayback", "manifest").any { lower.contains(it) }
+    }
+
+    private fun normalizeUrl(url: String, baseUrl: String): String = when {
+        url.startsWith("http") -> url
+        url.startsWith("//") -> "https:$url"
+        url.startsWith("/") -> "${extractHost(baseUrl).trimEnd('/')}$url"
+        else -> "${baseUrl.substringBefore("?").substringBeforeLast("/", baseUrl).trimEnd('/')}/$url"
+    }
 }
 
 private class InMemoryCookieJar : okhttp3.CookieJar {
