@@ -778,10 +778,49 @@ class ScrapingEngine @Inject constructor(
         return normalizeUrl(href, base)
     }
     private fun extractBestDescription(item: Element): String? = item.select(".description, .desc, p").firstOrNull()?.text()?.take(200)
-    private fun extractBestThumbnail(item: Element, base: String): String? = item.select("img").firstOrNull()?.let { normalizeUrl(it.attr("src"), base) }
+    private fun extractBestThumbnail(item: Element, base: String): String? {
+        val imageElement = item.select("img, source, video, [data-thumb], [data-thumbnail], [data-poster], [data-image], [style*='background-image']").firstOrNull()
+            ?: return null
+        return extractImageCandidate(imageElement, base)
+    }
     private fun extractText(el: Element, sel: String): String = el.select(sel).text().trim()
     private fun extractUrl(el: Element, sel: String, base: String): String = normalizeUrl(el.select(sel).attr("href"), base)
-    private fun extractImageUrl(el: Element, sel: String, base: String): String = normalizeUrl(el.select(sel).attr("src"), base)
+    private fun extractImageUrl(el: Element, sel: String, base: String): String {
+        val imageElement = el.select(sel).firstOrNull() ?: return ""
+        return extractImageCandidate(imageElement, base).orEmpty()
+    }
+    private fun extractImageCandidate(element: Element, base: String): String? {
+        val srcset = element.attr("srcset").takeIf { it.isNotBlank() }
+            ?: element.attr("data-srcset").takeIf { it.isNotBlank() }
+        val fromSrcset = srcset
+            ?.split(",")
+            ?.map { it.trim().split(Regex("\\s+")).firstOrNull().orEmpty() }
+            ?.firstOrNull { it.isNotBlank() && !it.startsWith("data:", ignoreCase = true) }
+
+        val raw = listOf(
+            element.attr("src"),
+            element.attr("data-src"),
+            element.attr("data-lazy-src"),
+            element.attr("data-original"),
+            element.attr("data-lazy"),
+            element.attr("data-thumb"),
+            element.attr("data-thumbnail"),
+            element.attr("data-poster"),
+            element.attr("data-image"),
+            element.attr("poster"),
+            fromSrcset,
+            extractBackgroundImageUrl(element.attr("style"))
+        ).firstOrNull { !it.isNullOrBlank() && !it.startsWith("data:", ignoreCase = true) } ?: return null
+
+        return normalizeUrl(raw, base)
+    }
+    private fun extractBackgroundImageUrl(style: String): String? {
+        if (style.isBlank()) return null
+        return Regex("""background(?:-image)?\s*:\s*url\(['"]?([^'")]+)['"]?\)""", RegexOption.IGNORE_CASE)
+            .find(style)
+            ?.groupValues
+            ?.getOrNull(1)
+    }
     private fun extractTitleFromUrl(url: String): String? = try {
         url.substringAfterLast("/")
             .substringBefore("?")

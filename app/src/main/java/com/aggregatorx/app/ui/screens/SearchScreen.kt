@@ -982,8 +982,7 @@ fun ShieldedResultCard(
             ) {
                 ActionBtn("▶", "Watch",    NeonGreen,    onWatch)
                 ActionBtn("⬇", "Download", NeonGreenDim, onDownload)
-                // Browser opens in-app WebView — user stays on results screen
-                ActionBtn("↑", "Browser",  TextSecondary) { showInAppBrowser = true }
+                ActionBtn("↑", "Browser",  TextSecondary, onBrowser)
                 ActionBtn("👁", "In App",  CyberPurple,  onInApp)
                 IconButton(onClick = onLike, modifier = Modifier.size(36.dp)) {
                     Icon(
