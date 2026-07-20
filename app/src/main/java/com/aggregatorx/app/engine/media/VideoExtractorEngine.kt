@@ -4,6 +4,7 @@ import android.content.Context
 import android.os.Environment
 import com.aggregatorx.app.engine.ai.AICodeInjectionEngine
 import com.aggregatorx.app.engine.ai.PageContext
+import com.aggregatorx.app.engine.network.TlsFingerprintEngine
 import com.aggregatorx.app.engine.scraper.HeadlessBrowserHelper
 import com.aggregatorx.app.engine.util.EngineUtils
 import kotlinx.coroutines.Dispatchers
@@ -36,7 +37,7 @@ import javax.inject.Singleton
 @Singleton
 class VideoExtractorEngine @Inject constructor() {
     
-    private val httpClient = OkHttpClient.Builder()
+    private val httpClient = TlsFingerprintEngine().apply(OkHttpClient.Builder(), TlsFingerprintEngine.Profile.CHROME)
         .connectTimeout(30, TimeUnit.SECONDS)
         .readTimeout(60, TimeUnit.SECONDS)
         .followRedirects(true)

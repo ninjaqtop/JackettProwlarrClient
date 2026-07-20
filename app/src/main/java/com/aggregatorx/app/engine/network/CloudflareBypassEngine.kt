@@ -30,7 +30,9 @@ import javax.inject.Singleton
  * 6. Cached bypass tokens per domain so subsequent requests fly through
  */
 @Singleton
-class CloudflareBypassEngine @Inject constructor() {
+class CloudflareBypassEngine @Inject constructor(
+    private val tlsFingerprintEngine: TlsFingerprintEngine
+) {
 
     companion object {
         private const val MAX_CHALLENGE_RETRIES = 3
@@ -103,7 +105,7 @@ class CloudflareBypassEngine @Inject constructor() {
 
     // Shared OkHttp client with connection pooling
     private val sharedClient: OkHttpClient by lazy {
-        OkHttpClient.Builder()
+        tlsFingerprintEngine.apply(OkHttpClient.Builder(), TlsFingerprintEngine.Profile.CHROME)
             .connectionPool(ConnectionPool(32, 5, TimeUnit.MINUTES))
             .connectTimeout(30, TimeUnit.SECONDS)
             .readTimeout(60, TimeUnit.SECONDS)
@@ -111,7 +113,6 @@ class CloudflareBypassEngine @Inject constructor() {
             .followRedirects(true)
             .followSslRedirects(true)
             // Retry on connection failure
-            .retryOnConnectionFailure(true)
             .build()
     }
 
@@ -413,7 +414,7 @@ class CloudflareBypassEngine @Inject constructor() {
         com.aggregatorx.app.engine.util.EngineUtils.extractDomain(url)
 
     private fun buildDohClient(): OkHttpClient {
-        val bootstrapClient = OkHttpClient.Builder()
+        val bootstrapClient = tlsFingerprintEngine.apply(OkHttpClient.Builder(), TlsFingerprintEngine.Profile.CHROME)
             .connectTimeout(15, TimeUnit.SECONDS)
             .readTimeout(15, TimeUnit.SECONDS)
             .build()

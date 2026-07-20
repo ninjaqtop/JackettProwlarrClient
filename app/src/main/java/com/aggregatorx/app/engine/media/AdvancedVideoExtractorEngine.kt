@@ -2,6 +2,7 @@ package com.aggregatorx.app.engine.media
 
 import android.util.Base64
 import android.util.Log
+import com.aggregatorx.app.engine.network.TlsFingerprintEngine
 import com.aggregatorx.app.engine.scraper.HeadlessBrowserHelper
 import com.aggregatorx.app.engine.util.EngineUtils
 import kotlinx.coroutines.*
@@ -115,7 +116,7 @@ class AdvancedVideoExtractorEngine @Inject constructor() {
     }
 
     private val client: OkHttpClient by lazy {
-        OkHttpClient.Builder()
+        TlsFingerprintEngine().apply(OkHttpClient.Builder(), TlsFingerprintEngine.Profile.CHROME)
             .connectTimeout(20, TimeUnit.SECONDS)
             .readTimeout(30, TimeUnit.SECONDS)
             .followRedirects(true)

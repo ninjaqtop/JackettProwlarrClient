@@ -1,6 +1,7 @@
 package com.aggregatorx.app.engine.analyzer
 
 import com.aggregatorx.app.data.model.*
+import com.aggregatorx.app.engine.network.TlsFingerprintEngine
 import com.aggregatorx.app.engine.scraper.HeadlessBrowserHelper
 import com.aggregatorx.app.engine.token.TokenManager
 import com.aggregatorx.app.engine.vision.VisionEngine
@@ -37,7 +38,8 @@ import kotlinx.serialization.json.Json
 class SiteAnalyzerEngine @Inject constructor(
     private val endpointDiscoveryEngine: EndpointDiscoveryEngine,
     private val tokenManager: TokenManager,
-    private val visionEngine: VisionEngine
+    private val visionEngine: VisionEngine,
+    private val tlsFingerprintEngine: TlsFingerprintEngine
 ) {
 
     /** Cache: url → (SiteAnalysis, timestamp) */
@@ -980,6 +982,7 @@ class SiteAnalyzerEngine @Inject constructor(
         val thumbnails = collectThumbnailUrls(document, baseUrl)
         val ocrKeywords = try { visionEngine.batchExtract(thumbnails.take(8)) } catch (_: Exception) { emptyMap() }
         val network = analyzeNetworkTopology(url, headers)
+        val tlsProfile = tlsFingerprintEngine.defaultProfileInfo()
         val waf = analyzeWafFingerprint(headers, html)
         val jsBundle = analyzeJsBundles(document, html, baseUrl)
         val hiddenInputs = document.select("input[type=hidden]").size
@@ -1099,7 +1102,8 @@ class SiteAnalyzerEngine @Inject constructor(
                         capability("Navigator Spoof", "active", "WebView JS override for webdriver/platform/hardware/device memory"),
                         capability("Canvas/WebGL Spoof", "active", "WebView JS overrides for canvas noise and WebGL vendor/renderer"),
                         capability("TLS Fingerprint", "active", "Chromium WebView TLS profile used for rendered fetches"),
-                        capability("Custom JA3 Randomisation", "external_required", "Requires an external impersonation proxy or native TLS stack; not exposed by Android WebView/OkHttp APIs")
+                        capability("Native TLS Profile Rotation", "active", "${tlsProfile.profile}: ${tlsProfile.description}"),
+                        capability("Custom JA3 Extension Order", "external_required", "Android APIs allow TLS/cipher profiles but not arbitrary ClientHello extension ordering")
                     )
                 ),
                 AnalyzerCapabilitySection(
