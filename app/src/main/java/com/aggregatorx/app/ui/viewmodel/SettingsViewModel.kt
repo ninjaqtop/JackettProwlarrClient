@@ -25,7 +25,16 @@ class SettingsViewModel @Inject constructor(
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
     
     fun updateCustomUrl(url: String) {
-        _uiState.update { it.copy(customUrl = url) }
+        _uiState.update {
+            it.copy(
+                customUrl = url,
+                lastAnalysis = if (url.isNotBlank()) null else it.lastAnalysis,
+                lastProvider = if (url.isNotBlank()) null else it.lastProvider,
+                showAnalysisDetails = if (url.isNotBlank()) false else it.showAnalysisDetails,
+                error = null,
+                message = null
+            )
+        }
     }
     
     fun analyzeCustomUrl() {
@@ -120,4 +129,3 @@ class SettingsViewModel @Inject constructor(
         _uiState.update { it.copy(showAnalysisDetails = false) }
     }
 }
-

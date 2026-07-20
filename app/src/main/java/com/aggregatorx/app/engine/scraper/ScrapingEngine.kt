@@ -223,8 +223,14 @@ class ScrapingEngine @Inject constructor(
                         aiDecisionEngine.learnFromFailure(domain, "CATEGORY_PAGE", "Invalid results", ScrapingStrategy.HTML_PARSING, null, provider.baseUrl)
                         retryWithNlpQueries(provider, query, startTime) ?: result.copy(results = emptyList(), success = false, errorMessage = "Category results filtered")
                     } else {
+                        val expanded = expandResultsToTarget(provider, query, validated)
+                        val finalResults = validateAndFilterResults(expanded, query)
                         aiDecisionEngine.learnFromSuccess(domain, ScrapingStrategy.HTML_PARSING, null, null, null, validated.size, System.currentTimeMillis() - startTime)
-                        result.copy(results = validated)
+                        result.copy(
+                            results = finalResults,
+                            totalResults = finalResults.size,
+                            hasMore = finalResults.size >= TARGET_RESULTS_PER_PROVIDER
+                        )
                     }
                 } else {
                     retryWithNlpQueries(provider, query, startTime) ?: result
@@ -319,16 +325,32 @@ class ScrapingEngine @Inject constructor(
             if (smartSearchUrl != null) {
                 val results = scrapeWithSmartNavigation(provider, query, smartSearchUrl, pageOffset)
                 if (results.isNotEmpty()) {
+                    val expanded = expandResultsToTarget(provider, query, results)
                     updateProviderHealth(provider.id, true, System.currentTimeMillis() - startTime)
-                    return ProviderSearchResults(provider, results, System.currentTimeMillis() - startTime, true)
+                    return ProviderSearchResults(
+                        provider = provider,
+                        results = expanded,
+                        searchTime = System.currentTimeMillis() - startTime,
+                        success = true,
+                        totalResults = expanded.size,
+                        hasMore = expanded.size >= TARGET_RESULTS_PER_PROVIDER
+                    )
                 }
             }
 
             // 2. Tab Crawling (for sites without search)
             val tabResults = scrapeWithTabCrawl(provider, effectiveQuery)
             if (tabResults.isNotEmpty()) {
+                val expanded = expandResultsToTarget(provider, query, tabResults)
                 updateProviderHealth(provider.id, true, System.currentTimeMillis() - startTime)
-                return ProviderSearchResults(provider, tabResults, System.currentTimeMillis() - startTime, true)
+                return ProviderSearchResults(
+                    provider = provider,
+                    results = expanded,
+                    searchTime = System.currentTimeMillis() - startTime,
+                    success = true,
+                    totalResults = expanded.size,
+                    hasMore = expanded.size >= TARGET_RESULTS_PER_PROVIDER
+                )
             }
 
             // 3. Fallback to generic search
@@ -457,9 +479,18 @@ class ScrapingEngine @Inject constructor(
                 analysis != null -> scrapeWithAnalysis(provider, query, analysis, pageOffset)
                 else -> scrapeGeneric(provider, query, pageOffset)
             }
+            val expanded = expandResultsToTarget(provider, query, results)
             
             updateProviderHealth(provider.id, true, System.currentTimeMillis() - startTime)
-            ProviderSearchResults(provider, results, System.currentTimeMillis() - startTime, true)
+            ProviderSearchResults(
+                provider = provider,
+                results = expanded,
+                searchTime = System.currentTimeMillis() - startTime,
+                success = expanded.isNotEmpty(),
+                errorMessage = if (expanded.isEmpty()) "No parseable results found" else null,
+                totalResults = expanded.size,
+                hasMore = expanded.size >= TARGET_RESULTS_PER_PROVIDER
+            )
         } catch (e: Exception) {
             tryFallbackScraping(provider, query, startTime, e)
         }
@@ -477,8 +508,16 @@ class ScrapingEngine @Inject constructor(
             try {
                 val res = method()
                 if (res.isNotEmpty()) {
+                    val expanded = expandResultsToTarget(provider, query, res)
                     updateProviderHealth(provider.id, true, System.currentTimeMillis() - start)
-                    return ProviderSearchResults(provider, res, System.currentTimeMillis() - start, true)
+                    return ProviderSearchResults(
+                        provider = provider,
+                        results = expanded,
+                        searchTime = System.currentTimeMillis() - start,
+                        success = expanded.isNotEmpty(),
+                        totalResults = expanded.size,
+                        hasMore = expanded.size >= TARGET_RESULTS_PER_PROVIDER
+                    )
                 }
             } catch (_: Exception) {}
         }
@@ -648,6 +687,52 @@ class ScrapingEngine @Inject constructor(
         return (selectorResults + contentLinkResults + parsedResults)
             .distinctBy { it.url }
             .sortedByDescending { it.relevanceScore }
+    }
+
+    private suspend fun expandResultsToTarget(
+        provider: Provider,
+        query: String,
+        seedResults: List<SearchResult>
+    ): List<SearchResult> {
+        if (seedResults.size >= TARGET_RESULTS_PER_PROVIDER) {
+            return seedResults.distinctBy { it.url }.take(TARGET_RESULTS_PER_PROVIDER)
+        }
+
+        val combined = linkedMapOf<String, SearchResult>()
+
+        fun addAll(results: List<SearchResult>) {
+            results.forEach { result ->
+                if (combined.size >= TARGET_RESULTS_PER_PROVIDER) return
+                if (result.url.isNotBlank() && !result.url.contains("javascript:", ignoreCase = true)) {
+                    combined.putIfAbsent(result.url, result)
+                }
+            }
+        }
+
+        addAll(seedResults)
+
+        val queryVariants = buildList {
+            add(query)
+            currentProcessedQuery?.searchQueries
+                ?.filter { it.isNotBlank() && !contains(it) }
+                ?.take(3)
+                ?.let { addAll(it) }
+        }
+
+        for (variant in queryVariants) {
+            if (combined.size >= TARGET_RESULTS_PER_PROVIDER) break
+            runCatching { addAll(scrapeGeneric(provider, variant)) }
+            if (combined.size >= TARGET_RESULTS_PER_PROVIDER) break
+            runCatching { addAll(scrapeWithTabCrawl(provider, variant)) }
+        }
+
+        if (combined.size < TARGET_RESULTS_PER_PROVIDER) {
+            runCatching { addAll(scrapeProviderHomepage(provider, query)) }
+        }
+
+        return combined.values
+            .sortedByDescending { it.relevanceScore }
+            .take(TARGET_RESULTS_PER_PROVIDER)
     }
 
     private suspend fun collectPagedResults(

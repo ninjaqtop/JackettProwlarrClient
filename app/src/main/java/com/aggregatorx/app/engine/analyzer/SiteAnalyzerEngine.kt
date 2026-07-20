@@ -135,17 +135,9 @@ class SiteAnalyzerEngine @Inject constructor(
             val normalizedUrl = normalizeUrl(url)
             val baseUrl = extractBaseUrl(normalizedUrl)
             
-            // Fetch the page with modern browser headers
-            val connection = Jsoup.connect(normalizedUrl)
-                .userAgent(DEFAULT_USER_AGENT)
-                .timeout(DEFAULT_TIMEOUT)
-                .followRedirects(true)
-                .ignoreHttpErrors(true)
-                .ignoreContentType(false)
-                .headers(MODERN_REQUEST_HEADERS)
-            
-            val response = connection.execute()
-            val responseBody = response.body()
+            // Fetch the page with modern browser headers, then fall back to
+            // rendered content so JS-heavy sites can still be analyzed.
+            val fetchedPage = fetchAnalyzerPage(normalizedUrl)
             val renderedHtml = try {
                 HeadlessBrowserHelper.fetchPageContentWithShadowAndAdSkip(
                     url = normalizedUrl,
@@ -155,12 +147,12 @@ class SiteAnalyzerEngine @Inject constructor(
             } catch (_: Exception) {
                 null
             }
-            val activeHtml = renderedHtml ?: responseBody
+            val activeHtml = renderedHtml ?: fetchedPage.html
             val document = Jsoup.parse(activeHtml, normalizedUrl)
             val loadTime = System.currentTimeMillis() - startTime
             
             // Perform all analyses
-            val securityAnalysis = analyzeSecurityHeaders(normalizedUrl, response.headers())
+            val securityAnalysis = analyzeSecurityHeaders(normalizedUrl, fetchedPage.headers)
             val domAnalysis = analyzeDOMStructure(document)
             val patterns = detectPatterns(document)
             val mediaAnalysis = analyzeMediaContent(document)
@@ -171,12 +163,12 @@ class SiteAnalyzerEngine @Inject constructor(
                 url = normalizedUrl,
                 document = document,
                 html = activeHtml,
-                headers = response.headers(),
+                headers = fetchedPage.headers,
                 mediaAnalysis = mediaAnalysis,
                 apiAnalysis = apiAnalysis,
                 loadTime = loadTime
             )
-            val enrichedHeaders = response.headers().toMutableMap().apply {
+            val enrichedHeaders = fetchedPage.headers.toMutableMap().apply {
                 put(CAPABILITY_REPORT_HEADER, json.encodeToString(capabilityReport))
             }
             
@@ -242,7 +234,7 @@ class SiteAnalyzerEngine @Inject constructor(
                 // Raw data
                 rawHtml = document.html().take(50000), // Limit storage
                 headers = json.encodeToString(enrichedHeaders),
-                cookies = json.encodeToString(response.cookies())
+                cookies = json.encodeToString(fetchedPage.cookies)
             )
             analysisCache[normalizedKey] = result to System.currentTimeMillis()
             result
@@ -252,6 +244,35 @@ class SiteAnalyzerEngine @Inject constructor(
                 providerId = providerId,
                 url = url,
                 securityScore = 0f
+            )
+        }
+    }
+
+    private suspend fun fetchAnalyzerPage(url: String): AnalyzerFetchedPage {
+        return try {
+            val response = Jsoup.connect(url)
+                .userAgent(DEFAULT_USER_AGENT)
+                .timeout(DEFAULT_TIMEOUT)
+                .followRedirects(true)
+                .ignoreHttpErrors(true)
+                .ignoreContentType(false)
+                .headers(MODERN_REQUEST_HEADERS)
+                .execute()
+            AnalyzerFetchedPage(
+                html = response.body(),
+                headers = response.headers(),
+                cookies = response.cookies()
+            )
+        } catch (e: Exception) {
+            val renderedHtml = HeadlessBrowserHelper.fetchPageContentWithShadowAndAdSkip(
+                url = url,
+                waitSelector = "body",
+                timeout = DEFAULT_TIMEOUT
+            ) ?: throw e
+            AnalyzerFetchedPage(
+                html = renderedHtml,
+                headers = emptyMap(),
+                cookies = emptyMap()
             )
         }
     }
@@ -1297,6 +1318,12 @@ class SiteAnalyzerEngine @Inject constructor(
     }
     
     // Data classes for internal use
+    data class AnalyzerFetchedPage(
+        val html: String,
+        val headers: Map<String, String>,
+        val cookies: Map<String, String>
+    )
+
     data class SecurityAnalysisResult(
         val score: Float,
         val sslVersion: String?,

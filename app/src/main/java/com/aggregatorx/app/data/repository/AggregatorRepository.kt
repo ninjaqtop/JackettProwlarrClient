@@ -40,6 +40,10 @@ class AggregatorRepository @Inject constructor(
         
         val existingProvider = providerDao.getProviderByUrl(normalizedUrl)
         if (existingProvider != null) {
+            if (!existingProvider.isEnabled) {
+                providerDao.setProviderEnabled(existingProvider.id, true)
+            }
+            clearSearchCache()
             return existingProvider
         }
         
@@ -53,6 +57,7 @@ class AggregatorRepository @Inject constructor(
         )
         
         providerDao.insertProvider(provider)
+        clearSearchCache()
         return provider
     }
     
