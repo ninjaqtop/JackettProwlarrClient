@@ -6,6 +6,8 @@ import com.aggregatorx.app.engine.scraper.HeadlessBrowserHelper
 import com.aggregatorx.app.engine.token.TokenManager
 import com.aggregatorx.app.engine.vision.VisionEngine
 import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.withContext
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
@@ -52,6 +54,8 @@ class SiteAnalyzerEngine @Inject constructor(
     
     companion object {
         private const val DEFAULT_TIMEOUT = 30000
+        private const val RENDER_TIMEOUT_MS = 18_000L
+        private const val CAPABILITY_STEP_TIMEOUT_MS = 6_000L
         private const val ANALYSIS_CACHE_TTL_MS = 3_600_000L // 1 hour
         const val CAPABILITY_REPORT_HEADER = "AggregatorX-Capability-Report"
         private val DEFAULT_USER_AGENT = com.aggregatorx.app.engine.util.EngineUtils.DEFAULT_USER_AGENT
@@ -139,11 +143,13 @@ class SiteAnalyzerEngine @Inject constructor(
             // rendered content so JS-heavy sites can still be analyzed.
             val fetchedPage = fetchAnalyzerPage(normalizedUrl)
             val renderedHtml = try {
-                HeadlessBrowserHelper.fetchPageContentWithShadowAndAdSkip(
-                    url = normalizedUrl,
-                    waitSelector = "body",
-                    timeout = DEFAULT_TIMEOUT
-                )
+                withTimeoutOrNull(RENDER_TIMEOUT_MS) {
+                    HeadlessBrowserHelper.fetchPageContentWithShadowAndAdSkip(
+                        url = normalizedUrl,
+                        waitSelector = "body",
+                        timeout = DEFAULT_TIMEOUT
+                    )
+                }
             } catch (_: Exception) {
                 null
             }
@@ -238,6 +244,8 @@ class SiteAnalyzerEngine @Inject constructor(
             )
             analysisCache[normalizedKey] = result to System.currentTimeMillis()
             result
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
             // Return minimal analysis on failure
             SiteAnalysis(
@@ -263,12 +271,16 @@ class SiteAnalyzerEngine @Inject constructor(
                 headers = response.headers(),
                 cookies = response.cookies()
             )
+        } catch (e: CancellationException) {
+            throw e
         } catch (e: Exception) {
-            val renderedHtml = HeadlessBrowserHelper.fetchPageContentWithShadowAndAdSkip(
-                url = url,
-                waitSelector = "body",
-                timeout = DEFAULT_TIMEOUT
-            ) ?: throw e
+            val renderedHtml = withTimeoutOrNull(RENDER_TIMEOUT_MS) {
+                HeadlessBrowserHelper.fetchPageContentWithShadowAndAdSkip(
+                    url = url,
+                    waitSelector = "body",
+                    timeout = DEFAULT_TIMEOUT
+                )
+            } ?: throw e
             AnalyzerFetchedPage(
                 html = renderedHtml,
                 headers = emptyMap(),
@@ -326,6 +338,8 @@ class SiteAnalyzerEngine @Inject constructor(
     private fun getSSLVersion(url: String): String? {
         return try {
             val connection = URL(url).openConnection() as? HttpsURLConnection
+            connection?.connectTimeout = 5_000
+            connection?.readTimeout = 5_000
             connection?.connect()
             // Get cipher suite which indicates TLS version
             val cipherSuite = connection?.cipherSuite
@@ -998,11 +1012,12 @@ class SiteAnalyzerEngine @Inject constructor(
         loadTime: Long
     ): AnalyzerCapabilityReport {
         val baseUrl = extractBaseUrl(url)
-        val tokenBundle = try { tokenManager.harvestTokens(url) } catch (_: Exception) { null }
-        val deepEndpoints = try { endpointDiscoveryEngine.deepDiscoverEndpoints(baseUrl, "test") } catch (_: Exception) { null }
+        val tokenBundle = try { withTimeoutOrNull(CAPABILITY_STEP_TIMEOUT_MS) { tokenManager.harvestTokens(url) } } catch (_: Exception) { null }
+        val deepEndpoints = try { withTimeoutOrNull(CAPABILITY_STEP_TIMEOUT_MS) { endpointDiscoveryEngine.deepDiscoverEndpoints(baseUrl, "test") } } catch (_: Exception) { null }
         val thumbnails = collectThumbnailUrls(document, baseUrl)
-        val ocrKeywords = try { visionEngine.batchExtract(thumbnails.take(8)) } catch (_: Exception) { emptyMap() }
-        val network = analyzeNetworkTopology(url, headers)
+        val ocrKeywords = try { withTimeoutOrNull(CAPABILITY_STEP_TIMEOUT_MS) { visionEngine.batchExtract(thumbnails.take(8)) } } catch (_: Exception) { null }.orEmpty()
+        val network = withTimeoutOrNull(CAPABILITY_STEP_TIMEOUT_MS) { analyzeNetworkTopology(url, headers) }
+            ?: NetworkTopologyResult(emptyList(), "Unknown", emptyList())
         val tlsProfile = tlsFingerprintEngine.defaultProfileInfo()
         val nativeTls = tlsFingerprintEngine.nativeImpersonationInfo()
         val waf = analyzeWafFingerprint(headers, html)

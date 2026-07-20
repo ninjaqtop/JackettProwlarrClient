@@ -6,7 +6,10 @@ import com.aggregatorx.app.engine.analyzer.SiteAnalyzerEngine
 import com.aggregatorx.app.engine.nlp.NaturalLanguageQueryProcessor
 import com.aggregatorx.app.engine.ranking.RankingEngine
 import com.aggregatorx.app.engine.scraper.ScrapingEngine
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.*
+import kotlinx.coroutines.withTimeout
 import java.net.URL
 import java.util.UUID
 import javax.inject.Inject
@@ -25,6 +28,10 @@ class AggregatorRepository @Inject constructor(
     private val rankingEngine: RankingEngine,
     private val nlpProcessor: NaturalLanguageQueryProcessor
 ) {
+    private companion object {
+        const val PROVIDER_ANALYSIS_TIMEOUT_MS = 60_000L
+    }
+
     fun clearSearchCache() {
         scrapingEngine.clearCache()
     }
@@ -80,11 +87,29 @@ class AggregatorRepository @Inject constructor(
         val provider = providerDao.getProviderById(providerId)
             ?: throw IllegalArgumentException("Provider not found")
         
-        val analysis = siteAnalyzerEngine.analyzeSite(provider.url, providerId)
+        val analysis = runCatching {
+            withTimeout(PROVIDER_ANALYSIS_TIMEOUT_MS) {
+                siteAnalyzerEngine.analyzeSite(provider.url, providerId)
+            }
+        }.getOrElse {
+            if (it is CancellationException && it !is TimeoutCancellationException) throw it
+            SiteAnalysis(
+                providerId = providerId,
+                url = provider.url,
+                analyzedAt = System.currentTimeMillis(),
+                hasSSL = provider.url.startsWith("https://", ignoreCase = true),
+                scrapingStrategy = ScrapingStrategy.HYBRID,
+                requiresJavaScript = true,
+                rawHtml = null,
+                headers = "{}",
+                cookies = "[]"
+            )
+        }
         siteAnalysisDao.insertAnalysis(analysis)
         
-        // Generate scraping config from analysis
-        generateScrapingConfig(provider, analysis)
+        // Generate scraping config from analysis. If selector generation fails,
+        // the provider still remains saved and searchable through generic fallback.
+        runCatching { generateScrapingConfig(provider, analysis) }
         
         // Update provider last analyzed timestamp
         providerDao.updateLastAnalyzed(providerId, System.currentTimeMillis())

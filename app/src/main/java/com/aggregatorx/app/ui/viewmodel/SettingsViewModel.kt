@@ -5,14 +5,21 @@ import androidx.lifecycle.viewModelScope
 import com.aggregatorx.app.data.model.*
 import com.aggregatorx.app.data.repository.AggregatorRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeout
 import javax.inject.Inject
 
 @HiltViewModel
 class SettingsViewModel @Inject constructor(
     private val repository: AggregatorRepository
 ) : ViewModel() {
+    private companion object {
+        const val ANALYZE_TIMEOUT_MS = 75_000L
+    }
+
     fun updateDownloadDirectory(uri: String) {
         _uiState.update { it.copy(downloadSettings = it.downloadSettings.copy(downloadDirectory = uri)) }
         // TODO: Persist to repository or DataStore if needed
@@ -48,7 +55,9 @@ class SettingsViewModel @Inject constructor(
             _uiState.update { it.copy(isAnalyzing = true, error = null) }
             
             try {
-                val (provider, analysis) = repository.analyzeNewUrl(url)
+                val (provider, analysis) = withTimeout(ANALYZE_TIMEOUT_MS) {
+                    repository.analyzeNewUrl(url)
+                }
                 _uiState.update { 
                     it.copy(
                         isAnalyzing = false,
@@ -58,11 +67,20 @@ class SettingsViewModel @Inject constructor(
                         message = "Successfully analyzed and added: ${provider.name}"
                     ) 
                 }
+            } catch (e: TimeoutCancellationException) {
+                _uiState.update {
+                    it.copy(
+                        isAnalyzing = false,
+                        error = "Analysis timed out. The button has been reset; try the address again or check that the site is reachable."
+                    )
+                }
+            } catch (e: CancellationException) {
+                throw e
             } catch (e: Exception) {
                 _uiState.update { 
                     it.copy(
                         isAnalyzing = false,
-                        error = e.message ?: "Analysis failed"
+                        error = "Analysis could not finish for this address. The provider was not saved; check the URL and try again."
                     ) 
                 }
             }
