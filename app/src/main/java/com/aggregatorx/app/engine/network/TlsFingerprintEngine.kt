@@ -34,6 +34,13 @@ class TlsFingerprintEngine @Inject constructor() {
         val description: String
     )
 
+    data class NativeImpersonationInfo(
+        val available: Boolean,
+        val defaultProfile: String,
+        val supportedProfiles: List<String>,
+        val unavailableReason: String?
+    )
+
     private val random = SecureRandom()
 
     fun randomProfile(): Profile = Profile.values()[random.nextInt(Profile.values().size)]
@@ -97,6 +104,20 @@ class TlsFingerprintEngine @Inject constructor() {
     }
 
     fun newClient(profile: Profile = randomProfile()): OkHttpClient = apply(OkHttpClient.Builder(), profile).build()
+
+    fun nativeImpersonationInfo(): NativeImpersonationInfo = NativeImpersonationInfo(
+        available = TlsClient.isAvailable,
+        defaultProfile = TlsClient.DEFAULT_PROFILE,
+        supportedProfiles = TlsClient.supportedProfiles,
+        unavailableReason = TlsClient.unavailableReason
+    )
+
+    fun nativeProfileFor(profile: Profile = Profile.CHROME): String = when (profile) {
+        Profile.CHROME -> "chrome_133"
+        Profile.FIREFOX -> "firefox_135"
+        Profile.SAFARI -> "safari_ios_18_5"
+        Profile.ANDROID_WEBVIEW -> "okhttp4_android_13"
+    }
 
     fun headers(profile: Profile = Profile.CHROME): Map<String, String> {
         val info = describe(profile)

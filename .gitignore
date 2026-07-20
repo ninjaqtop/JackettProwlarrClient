@@ -3,6 +3,7 @@
 build/
 */build/
 app/build/
+app/.cxx/
 
 # Local configuration
 local.properties

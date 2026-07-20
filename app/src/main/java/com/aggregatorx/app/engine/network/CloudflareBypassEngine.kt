@@ -246,20 +246,28 @@ class CloudflareBypassEngine @Inject constructor(
         headers: Map<String, String>,
         timeoutMs: Int
     ): BypassResult {
+        val domain = extractDomain(url)
+        val requestHeaders = headers.toMutableMap()
+        domainCookieJars[domain]?.let { cookies ->
+            val cookieStr = cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
+            if (cookieStr.isNotEmpty()) requestHeaders["Cookie"] = cookieStr
+        }
+
+        val nativeResult = nativeDirectFetch(url, requestHeaders, timeoutMs)
+        if (nativeResult.statusCode > 0 || nativeResult.html != null) {
+            if (nativeResult.cookies.isNotEmpty()) {
+                domainCookieJars[domain] = (domainCookieJars[domain].orEmpty() + nativeResult.cookies).toMutableMap()
+            }
+            return nativeResult
+        }
+
         val client = sharedClient.newBuilder()
             .connectTimeout(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
             .readTimeout(timeoutMs.toLong(), TimeUnit.MILLISECONDS)
             .build()
 
         val requestBuilder = Request.Builder().url(url)
-        headers.forEach { (k, v) -> requestBuilder.header(k, v) }
-
-        // Apply any saved cookies for this domain
-        val domain = extractDomain(url)
-        domainCookieJars[domain]?.let { cookies ->
-            val cookieStr = cookies.entries.joinToString("; ") { "${it.key}=${it.value}" }
-            if (cookieStr.isNotEmpty()) requestBuilder.header("Cookie", cookieStr)
-        }
+        requestHeaders.forEach { (k, v) -> requestBuilder.header(k, v) }
 
         return try {
             val response = client.newCall(requestBuilder.build()).execute()
@@ -275,6 +283,34 @@ class CloudflareBypassEngine @Inject constructor(
         } catch (e: IOException) {
             BypassResult(success = false, error = e.message)
         }
+    }
+
+    private fun nativeDirectFetch(
+        url: String,
+        headers: Map<String, String>,
+        timeoutMs: Int
+    ): BypassResult {
+        val profile = selectNativeProfile(headers)
+        val response = TlsClient.execute(
+            TlsRequest(
+                url = url,
+                method = "GET",
+                headers = headers,
+                clientProfile = profile,
+                timeoutMs = timeoutMs
+            )
+        )
+
+        if (!response.error.isNullOrBlank()) {
+            return BypassResult(success = false, error = response.error)
+        }
+
+        return BypassResult(
+            success = response.statusCode in 200..399,
+            html = response.body,
+            statusCode = response.statusCode,
+            cookies = parseCookiesFromHeaders(response.headers)
+        )
     }
 
     private fun fetchWithCookies(
@@ -408,6 +444,34 @@ class CloudflareBypassEngine @Inject constructor(
             }
         }
         return cookies
+    }
+
+    private fun parseCookiesFromHeaders(headers: Map<String, List<String>>): Map<String, String> {
+        val cookies = mutableMapOf<String, String>()
+        headers.entries
+            .filter { it.key.equals("Set-Cookie", ignoreCase = true) }
+            .flatMap { it.value }
+            .forEach { header ->
+                val parts = header.split(";").firstOrNull()?.split("=", limit = 2)
+                if (parts != null && parts.size == 2) {
+                    cookies[parts[0].trim()] = parts[1].trim()
+                }
+            }
+        return cookies
+    }
+
+    private fun selectNativeProfile(headers: Map<String, String>): String {
+        val userAgent = headers.entries
+            .firstOrNull { it.key.equals("User-Agent", ignoreCase = true) }
+            ?.value
+            .orEmpty()
+
+        return when {
+            userAgent.contains("Firefox", ignoreCase = true) -> tlsFingerprintEngine.nativeProfileFor(TlsFingerprintEngine.Profile.FIREFOX)
+            userAgent.contains("Android", ignoreCase = true) -> tlsFingerprintEngine.nativeProfileFor(TlsFingerprintEngine.Profile.ANDROID_WEBVIEW)
+            userAgent.contains("Safari", ignoreCase = true) && !userAgent.contains("Chrome", ignoreCase = true) -> tlsFingerprintEngine.nativeProfileFor(TlsFingerprintEngine.Profile.SAFARI)
+            else -> tlsFingerprintEngine.nativeProfileFor(TlsFingerprintEngine.Profile.CHROME)
+        }
     }
 
     private fun extractDomain(url: String): String =

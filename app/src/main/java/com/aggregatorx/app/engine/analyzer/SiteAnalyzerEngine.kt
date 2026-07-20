@@ -983,6 +983,7 @@ class SiteAnalyzerEngine @Inject constructor(
         val ocrKeywords = try { visionEngine.batchExtract(thumbnails.take(8)) } catch (_: Exception) { emptyMap() }
         val network = analyzeNetworkTopology(url, headers)
         val tlsProfile = tlsFingerprintEngine.defaultProfileInfo()
+        val nativeTls = tlsFingerprintEngine.nativeImpersonationInfo()
         val waf = analyzeWafFingerprint(headers, html)
         val jsBundle = analyzeJsBundles(document, html, baseUrl)
         val hiddenInputs = document.select("input[type=hidden]").size
@@ -1101,9 +1102,18 @@ class SiteAnalyzerEngine @Inject constructor(
                         capability("Cookie Persistence", "active", "Native helper keeps an in-memory cookie jar; WebView cookies enabled"),
                         capability("Navigator Spoof", "active", "WebView JS override for webdriver/platform/hardware/device memory"),
                         capability("Canvas/WebGL Spoof", "active", "WebView JS overrides for canvas noise and WebGL vendor/renderer"),
-                        capability("TLS Fingerprint", "active", "Chromium WebView TLS profile used for rendered fetches"),
-                        capability("Native TLS Profile Rotation", "active", "${tlsProfile.profile}: ${tlsProfile.description}"),
-                        capability("Custom JA3 Extension Order", "external_required", "Android APIs allow TLS/cipher profiles but not arbitrary ClientHello extension ordering")
+                        capability("TLS Fingerprint", "active", "Chromium WebView and OkHttp TLS profile used for rendered fallback fetches"),
+                        capability("OkHttp TLS Profile Rotation", "active", "${tlsProfile.profile}: ${tlsProfile.description}"),
+                        capability(
+                            "Native TLS Impersonation",
+                            if (nativeTls.available) "active" else "packaged_fallback",
+                            if (nativeTls.available) {
+                                "Go tls-client JNI bridge available; default=${nativeTls.defaultProfile}; profiles=${nativeTls.supportedProfiles.joinToString(", ")}"
+                            } else {
+                                "Go tls-client bridge packaged for arm64-v8a; runtime load pending/unavailable: ${nativeTls.unavailableReason ?: "unknown"}"
+                            }
+                        ),
+                        capability("Custom JA3 Extension Order", if (nativeTls.available) "active" else "packaged_fallback", "Native Go tls-client supports browser ClientHello/profile impersonation; Android API fallback cannot override every ClientHello field")
                     )
                 ),
                 AnalyzerCapabilitySection(
