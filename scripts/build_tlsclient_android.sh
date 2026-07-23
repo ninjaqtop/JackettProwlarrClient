@@ -16,6 +16,7 @@ export GOOS=android
 export GOARCH=arm64
 export CC="$TOOLCHAIN/bin/aarch64-linux-android${API_LEVEL}-clang"
 export CXX="$TOOLCHAIN/bin/aarch64-linux-android${API_LEVEL}-clang++"
+export CGO_LDFLAGS="${CGO_LDFLAGS:-} -Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384"
 
 if [[ ! -x "$CC" ]]; then
   echo "Android NDK compiler not found: $CC" >&2
@@ -27,7 +28,7 @@ mkdir -p "$JNI_LIB_DIR" "$CPP_DIR"
 
 cd "$GO_DIR"
 go mod tidy
-go build -buildmode=c-shared -trimpath -ldflags="-s -w" -o "$JNI_LIB_DIR/libtlsclient.so" .
+go build -buildmode=c-shared -trimpath -ldflags="-s -w -extldflags '-Wl,-z,max-page-size=16384 -Wl,-z,common-page-size=16384'" -o "$JNI_LIB_DIR/libtlsclient.so" .
 cp "$JNI_LIB_DIR/libtlsclient.h" "$CPP_DIR/libtlsclient.h"
 rm -f "$JNI_LIB_DIR/libtlsclient.h"
 

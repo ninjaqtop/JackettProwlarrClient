@@ -15,11 +15,11 @@ object ResultNormalizer {
     private val json = Json { encodeDefaults = true; ignoreUnknownKeys = true }
 
     suspend fun normalize(providerId: String, providerBaseUrl: String, results: List<SearchResult>): List<SearchResult> {
-        ProviderMemoryStore.getProviderContext(providerId)
+        runCatching { ProviderMemoryStore.getProviderContext(providerId) }
         val rawJson = json.encodeToString(results)
-        AnalysisHelper.checkFreshness(rawJson, "[]").first()
-        AnalysisHelper.analyzePagination(rawJson, providerId).first()
-        AnalysisHelper.checkFreshness(rawJson, rawJson).first()
+        runCatching { AnalysisHelper.checkFreshness(rawJson, "[]").first() }
+        runCatching { AnalysisHelper.analyzePagination(rawJson, providerId).first() }
+        runCatching { AnalysisHelper.diffResults(rawJson, "[]", providerId).first() }
 
         val normalized = results.mapNotNull { result ->
             val repaired = repairResult(providerId, providerBaseUrl, result)
@@ -29,7 +29,7 @@ object ResultNormalizer {
         }.distinctBy { it.url }
 
         if (normalized.isNotEmpty()) {
-            ProviderMemoryStore.updateProviderSchema(providerId, json.encodeToString(normalized.take(5)), 0.86f)
+            runCatching { ProviderMemoryStore.updateProviderSchema(providerId, json.encodeToString(normalized.take(5)), 0.86f) }
         }
         return normalized
     }
@@ -37,14 +37,16 @@ object ResultNormalizer {
     private suspend fun repairResult(providerId: String, providerBaseUrl: String, result: SearchResult): SearchResult {
         val localUrl = EngineUtils.normalizeUrl(result.url, providerBaseUrl)
         if (localUrl != result.url) {
-            ProviderMemoryStore.saveCorrection(providerId, "url", result.url, localUrl, 0.92f)
+            runCatching { ProviderMemoryStore.saveCorrection(providerId, "url", result.url, localUrl, 0.92f) }
         }
         val locallyRepaired = result.copy(
             url = localUrl,
             thumbnailUrl = result.thumbnailUrl?.let { EngineUtils.normalizeUrl(it, providerBaseUrl) }
         )
 
-        val response = AnalysisHelper.repairUrls(json.encodeToString(locallyRepaired), providerId).first()
+        val response = runCatching {
+            AnalysisHelper.repairUrls(json.encodeToString(locallyRepaired), providerId).first()
+        }.getOrNull() ?: return locallyRepaired
         return runCatching {
             val root = json.parseToJsonElement(response.json).jsonObject
             val repaired = root["repaired_result"] ?: return@runCatching locallyRepaired
@@ -53,12 +55,14 @@ object ResultNormalizer {
     }
 
     private suspend fun fixCategory(providerId: String, result: SearchResult): SearchResult {
-        val response = AnalysisHelper.fixCategory(json.encodeToString(result), providerId).first()
+        val response = runCatching {
+            AnalysisHelper.fixCategory(json.encodeToString(result), providerId).first()
+        }.getOrNull() ?: return result
         val root = runCatching { json.parseToJsonElement(response.json).jsonObject }.getOrNull() ?: return result
         val corrected = root["corrected_category"]?.jsonPrimitive?.content.orEmpty()
         val confidence = root["confidence"]?.jsonPrimitive?.content?.toFloatOrNull() ?: 0f
         return if (corrected.isNotBlank() && confidence >= 0.8f && corrected != result.category) {
-            ProviderMemoryStore.saveCorrection(providerId, "category", result.category.orEmpty(), corrected, confidence)
+            runCatching { ProviderMemoryStore.saveCorrection(providerId, "category", result.category.orEmpty(), corrected, confidence) }
             result.copy(category = corrected)
         } else {
             result
@@ -71,7 +75,9 @@ object ResultNormalizer {
     }
 
     suspend fun normalizeResponse(providerId: String, providerBaseUrl: String, rawResponse: String): List<SearchResult> {
-        val parsed = AnalysisHelper.analyzeResults(rawResponse, providerId).first()
+        val parsed = runCatching {
+            AnalysisHelper.analyzeResults(rawResponse, providerId).first()
+        }.getOrNull() ?: return emptyList()
         val results = runCatching {
             json.parseToJsonElement(parsed.json)
                 .jsonObject["results"]
@@ -97,13 +103,17 @@ object ResultNormalizer {
     }
 
     suspend fun isFresh(providerId: String, newResults: List<SearchResult>, oldResults: List<SearchResult>): Boolean {
-        val response = AnalysisHelper.checkFreshness(json.encodeToString(newResults), json.encodeToString(oldResults)).first()
+        val response = runCatching {
+            AnalysisHelper.checkFreshness(json.encodeToString(newResults), json.encodeToString(oldResults)).first()
+        }.getOrNull() ?: return true
         val root = runCatching { json.parseToJsonElement(response.json).jsonObject }.getOrNull()
         return root?.get("is_fresh")?.jsonPrimitive?.content?.toBooleanStrictOrNull() ?: true
     }
 
     suspend fun diffFresh(providerId: String, newResults: List<SearchResult>, oldResults: List<SearchResult>): Boolean {
-        val response = AnalysisHelper.diffResults(json.encodeToString(newResults), json.encodeToString(oldResults), providerId).first()
+        val response = runCatching {
+            AnalysisHelper.diffResults(json.encodeToString(newResults), json.encodeToString(oldResults), providerId).first()
+        }.getOrNull() ?: return true
         val root = runCatching { json.parseToJsonElement(response.json).jsonObject }.getOrNull()
         return root?.get("is_fresh")?.jsonPrimitive?.content?.toBooleanStrictOrNull()
             ?: root?.get("freshness_score")?.jsonPrimitive?.content?.toFloatOrNull()?.let { it >= 0.8f }

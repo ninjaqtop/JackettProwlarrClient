@@ -11,6 +11,7 @@ import com.aggregatorx.app.engine.token.TokenManager
 import com.aggregatorx.app.engine.util.EngineUtils
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Job
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import javax.inject.Inject
@@ -111,56 +112,56 @@ class SearchViewModel @Inject constructor(
             _uiState.update { it.copy(isSearching = true, currentSearchQuery = query, error = null) }
             val currentResults = if (isLoadMore) _providerResults.value.toMutableList() else mutableListOf()
 
-            // Calls Repository using the new pages parameter fix
-            repository.searchAllProviders(query, pages = _providerFetchPages.value)
-                .catch { e -> if (currentResults.isEmpty()) _uiState.update { it.copy(error = e.message) } }
-                .collect { providerResult ->
-                    val normalizedResults = ResultNormalizer.normalize(
-                        providerId = providerResult.provider.id,
-                        providerBaseUrl = providerResult.provider.baseUrl,
-                        results = providerResult.results
-                    )
-                    ProviderPaginationManager.markFetched(providerResult.provider.id, normalizedResults.size)
-                    val normalizedProviderResult = providerResult.copy(
-                        results = normalizedResults,
-                        totalResults = normalizedResults.size,
-                        hasMore = normalizedResults.size >= PROVIDER_PAGE_SIZE
-                    )
-                    // Session-level de-duplication
-                    val uniqueNewOnes = normalizedProviderResult.results.filter { sessionSeenUrls.add(it.url) }
-                    
-                    if (uniqueNewOnes.isNotEmpty()) {
-                        val filteredResult = normalizedProviderResult.copy(results = uniqueNewOnes)
-                        val existingIndex = currentResults.indexOfFirst { it.provider.id == normalizedProviderResult.provider.id }
-                        if (existingIndex >= 0) {
-                            val existing = currentResults[existingIndex]
-                            currentResults[existingIndex] = existing.copy(
-                                results = (existing.results + uniqueNewOnes).distinctBy { it.url },
-                                searchTime = normalizedProviderResult.searchTime,
-                                success = normalizedProviderResult.success,
-                                errorMessage = normalizedProviderResult.errorMessage,
-                                totalResults = existing.results.size + uniqueNewOnes.size,
-                                hasMore = normalizedProviderResult.hasMore,
-                                nextPageUrl = normalizedProviderResult.nextPageUrl
-                            )
-                        } else {
-                            currentResults.add(filteredResult)
-                        }
-                        _providerResults.value = currentResults.toList()
-
+            try {
+                // Calls Repository using the new pages parameter fix
+                repository.searchAllProviders(query, pages = _providerFetchPages.value)
+                    .catch { e -> if (currentResults.isEmpty()) _uiState.update { it.copy(error = e.message) } }
+                    .collect { providerResult ->
                         try {
-                            val aggregated = repository.aggregateSearchResults(query, currentResults)
-                            _uiState.update { it.copy(
-                                aggregatedResults = aggregated,
-                                totalResults = sessionSeenUrls.size,
-                                successfulProviders = aggregated.successfulProviders,
-                                failedProviders = aggregated.failedProviders
-                            ) }
-                        } catch (_: Exception) {}
-                    }
-                }
+                            val normalizedResults = safeNormalize(providerResult)
+                            ProviderPaginationManager.markFetched(providerResult.provider.id, normalizedResults.size)
+                            val normalizedProviderResult = providerResult.copy(
+                                results = normalizedResults,
+                                totalResults = normalizedResults.size,
+                                hasMore = normalizedResults.size >= PROVIDER_PAGE_SIZE
+                            )
+                            // Session-level de-duplication
+                            val uniqueNewOnes = normalizedProviderResult.results.filter { sessionSeenUrls.add(it.url) }
 
-            _uiState.update { it.copy(isSearching = false, searchCompleted = true) }
+                            if (uniqueNewOnes.isNotEmpty()) {
+                                val filteredResult = normalizedProviderResult.copy(results = uniqueNewOnes)
+                                val existingIndex = currentResults.indexOfFirst { it.provider.id == normalizedProviderResult.provider.id }
+                                if (existingIndex >= 0) {
+                                    val existing = currentResults[existingIndex]
+                                    currentResults[existingIndex] = existing.copy(
+                                        results = (existing.results + uniqueNewOnes).distinctBy { it.url },
+                                        searchTime = normalizedProviderResult.searchTime,
+                                        success = normalizedProviderResult.success,
+                                        errorMessage = normalizedProviderResult.errorMessage,
+                                        totalResults = existing.results.size + uniqueNewOnes.size,
+                                        hasMore = normalizedProviderResult.hasMore,
+                                        nextPageUrl = normalizedProviderResult.nextPageUrl
+                                    )
+                                } else {
+                                    currentResults.add(filteredResult)
+                                }
+                                _providerResults.value = currentResults.toList()
+
+                                updateAggregatedState(query, currentResults)
+                            }
+                        } catch (e: CancellationException) {
+                            throw e
+                        } catch (e: Throwable) {
+                            appendProviderFailure(providerResult, e)
+                        }
+                    }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                _uiState.update { it.copy(error = e.message ?: "Search failed") }
+            } finally {
+                _uiState.update { it.copy(isSearching = false, searchCompleted = true) }
+            }
 
             // PASS 2: Preference Ranking (AI Tab)
             launch {
@@ -219,26 +220,33 @@ class SearchViewModel @Inject constructor(
             if (query.isBlank()) return
             viewModelScope.launch {
                 _loadingProviderIds.update { it + providerId }
-                ProviderPaginationManager.fetchMoreResults(providerId, query).collect { fetched ->
-                    val existingIndex = _providerResults.value.indexOfFirst { it.provider.id == providerId }
-                    if (existingIndex >= 0 && fetched.isNotEmpty()) {
-                        val next = _providerResults.value.toMutableList()
-                        val existing = next[existingIndex]
-                        val unique = fetched.filter { sessionSeenUrls.add(it.url) }
-                        next[existingIndex] = existing.copy(
-                            results = (existing.results + unique).distinctBy { it.url },
-                            totalResults = existing.results.size + unique.size,
-                            hasMore = unique.isNotEmpty()
-                        )
-                        _providerResults.value = next
-                    } else if (existingIndex >= 0) {
-                        val next = _providerResults.value.toMutableList()
-                        next[existingIndex] = next[existingIndex].copy(hasMore = false)
-                        _providerResults.value = next
+                try {
+                    ProviderPaginationManager.fetchMoreResults(providerId, query).collect { fetched ->
+                        val existingIndex = _providerResults.value.indexOfFirst { it.provider.id == providerId }
+                        if (existingIndex >= 0 && fetched.isNotEmpty()) {
+                            val next = _providerResults.value.toMutableList()
+                            val existing = next[existingIndex]
+                            val unique = fetched.filter { sessionSeenUrls.add(it.url) }
+                            next[existingIndex] = existing.copy(
+                                results = (existing.results + unique).distinctBy { it.url },
+                                totalResults = existing.results.size + unique.size,
+                                hasMore = unique.isNotEmpty()
+                            )
+                            _providerResults.value = next
+                        } else if (existingIndex >= 0) {
+                            val next = _providerResults.value.toMutableList()
+                            next[existingIndex] = next[existingIndex].copy(hasMore = false)
+                            _providerResults.value = next
+                        }
                     }
+                    _providerPages.update { it + (providerId to current + 1) }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (e: Throwable) {
+                    _uiState.update { it.copy(error = "Load more failed: ${e.message ?: e.javaClass.simpleName}") }
+                } finally {
+                    _loadingProviderIds.update { it - providerId }
                 }
-                _providerPages.update { it + (providerId to current + 1) }
-                _loadingProviderIds.update { it - providerId }
             }
         }
     }
@@ -265,18 +273,67 @@ class SearchViewModel @Inject constructor(
         if (query.isBlank()) return
         viewModelScope.launch {
             _loadingProviderIds.update { it + providerId }
-            repository.searchProviderPage(providerId, query, 0)?.let { providerResult ->
-                val normalized = ResultNormalizer.normalize(providerResult.provider.id, providerResult.provider.baseUrl, providerResult.results)
-                _providerResults.update { current ->
-                    current.filterNot { it.provider.id == providerId } + providerResult.copy(
-                        results = normalized,
-                        totalResults = normalized.size,
-                        hasMore = normalized.size >= PROVIDER_PAGE_SIZE
-                    )
+            try {
+                repository.searchProviderPage(providerId, query, 0)?.let { providerResult ->
+                    val normalized = safeNormalize(providerResult)
+                    _providerResults.update { current ->
+                        current.filterNot { it.provider.id == providerId } + providerResult.copy(
+                            results = normalized,
+                            totalResults = normalized.size,
+                            hasMore = normalized.size >= PROVIDER_PAGE_SIZE
+                        )
+                    }
+                    normalized.forEach { sessionSeenUrls.add(it.url) }
                 }
-                normalized.forEach { sessionSeenUrls.add(it.url) }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Throwable) {
+                _uiState.update { it.copy(error = "Provider refresh failed: ${e.message ?: e.javaClass.simpleName}") }
+            } finally {
+                _loadingProviderIds.update { it - providerId }
             }
-            _loadingProviderIds.update { it - providerId }
+        }
+    }
+
+    private suspend fun safeNormalize(providerResult: ProviderSearchResults): List<SearchResult> {
+        val base = providerResult.results.filter { it.url.isNotBlank() && it.title.isNotBlank() }
+        return runCatching {
+            ResultNormalizer.normalize(
+                providerId = providerResult.provider.id,
+                providerBaseUrl = providerResult.provider.baseUrl,
+                results = base
+            )
+        }.getOrElse {
+            base.distinctBy { result -> result.url }.take(PROVIDER_PAGE_SIZE)
+        }
+    }
+
+    private suspend fun updateAggregatedState(query: String, currentResults: List<ProviderSearchResults>) {
+        runCatching {
+            val aggregated = repository.aggregateSearchResults(query, currentResults)
+            _uiState.update { it.copy(
+                aggregatedResults = aggregated,
+                totalResults = sessionSeenUrls.size,
+                successfulProviders = aggregated.successfulProviders,
+                failedProviders = aggregated.failedProviders
+            ) }
+        }
+    }
+
+    private fun appendProviderFailure(providerResult: ProviderSearchResults, error: Throwable) {
+        _providerResults.update { current ->
+            val failed = providerResult.copy(
+                results = emptyList(),
+                success = false,
+                errorMessage = error.message ?: error.javaClass.simpleName
+            )
+            current.filterNot { it.provider.id == providerResult.provider.id } + failed
+        }
+        _uiState.update { state ->
+            state.copy(
+                failedProviders = state.failedProviders + 1,
+                error = "Provider ${providerResult.provider.name} failed but search continued"
+            )
         }
     }
 
