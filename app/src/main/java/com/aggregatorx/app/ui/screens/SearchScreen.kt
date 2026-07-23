@@ -33,6 +33,7 @@ import androidx.hilt.navigation.compose.hiltViewModel
 import com.aggregatorx.app.data.model.ProviderSearchResults
 import com.aggregatorx.app.data.model.SearchResult
 import com.aggregatorx.app.ui.VideoPlayerActivity
+import com.aggregatorx.app.ui.WebViewActivity
 import com.aggregatorx.app.ui.components.*
 import com.aggregatorx.app.ui.theme.*
 import com.aggregatorx.app.ui.viewmodel.SearchViewModel
@@ -151,27 +152,7 @@ fun SearchScreen(
                             context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(result.url)))
                         },
                         onInApp                  = { result ->
-                            // If extraction already succeeded for this result, launch immediately.
-                            val currentState = viewModel.videoExtractionState.value
-                            if (currentState is VideoExtractionState.Success &&
-                                currentState.title == result.title
-                            ) {
-                                context.startActivity(
-                                    VideoPlayerActivity.buildIntent(
-                                        context  = context,
-                                        videoUrl = currentState.videoUrl,
-                                        title    = result.title,
-                                        headers  = currentState.headers
-                                    )
-                                )
-                                viewModel.resetVideoState()
-                            } else {
-                                // Kick off extraction; the LaunchedEffect below will
-                                // auto-launch VideoPlayerActivity once it completes.
-                                pendingInAppLaunch = true
-                                viewModel.extractVideoUrl(result)
-                                Toast.makeText(context, "Loading: ${result.title}…", Toast.LENGTH_SHORT).show()
-                            }
+                            context.startActivity(WebViewActivity.intent(context, result.url, result.providerId))
                         },
                         onLike                   = { result -> viewModel.toggleLike(result) },
                         onNextPage               = { id -> viewModel.nextProviderPage(id) },
@@ -714,6 +695,14 @@ fun ResultsFeed(
                 )
             }
 
+            item(key = "more_$providerId") {
+                ProviderLoadMoreFooter(
+                    canLoadMore = pr.hasMore || pr.results.size >= PAGE_SIZE,
+                    isEnd = !pr.hasMore && pr.results.size < PAGE_SIZE,
+                    onLoadMore = { onNextPage(providerId) }
+                )
+            }
+
             item(key = "sp_$providerId") { Spacer(Modifier.height(8.dp)) }
         }
 
@@ -738,6 +727,34 @@ fun ResultsFeed(
                     }
                 }
             }
+        }
+    }
+}
+
+@Composable
+fun ProviderLoadMoreFooter(
+    canLoadMore: Boolean,
+    isEnd: Boolean,
+    onLoadMore: () -> Unit
+) {
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 6.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        if (canLoadMore) {
+            OutlinedButton(
+                onClick = onLoadMore,
+                border = BorderStroke(1.dp, NeonGreen.copy(alpha = 0.45f)),
+                colors = ButtonDefaults.outlinedButtonColors(contentColor = NeonGreen)
+            ) {
+                Icon(Icons.Default.ExpandMore, contentDescription = null, modifier = Modifier.size(16.dp))
+                Spacer(Modifier.width(6.dp))
+                Text("Load More", fontSize = 11.sp, fontWeight = FontWeight.Bold)
+            }
+        } else if (isEnd) {
+            Text("End of results", color = TextTertiary, fontSize = 10.sp)
         }
     }
 }

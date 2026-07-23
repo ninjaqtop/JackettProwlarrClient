@@ -37,6 +37,8 @@ import androidx.navigation.compose.rememberNavController
 import com.aggregatorx.app.ui.screens.*
 import com.aggregatorx.app.ui.theme.*
 import com.aggregatorx.app.ui.viewmodel.SearchViewModel
+import com.aggregatorx.app.engine.ml.DownloadState
+import com.aggregatorx.app.engine.ml.ModelDownloadManager
 import dagger.hilt.android.AndroidEntryPoint
 
 @AndroidEntryPoint
@@ -73,60 +75,110 @@ fun MainScreen() {
     // Shared SearchViewModel
     val searchViewModel: SearchViewModel = hiltViewModel()
     val isDiscoveryPaused by searchViewModel.isDiscoveryPaused.collectAsState()
+    val modelDownloadState by ModelDownloadManager.state.collectAsState()
 
     val screens = listOf(Screen.Search, Screen.Providers, Screen.Settings)
 
-    Scaffold(
-        containerColor = DarkBackground,
-        topBar = {
-            MissionControlTopBar(
-                isPaused = isDiscoveryPaused,
-                onPanicRefresh = { searchViewModel.panicRefresh() },
-                onTogglePause = { searchViewModel.toggleDiscoveryPause() }
-            )
-        },
-        bottomBar = {
-            FuturisticBottomBar(
-                screens = screens,
-                currentDestination = currentDestination,
-                onNavigate = { screen ->
-                    navController.navigate(screen.route) {
-                        popUpTo(navController.graph.findStartDestination().id) {
-                            saveState = true
+    Box(modifier = Modifier.fillMaxSize()) {
+        Scaffold(
+            containerColor = DarkBackground,
+            topBar = {
+                MissionControlTopBar(
+                    isPaused = isDiscoveryPaused,
+                    onPanicRefresh = { searchViewModel.panicRefresh() },
+                    onTogglePause = { searchViewModel.toggleDiscoveryPause() }
+                )
+            },
+            bottomBar = {
+                FuturisticBottomBar(
+                    screens = screens,
+                    currentDestination = currentDestination,
+                    onNavigate = { screen ->
+                        navController.navigate(screen.route) {
+                            popUpTo(navController.graph.findStartDestination().id) {
+                                saveState = true
+                            }
+                            launchSingleTop = true
+                            restoreState = true
                         }
-                        launchSingleTop = true
-                        restoreState = true
                     }
+                )
+            }
+        ) { paddingValues ->
+            NavHost(
+                navController = navController,
+                startDestination = Screen.Search.route,
+                modifier = Modifier.padding(paddingValues)
+            ) {
+                composable(
+                    route = Screen.Search.route,
+                    enterTransition = { fadeIn(tween(250)) + slideInHorizontally { -it / 4 } },
+                    exitTransition  = { fadeOut(tween(250)) + slideOutHorizontally { -it / 4 } }
+                ) {
+                    SearchScreen(viewModel = searchViewModel)
                 }
-            )
+                composable(
+                    route = Screen.Providers.route,
+                    enterTransition = { fadeIn(tween(250)) + slideInHorizontally { it / 4 } },
+                    exitTransition  = { fadeOut(tween(250)) + slideOutHorizontally { it / 4 } }
+                ) {
+                    ProvidersScreen()
+                }
+                composable(
+                    route = Screen.Settings.route,
+                    enterTransition = { fadeIn(tween(250)) + slideInHorizontally { it / 4 } },
+                    exitTransition  = { fadeOut(tween(250)) + slideOutHorizontally { it / 4 } }
+                ) {
+                    SettingsScreen()
+                }
+            }
         }
-    ) { paddingValues ->
-        NavHost(
-            navController = navController,
-            startDestination = Screen.Search.route,
-            modifier = Modifier.padding(paddingValues)
+
+        ModelDownloadOverlay(modelDownloadState)
+    }
+}
+
+@Composable
+private fun ModelDownloadOverlay(state: DownloadState) {
+    val visible = state is DownloadState.Queued || state is DownloadState.Downloading || state is DownloadState.Failed
+    if (!visible) return
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(DarkBackground.copy(alpha = 0.96f)),
+        contentAlignment = Alignment.Center
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(28.dp)
+                .clip(RoundedCornerShape(16.dp))
+                .background(DarkCard)
+                .border(1.dp, NeonGreen.copy(alpha = 0.35f), RoundedCornerShape(16.dp))
+                .padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
         ) {
-            composable(
-                route = Screen.Search.route,
-                enterTransition = { fadeIn(tween(250)) + slideInHorizontally { -it / 4 } },
-                exitTransition  = { fadeOut(tween(250)) + slideOutHorizontally { -it / 4 } }
-            ) {
-                // FIXED: Wrapped correctly in lambda context
-                SearchScreen(viewModel = searchViewModel)
-            }
-            composable(
-                route = Screen.Providers.route,
-                enterTransition = { fadeIn(tween(250)) + slideInHorizontally { it / 4 } },
-                exitTransition  = { fadeOut(tween(250)) + slideOutHorizontally { it / 4 } }
-            ) {
-                ProvidersScreen()
-            }
-            composable(
-                route = Screen.Settings.route,
-                enterTransition = { fadeIn(tween(250)) + slideInHorizontally { it / 4 } },
-                exitTransition  = { fadeOut(tween(250)) + slideOutHorizontally { it / 4 } }
-            ) {
-                SettingsScreen()
+            Text("Preparing On-Device Model", color = NeonGreen, fontSize = 18.sp, fontWeight = FontWeight.Bold)
+            Spacer(Modifier.height(12.dp))
+            when (state) {
+                is DownloadState.Downloading -> {
+                    LinearProgressIndicator(
+                        progress = { state.progress / 100f },
+                        modifier = Modifier.fillMaxWidth(),
+                        color = NeonGreen,
+                        trackColor = DarkSurfaceVariant
+                    )
+                    Spacer(Modifier.height(8.dp))
+                    Text("${state.progress}% downloaded", color = TextSecondary, fontSize = 12.sp)
+                }
+                is DownloadState.Failed -> {
+                    Text(state.message, color = AccentRed, fontSize = 12.sp, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+                }
+                else -> {
+                    LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = NeonGreen, trackColor = DarkSurfaceVariant)
+                    Spacer(Modifier.height(8.dp))
+                    Text("Queued for download", color = TextSecondary, fontSize = 12.sp)
+                }
             }
         }
     }

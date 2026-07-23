@@ -5,6 +5,8 @@ import androidx.lifecycle.viewModelScope
 import com.aggregatorx.app.data.model.*
 import com.aggregatorx.app.data.repository.AggregatorRepository
 import com.aggregatorx.app.engine.media.*
+import com.aggregatorx.app.engine.ml.ProviderPaginationManager
+import com.aggregatorx.app.engine.ml.ResultNormalizer
 import com.aggregatorx.app.engine.token.TokenManager
 import com.aggregatorx.app.engine.util.EngineUtils
 import dagger.hilt.android.lifecycle.HiltViewModel
@@ -103,22 +105,33 @@ class SearchViewModel @Inject constructor(
             repository.searchAllProviders(query, pages = _providerFetchPages.value)
                 .catch { e -> if (currentResults.isEmpty()) _uiState.update { it.copy(error = e.message) } }
                 .collect { providerResult ->
+                    val normalizedResults = ResultNormalizer.normalize(
+                        providerId = providerResult.provider.id,
+                        providerBaseUrl = providerResult.provider.baseUrl,
+                        results = providerResult.results
+                    )
+                    ProviderPaginationManager.markFetched(providerResult.provider.id, normalizedResults.size)
+                    val normalizedProviderResult = providerResult.copy(
+                        results = normalizedResults,
+                        totalResults = normalizedResults.size,
+                        hasMore = normalizedResults.size >= PROVIDER_PAGE_SIZE
+                    )
                     // Session-level de-duplication
-                    val uniqueNewOnes = providerResult.results.filter { sessionSeenUrls.add(it.url) }
+                    val uniqueNewOnes = normalizedProviderResult.results.filter { sessionSeenUrls.add(it.url) }
                     
                     if (uniqueNewOnes.isNotEmpty()) {
-                        val filteredResult = providerResult.copy(results = uniqueNewOnes)
-                        val existingIndex = currentResults.indexOfFirst { it.provider.id == providerResult.provider.id }
+                        val filteredResult = normalizedProviderResult.copy(results = uniqueNewOnes)
+                        val existingIndex = currentResults.indexOfFirst { it.provider.id == normalizedProviderResult.provider.id }
                         if (existingIndex >= 0) {
                             val existing = currentResults[existingIndex]
                             currentResults[existingIndex] = existing.copy(
                                 results = (existing.results + uniqueNewOnes).distinctBy { it.url },
-                                searchTime = providerResult.searchTime,
-                                success = providerResult.success,
-                                errorMessage = providerResult.errorMessage,
+                                searchTime = normalizedProviderResult.searchTime,
+                                success = normalizedProviderResult.success,
+                                errorMessage = normalizedProviderResult.errorMessage,
                                 totalResults = existing.results.size + uniqueNewOnes.size,
-                                hasMore = providerResult.hasMore,
-                                nextPageUrl = providerResult.nextPageUrl
+                                hasMore = normalizedProviderResult.hasMore,
+                                nextPageUrl = normalizedProviderResult.nextPageUrl
                             )
                         } else {
                             currentResults.add(filteredResult)
@@ -209,6 +222,7 @@ class SearchViewModel @Inject constructor(
     }
 
     fun refreshProvider(providerId: String) {
+        ProviderPaginationManager.reset(providerId)
         _providerPages.update { it - providerId }
         _providerFetchPages.update { it - providerId }
         val removedUrls = _providerResults.value
