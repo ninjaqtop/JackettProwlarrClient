@@ -147,7 +147,7 @@ class SearchViewModel @Inject constructor(
                                 }
                                 _providerResults.value = currentResults.toList()
 
-                                updateAggregatedState(query, currentResults)
+                                updateSearchStats(currentResults)
                             }
                         } catch (e: CancellationException) {
                             throw e
@@ -155,6 +155,7 @@ class SearchViewModel @Inject constructor(
                             appendProviderFailure(providerResult, e)
                         }
                     }
+                finalizeAggregatedState(query, currentResults)
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Throwable) {
@@ -308,7 +309,17 @@ class SearchViewModel @Inject constructor(
         }
     }
 
-    private suspend fun updateAggregatedState(query: String, currentResults: List<ProviderSearchResults>) {
+    private fun updateSearchStats(currentResults: List<ProviderSearchResults>) {
+        _uiState.update { state ->
+            state.copy(
+                totalResults = sessionSeenUrls.size,
+                successfulProviders = currentResults.count { it.success && it.results.isNotEmpty() },
+                failedProviders = currentResults.count { !it.success }
+            )
+        }
+    }
+
+    private suspend fun finalizeAggregatedState(query: String, currentResults: List<ProviderSearchResults>) {
         runCatching {
             val aggregated = repository.aggregateSearchResults(query, currentResults)
             _uiState.update { it.copy(

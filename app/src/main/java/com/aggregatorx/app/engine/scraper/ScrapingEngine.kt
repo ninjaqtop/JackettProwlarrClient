@@ -57,14 +57,15 @@ class ScrapingEngine @Inject constructor(
     private val lastRequestTime = ConcurrentHashMap<String, Long>()
     
     companion object {
-        private const val DEFAULT_TIMEOUT = 30000
-        private const val DEFAULT_RETRY_COUNT = 3
-        private const val DEFAULT_RETRY_DELAY = 800L
+        private const val DEFAULT_TIMEOUT = 12000
+        private const val DEFAULT_RETRY_COUNT = 1
+        private const val DEFAULT_RETRY_DELAY = 300L
         private const val DEFAULT_RATE_LIMIT_MS = 50L
-        private const val MAX_CONCURRENT_PROVIDERS = 20
+        private const val MAX_CONCURRENT_PROVIDERS = 8
         private const val CACHE_TTL_MS = 10 * 60 * 1000L
         private const val TARGET_RESULTS_PER_PROVIDER = 50
-        private const val MAX_PAGES_PER_PROVIDER_SEARCH = 5
+        private const val MAX_PAGES_PER_PROVIDER_SEARCH = 2
+        private const val PER_PROVIDER_TIMEOUT_MS = 25_000L
         
         private val CATEGORY_URL_PATTERNS = listOf(
             "/genre/", "/category/", "/browse/", "/filter/", "/tags/",
@@ -111,7 +112,7 @@ class ScrapingEngine @Inject constructor(
         query: String,
         pages: Map<String, Int> = emptyMap(),
         cache: Boolean = cacheResults
-    ): Flow<ProviderSearchResults> = flow {
+    ): Flow<ProviderSearchResults> = channelFlow {
         val processedQuery = nlpProcessor.processQuery(query)
         currentProcessedQuery = processedQuery
         val cacheKey = buildString {
@@ -125,78 +126,52 @@ class ScrapingEngine @Inject constructor(
         if (cache) {
             val cachedEntry = synchronized(resultCache) { resultCache[cacheKey] }
             if (cachedEntry != null && System.currentTimeMillis() - cachedEntry.timestamp < CACHE_TTL_MS) {
-                cachedEntry.results.forEach { emit(it) }
-                return@flow
+                cachedEntry.results.forEach { send(it) }
+                return@channelFlow
             }
         }
 
         var enabledProviders = providerDao.getEnabledProvidersSync()
-        if (enabledProviders.isEmpty()) return@flow
+        if (enabledProviders.isEmpty()) {
+            close()
+            return@channelFlow
+        }
 
         enabledProviders = enabledProviders.sortedWith(
             compareByDescending<Provider> { it.successRate }
                 .thenBy { it.avgResponseTime }
         )
         
-        val processedProviders = mutableSetOf<String>()
         val semaphore = Semaphore(MAX_CONCURRENT_PROVIDERS)
-        val results = mutableListOf<ProviderSearchResults>()
-        val perProviderTimeoutMs = 90_000L
+        val results = java.util.Collections.synchronizedList(mutableListOf<ProviderSearchResults>())
 
-        coroutineScope {
-            val deferredResults = enabledProviders.map { provider ->
-                async {
+        val jobs = enabledProviders.map { provider ->
+            launch(Dispatchers.IO) {
+                val result = try {
                     semaphore.withPermit {
-                        processedProviders.add(provider.id)
-                        try {
-                            withTimeoutOrNull(perProviderTimeoutMs) {
-                                safeSearchProvider(provider, query, pages[provider.id] ?: 0)
-                            } ?: ProviderSearchResults(
-                                provider = provider,
-                                results = emptyList(),
-                                searchTime = perProviderTimeoutMs,
-                                success = false,
-                                errorMessage = "Timed out"
-                            )
-                        } catch (e: CancellationException) {
-                            throw e
-                        } catch (e: Exception) {
-                            ProviderSearchResults(
-                                provider = provider,
-                                results = emptyList(),
-                                searchTime = 0L,
-                                success = false,
-                                errorMessage = "Error: ${e.message?.take(100)}"
-                            )
-                        }
+                        withTimeoutOrNull(PER_PROVIDER_TIMEOUT_MS) {
+                            safeSearchProvider(provider, query, pages[provider.id] ?: 0)
+                        } ?: ProviderSearchResults(
+                            provider = provider,
+                            results = emptyList(),
+                            searchTime = PER_PROVIDER_TIMEOUT_MS,
+                            success = false,
+                            errorMessage = "Timed out"
+                        )
                     }
-                }
-            }
-
-            deferredResults.forEachIndexed { index, deferred ->
-                val provider = enabledProviders.getOrNull(index)
-                try {
-                    val result = deferred.await()
-                    results.add(result)
-                    emit(result)
                 } catch (e: CancellationException) {
-                    if (provider != null) {
-                        val res = ProviderSearchResults(provider, emptyList(), 0L, false, "Cancelled")
-                        results.add(res)
-                        emit(res)
-                    }
+                    ProviderSearchResults(provider, emptyList(), 0L, false, "Cancelled")
                 } catch (e: Exception) {
-                    provider?.let {
-                        val res = ProviderSearchResults(it, emptyList(), 0L, false, "Internal Error")
-                        results.add(res)
-                        emit(res)
-                    }
+                    ProviderSearchResults(provider, emptyList(), 0L, false, "Error: ${e.message?.take(100)}")
                 }
+                results.add(result)
+                send(result)
             }
         }
 
+        jobs.joinAll()
         if (cache && results.any { it.success }) {
-            synchronized(resultCache) { resultCache[cacheKey] = CacheEntry(results) }
+            synchronized(resultCache) { resultCache[cacheKey] = CacheEntry(results.toList()) }
         }
     }.flowOn(Dispatchers.IO)
 
@@ -710,24 +685,25 @@ class ScrapingEngine @Inject constructor(
         }
 
         addAll(seedResults)
+        if (combined.size >= 12) {
+            return combined.values
+                .sortedByDescending { it.relevanceScore }
+                .take(TARGET_RESULTS_PER_PROVIDER)
+        }
 
         val queryVariants = buildList {
             add(query)
             currentProcessedQuery?.searchQueries
                 ?.filter { it.isNotBlank() && !contains(it) }
-                ?.take(3)
+                ?.take(1)
                 ?.let { addAll(it) }
         }
 
         for (variant in queryVariants) {
             if (combined.size >= TARGET_RESULTS_PER_PROVIDER) break
-            runCatching { addAll(scrapeGeneric(provider, variant)) }
-            if (combined.size >= TARGET_RESULTS_PER_PROVIDER) break
-            runCatching { addAll(scrapeWithTabCrawl(provider, variant)) }
-        }
-
-        if (combined.size < TARGET_RESULTS_PER_PROVIDER) {
-            runCatching { addAll(scrapeProviderHomepage(provider, query)) }
+            withTimeoutOrNull(4_000L) {
+                runCatching { addAll(scrapeWithTabCrawl(provider, variant)) }
+            }
         }
 
         return combined.values

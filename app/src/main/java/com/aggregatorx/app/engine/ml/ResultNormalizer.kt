@@ -3,7 +3,11 @@ package com.aggregatorx.app.engine.ml
 import com.aggregatorx.app.data.memory.ProviderMemoryStore
 import com.aggregatorx.app.data.model.SearchResult
 import com.aggregatorx.app.engine.util.EngineUtils
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.SupervisorJob
 import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.launch
 import kotlinx.serialization.decodeFromString
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
@@ -13,25 +17,72 @@ import kotlinx.serialization.json.jsonPrimitive
 
 object ResultNormalizer {
     private val json = Json { encodeDefaults = true; ignoreUnknownKeys = true }
+    private val scope = CoroutineScope(SupervisorJob() + Dispatchers.IO)
 
     suspend fun normalize(providerId: String, providerBaseUrl: String, results: List<SearchResult>): List<SearchResult> {
-        runCatching { ProviderMemoryStore.getProviderContext(providerId) }
-        val rawJson = json.encodeToString(results)
-        runCatching { AnalysisHelper.checkFreshness(rawJson, "[]").first() }
-        runCatching { AnalysisHelper.analyzePagination(rawJson, providerId).first() }
-        runCatching { AnalysisHelper.diffResults(rawJson, "[]", providerId).first() }
-
-        val normalized = results.mapNotNull { result ->
-            val repaired = repairResult(providerId, providerBaseUrl, result)
-            val categorized = fixCategory(providerId, repaired)
-            val confidence = maxOf(categorized.relevanceScore / 100f, 0.81f)
-            if (confidence >= 0.8f) categorized else retryRepair(providerId, providerBaseUrl, categorized)
-        }.distinctBy { it.url }
+        val categoryMappings = loadCategoryMappings(providerId)
+        val normalized = results
+            .mapNotNull { result -> normalizeLocal(providerId, providerBaseUrl, result, categoryMappings) }
+            .distinctBy { it.url }
+            .take(50)
 
         if (normalized.isNotEmpty()) {
             runCatching { ProviderMemoryStore.updateProviderSchema(providerId, json.encodeToString(normalized.take(5)), 0.86f) }
+            learnInBackground(providerId, providerBaseUrl, normalized)
         }
         return normalized
+    }
+
+    private suspend fun loadCategoryMappings(providerId: String): Map<String, String> {
+        val schema = runCatching { ProviderMemoryStore.getSchema(providerId) }.getOrNull() ?: return emptyMap()
+        return runCatching {
+            json.parseToJsonElement(schema.categoryMappings)
+                .jsonObject
+                .mapValues { (_, value) -> value.jsonPrimitive.content }
+        }.getOrDefault(emptyMap())
+    }
+
+    private suspend fun normalizeLocal(
+        providerId: String,
+        providerBaseUrl: String,
+        result: SearchResult,
+        categoryMappings: Map<String, String>
+    ): SearchResult? {
+        val title = result.title.trim()
+        if (title.length < 3 || result.url.isBlank()) return null
+
+        val normalizedUrl = EngineUtils.normalizeUrl(result.url, providerBaseUrl)
+        if (normalizedUrl.isBlank() || normalizedUrl.contains("javascript:", ignoreCase = true)) return null
+
+        if (normalizedUrl != result.url) {
+            runCatching { ProviderMemoryStore.saveCorrection(providerId, "url", result.url, normalizedUrl, 0.92f) }
+        }
+
+        val normalizedThumb = result.thumbnailUrl
+            ?.takeIf { it.isNotBlank() && !it.startsWith("data:", ignoreCase = true) }
+            ?.let { EngineUtils.normalizeUrl(it, providerBaseUrl) }
+
+        val correctedCategory = result.category?.let { categoryMappings[it] ?: it }
+        return result.copy(
+            title = title,
+            url = normalizedUrl,
+            thumbnailUrl = normalizedThumb,
+            category = correctedCategory
+        )
+    }
+
+    private fun learnInBackground(providerId: String, providerBaseUrl: String, results: List<SearchResult>) {
+        scope.launch {
+            val rawJson = json.encodeToString(results)
+            runCatching { ProviderMemoryStore.getProviderContext(providerId) }
+            runCatching { AnalysisHelper.checkFreshness(rawJson, "[]").first() }
+            runCatching { AnalysisHelper.analyzePagination(rawJson, providerId).first() }
+            runCatching { AnalysisHelper.diffResults(rawJson, "[]", providerId).first() }
+            results.take(3).forEach { result ->
+                runCatching { repairResult(providerId, providerBaseUrl, result) }
+                runCatching { fixCategory(providerId, result) }
+            }
+        }
     }
 
     private suspend fun repairResult(providerId: String, providerBaseUrl: String, result: SearchResult): SearchResult {
