@@ -1,7 +1,6 @@
 package com.aggregatorx.app.ui
 
 import android.annotation.SuppressLint
-import android.app.Activity
 import android.content.Context
 import android.content.Intent
 import android.graphics.Color
@@ -24,10 +23,14 @@ import com.aggregatorx.app.engine.ml.AnalysisHelper
 import com.aggregatorx.app.engine.util.EngineUtils
 import kotlinx.coroutines.flow.collect
 import kotlinx.coroutines.launch
+import org.json.JSONObject
 
 class WebViewActivity : ComponentActivity() {
     private lateinit var webView: WebView
     private lateinit var progress: ProgressBar
+    private lateinit var root: FrameLayout
+    private var fullscreenView: View? = null
+    private var fullscreenCallback: WebChromeClient.CustomViewCallback? = null
     private var expectedUrl: String = ""
     private var providerId: String = "global"
 
@@ -38,7 +41,7 @@ class WebViewActivity : ComponentActivity() {
         expectedUrl = intent.getStringExtra(EXTRA_URL).orEmpty()
         providerId = intent.getStringExtra(EXTRA_PROVIDER_ID).orEmpty().ifBlank { "global" }
 
-        val root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
+        root = FrameLayout(this).apply { setBackgroundColor(Color.BLACK) }
         progress = ProgressBar(this, null, android.R.attr.progressBarStyleHorizontal).apply {
             max = 100
             layoutParams = FrameLayout.LayoutParams(ViewGroup.LayoutParams.MATCH_PARENT, 6, Gravity.TOP)
@@ -57,13 +60,43 @@ class WebViewActivity : ComponentActivity() {
                     this@WebViewActivity.progress.progress = newProgress
                     this@WebViewActivity.progress.visibility = if (newProgress >= 100) View.GONE else View.VISIBLE
                 }
+
+                override fun onShowCustomView(view: View, callback: CustomViewCallback) {
+                    if (fullscreenView != null) {
+                        callback.onCustomViewHidden()
+                        return
+                    }
+                    fullscreenView = view
+                    fullscreenCallback = callback
+                    webView.visibility = View.GONE
+                    root.addView(
+                        view,
+                        FrameLayout.LayoutParams(
+                            ViewGroup.LayoutParams.MATCH_PARENT,
+                            ViewGroup.LayoutParams.MATCH_PARENT
+                        )
+                    )
+                }
+
+                override fun onHideCustomView() {
+                    fullscreenView?.let { root.removeView(it) }
+                    fullscreenView = null
+                    fullscreenCallback?.onCustomViewHidden()
+                    fullscreenCallback = null
+                    webView.visibility = View.VISIBLE
+                }
             }
             webViewClient = object : WebViewClient() {
                 override fun shouldOverrideUrlLoading(view: WebView, request: WebResourceRequest): Boolean = false
                 override fun onPageFinished(view: WebView, url: String) {
                     this@WebViewActivity.progress.visibility = View.GONE
                     lifecycleScope.launch {
-                        AnalysisHelper.repairUrls("""{"expected":"$expectedUrl","actual":"$url","title":"${view.title.orEmpty()}"}""", providerId)
+                        val payload = JSONObject()
+                            .put("expected", expectedUrl)
+                            .put("actual", url)
+                            .put("title", view.title.orEmpty())
+                            .toString()
+                        AnalysisHelper.repairUrls(payload, providerId)
                             .collect()
                     }
                 }
@@ -82,7 +115,11 @@ class WebViewActivity : ComponentActivity() {
         setContentView(root)
         onBackPressedDispatcher.addCallback(this, object : OnBackPressedCallback(true) {
             override fun handleOnBackPressed() {
-                if (webView.canGoBack()) webView.goBack() else finish()
+                when {
+                    fullscreenView != null -> webView.webChromeClient?.onHideCustomView()
+                    webView.canGoBack() -> webView.goBack()
+                    else -> finish()
+                }
             }
         })
         if (expectedUrl.isNotBlank()) webView.loadUrl(expectedUrl)
@@ -95,6 +132,8 @@ class WebViewActivity : ComponentActivity() {
 
     override fun onDestroy() {
         runCatching {
+            fullscreenView?.let { root.removeView(it) }
+            fullscreenCallback?.onCustomViewHidden()
             webView.stopLoading()
             webView.loadUrl("about:blank")
             webView.destroy()

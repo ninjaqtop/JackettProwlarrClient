@@ -39,5 +39,8 @@ class LlamaService : Service() {
         fun start(context: Context) {
             androidx.core.content.ContextCompat.startForegroundService(context, Intent(context, LlamaService::class.java))
         }
+
+        suspend fun analyze(input: String, mode: AnalysisMode, providerId: String): String =
+            LlamaRuntime.analyze(input, mode, providerId)
     }
 }

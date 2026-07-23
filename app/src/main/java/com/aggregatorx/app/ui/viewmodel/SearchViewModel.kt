@@ -59,6 +59,8 @@ class SearchViewModel @Inject constructor(
     private val _providerPages = MutableStateFlow<Map<String, Int>>(emptyMap())
     val providerPages: StateFlow<Map<String, Int>> = _providerPages.asStateFlow()
     private val _providerFetchPages = MutableStateFlow<Map<String, Int>>(emptyMap())
+    private val _loadingProviderIds = MutableStateFlow<Set<String>>(emptySet())
+    val loadingProviderIds: StateFlow<Set<String>> = _loadingProviderIds.asStateFlow()
 
     private companion object {
         const val PROVIDER_PAGE_SIZE = 50
@@ -70,6 +72,14 @@ class SearchViewModel @Inject constructor(
     private var currentSearchJob: Job? = null
 
     init {
+        ProviderPaginationManager.configure { providerId, query, state ->
+            val providerResult = repository.searchProviderPage(providerId, query, state.page - 1)
+            if (providerResult == null) {
+                emptyList()
+            } else {
+                ResultNormalizer.normalize(providerResult.provider.id, providerResult.provider.baseUrl, providerResult.results)
+            }
+        }
         viewModelScope.launch {
             repository.getRecentSearches().collect { searches ->
                 _uiState.update { it.copy(recentSearches = searches) }
@@ -205,12 +215,31 @@ class SearchViewModel @Inject constructor(
         if (loadedCount > (current + 1) * PROVIDER_PAGE_SIZE) {
             _providerPages.update { it + (providerId to current + 1) }
         } else {
-            _providerFetchPages.update { pages ->
-                val fetched = pages[providerId] ?: 0
-                pages + (providerId to fetched + 1)
+            val query = _uiState.value.currentSearchQuery.ifBlank { _uiState.value.query }.trim()
+            if (query.isBlank()) return
+            viewModelScope.launch {
+                _loadingProviderIds.update { it + providerId }
+                ProviderPaginationManager.fetchMoreResults(providerId, query).collect { fetched ->
+                    val existingIndex = _providerResults.value.indexOfFirst { it.provider.id == providerId }
+                    if (existingIndex >= 0 && fetched.isNotEmpty()) {
+                        val next = _providerResults.value.toMutableList()
+                        val existing = next[existingIndex]
+                        val unique = fetched.filter { sessionSeenUrls.add(it.url) }
+                        next[existingIndex] = existing.copy(
+                            results = (existing.results + unique).distinctBy { it.url },
+                            totalResults = existing.results.size + unique.size,
+                            hasMore = unique.isNotEmpty()
+                        )
+                        _providerResults.value = next
+                    } else if (existingIndex >= 0) {
+                        val next = _providerResults.value.toMutableList()
+                        next[existingIndex] = next[existingIndex].copy(hasMore = false)
+                        _providerResults.value = next
+                    }
+                }
+                _providerPages.update { it + (providerId to current + 1) }
+                _loadingProviderIds.update { it - providerId }
             }
-            _providerPages.update { it + (providerId to current + 1) }
-            search(isLoadMore = true)
         }
     }
 
@@ -223,6 +252,7 @@ class SearchViewModel @Inject constructor(
 
     fun refreshProvider(providerId: String) {
         ProviderPaginationManager.reset(providerId)
+        val query = _uiState.value.currentSearchQuery.ifBlank { _uiState.value.query }.trim()
         _providerPages.update { it - providerId }
         _providerFetchPages.update { it - providerId }
         val removedUrls = _providerResults.value
@@ -232,7 +262,22 @@ class SearchViewModel @Inject constructor(
             .orEmpty()
         sessionSeenUrls.removeAll(removedUrls.toSet())
         _providerResults.value = _providerResults.value.filterNot { it.provider.id == providerId }
-        search(isLoadMore = true)
+        if (query.isBlank()) return
+        viewModelScope.launch {
+            _loadingProviderIds.update { it + providerId }
+            repository.searchProviderPage(providerId, query, 0)?.let { providerResult ->
+                val normalized = ResultNormalizer.normalize(providerResult.provider.id, providerResult.provider.baseUrl, providerResult.results)
+                _providerResults.update { current ->
+                    current.filterNot { it.provider.id == providerId } + providerResult.copy(
+                        results = normalized,
+                        totalResults = normalized.size,
+                        hasMore = normalized.size >= PROVIDER_PAGE_SIZE
+                    )
+                }
+                normalized.forEach { sessionSeenUrls.add(it.url) }
+            }
+            _loadingProviderIds.update { it - providerId }
+        }
     }
 
     fun searchFromHistory(query: String) {

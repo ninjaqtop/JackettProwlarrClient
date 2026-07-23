@@ -42,6 +42,8 @@ import com.aggregatorx.app.ui.viewmodel.VideoPreviewResult
 import kotlinx.coroutines.launch
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.ui.unit.IntOffset
+import androidx.core.app.ActivityOptionsCompat
+import androidx.core.content.ContextCompat
 
 // Quick-tab sentinel IDs
 private const val TAB_TOP    = "__TOP__"
@@ -58,6 +60,7 @@ fun SearchScreen(
     val likedUrls            by viewModel.likedUrls.collectAsState()
     val isPaused             by viewModel.isDiscoveryPaused.collectAsState()
     val providerPages        by viewModel.providerPages.collectAsState()
+    val loadingProviderIds   by viewModel.loadingProviderIds.collectAsState()
     val tokenResults         by viewModel.tokenResults.collectAsState()
     val myAiResults          by viewModel.myAiResults.collectAsState()
     val videoExtractionState by viewModel.videoExtractionState.collectAsState()
@@ -143,6 +146,7 @@ fun SearchScreen(
                         listState                = listState,
                         likedUrls                = likedUrls,
                         providerPages            = providerPages,
+                        loadingProviderIds        = loadingProviderIds,
                         onWatch                  = { result -> viewModel.extractVideoUrl(result) },
                         onDownload               = { result ->
                             viewModel.downloadResult(result)
@@ -152,7 +156,16 @@ fun SearchScreen(
                             context.startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(result.url)))
                         },
                         onInApp                  = { result ->
-                            context.startActivity(WebViewActivity.intent(context, result.url, result.providerId))
+                            val options = ActivityOptionsCompat.makeCustomAnimation(
+                                context,
+                                com.aggregatorx.app.R.anim.slide_in_right,
+                                android.R.anim.fade_out
+                            )
+                            ContextCompat.startActivity(
+                                context,
+                                WebViewActivity.intent(context, result.url, result.providerId),
+                                options.toBundle()
+                            )
                         },
                         onLike                   = { result -> viewModel.toggleLike(result) },
                         onNextPage               = { id -> viewModel.nextProviderPage(id) },
@@ -314,9 +327,11 @@ fun SearchScreen(
                 modifier      = Modifier.padding(horizontal = 12.dp, vertical = 8.dp)
             )
             QuickTabsRow(
-                activeTab       = activeTab,
-                providerResults = providerResults,
-                onTabSelected   = { tab ->
+                activeTab          = activeTab,
+                providerResults    = providerResults,
+                loadingProviderIds = loadingProviderIds,
+                onRefreshProvider  = { id -> viewModel.refreshProvider(id) },
+                onTabSelected      = { tab ->
                     activeTab = tab
                     scope.launch { listState.animateScrollToItem(0) }
                 }
@@ -459,6 +474,8 @@ fun NeonSearchBar(
 fun QuickTabsRow(
     activeTab: String,
     providerResults: List<ProviderSearchResults>,
+    loadingProviderIds: Set<String>,
+    onRefreshProvider: (String) -> Unit,
     onTabSelected: (String) -> Unit
 ) {
     val successProviders = providerResults.filter { it.success && it.results.isNotEmpty() }
@@ -481,7 +498,9 @@ fun QuickTabsRow(
                 tabId     = pr.provider.id.toString(),
                 activeTab = activeTab,
                 onSelect  = onTabSelected,
-                count     = pr.results.size
+                count     = pr.results.size,
+                isLoading = pr.provider.id in loadingProviderIds,
+                onRefresh = { onRefreshProvider(pr.provider.id) }
             )
         }
     }
@@ -493,7 +512,9 @@ fun QuickTab(
     tabId: String,
     activeTab: String,
     onSelect: (String) -> Unit,
-    count: Int = 0
+    count: Int = 0,
+    isLoading: Boolean = false,
+    onRefresh: (() -> Unit)? = null
 ) {
     val selected = activeTab == tabId
     val bg       = if (selected) NeonGreen.copy(alpha = 0.15f) else DarkCard
@@ -518,6 +539,31 @@ fun QuickTab(
             if (count > 0) {
                 Spacer(Modifier.width(4.dp))
                 Text("$count", color = textColor.copy(alpha = 0.7f), fontSize = 9.sp)
+            }
+            if (onRefresh != null) {
+                Spacer(Modifier.width(3.dp))
+                Box(
+                    modifier = Modifier
+                        .size(22.dp)
+                        .clip(CircleShape)
+                        .clickable(enabled = !isLoading) { onRefresh() },
+                    contentAlignment = Alignment.Center
+                ) {
+                    if (isLoading) {
+                        CircularProgressIndicator(
+                            modifier = Modifier.size(12.dp),
+                            color = textColor,
+                            strokeWidth = 1.5.dp
+                        )
+                    } else {
+                        Icon(
+                            Icons.Default.Refresh,
+                            contentDescription = "Refresh ${label.lowercase()}",
+                            tint = textColor.copy(alpha = 0.75f),
+                            modifier = Modifier.size(13.dp)
+                        )
+                    }
+                }
             }
         }
     }
@@ -549,6 +595,7 @@ fun ResultsFeed(
     listState: LazyListState,
     likedUrls: Set<String>,
     providerPages: Map<String, Int>,
+    loadingProviderIds: Set<String>,
     onWatch: (SearchResult) -> Unit,
     onDownload: (SearchResult) -> Unit,
     onBrowser: (SearchResult) -> Unit,
@@ -678,6 +725,7 @@ fun ResultsFeed(
                     resultCount  = pr.results.size,
                     currentPage  = currentPage,
                     totalPages   = totalPages,
+                    isLoading    = providerId in loadingProviderIds,
                     onPrev       = { onPrevPage(providerId) },
                     onNext       = { onNextPage(providerId) },
                     onRefresh    = { onRefreshProvider(providerId) }
@@ -699,6 +747,7 @@ fun ResultsFeed(
                 ProviderLoadMoreFooter(
                     canLoadMore = pr.hasMore || pr.results.size >= PAGE_SIZE,
                     isEnd = !pr.hasMore && pr.results.size < PAGE_SIZE,
+                    isLoading = providerId in loadingProviderIds,
                     onLoadMore = { onNextPage(providerId) }
                 )
             }
@@ -735,6 +784,7 @@ fun ResultsFeed(
 fun ProviderLoadMoreFooter(
     canLoadMore: Boolean,
     isEnd: Boolean,
+    isLoading: Boolean,
     onLoadMore: () -> Unit
 ) {
     Box(
@@ -743,7 +793,13 @@ fun ProviderLoadMoreFooter(
             .padding(horizontal = 12.dp, vertical = 6.dp),
         contentAlignment = Alignment.Center
     ) {
-        if (canLoadMore) {
+        if (isLoading) {
+            Row(verticalAlignment = Alignment.CenterVertically) {
+                CircularProgressIndicator(color = NeonGreen, modifier = Modifier.size(16.dp), strokeWidth = 2.dp)
+                Spacer(Modifier.width(8.dp))
+                Text("Loading more", color = TextSecondary, fontSize = 10.sp)
+            }
+        } else if (canLoadMore) {
             OutlinedButton(
                 onClick = onLoadMore,
                 border = BorderStroke(1.dp, NeonGreen.copy(alpha = 0.45f)),
@@ -766,6 +822,7 @@ fun ProviderSectionHeader(
     resultCount: Int,
     currentPage: Int,
     totalPages: Int,
+    isLoading: Boolean,
     onPrev: () -> Unit,
     onNext: () -> Unit,
     onRefresh: () -> Unit
@@ -791,8 +848,12 @@ fun ProviderSectionHeader(
         Row(verticalAlignment = Alignment.CenterVertically) {
             // Refresh
             IconButton(onClick = onRefresh, modifier = Modifier.size(28.dp)) {
-                Icon(Icons.Default.Refresh, "Refresh", tint = NeonGreen.copy(alpha = 0.7f),
-                    modifier = Modifier.size(14.dp))
+                if (isLoading) {
+                    CircularProgressIndicator(color = NeonGreen, modifier = Modifier.size(14.dp), strokeWidth = 2.dp)
+                } else {
+                    Icon(Icons.Default.Refresh, "Refresh", tint = NeonGreen.copy(alpha = 0.7f),
+                        modifier = Modifier.size(14.dp))
+                }
             }
             // Prev
             IconButton(
@@ -1207,6 +1268,7 @@ fun ProviderResultsList(
         listState                = listState,
         likedUrls                = likedUrls,
         providerPages            = emptyMap(),
+        loadingProviderIds        = emptySet(),
         onWatch                  = { onResultClick(it) },
         onDownload               = { onDownload(it) },
         onBrowser                = { onOpenExternal(it) },

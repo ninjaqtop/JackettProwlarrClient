@@ -15,8 +15,14 @@ data class ProviderPaginationState(
 
 object ProviderPaginationManager {
     private val states = ConcurrentHashMap<String, ProviderPaginationState>()
+    @Volatile
+    private var fetcher: (suspend (String, String, ProviderPaginationState) -> List<SearchResult>)? = null
 
     fun init() = Unit
+
+    fun configure(fetchMore: suspend (String, String, ProviderPaginationState) -> List<SearchResult>) {
+        fetcher = fetchMore
+    }
 
     fun reset(providerId: String) {
         states.remove(providerId)
@@ -31,6 +37,9 @@ object ProviderPaginationManager {
     }
 
     fun fetchMoreResults(providerId: String, query: String): Flow<List<SearchResult>> = flow {
-        emit(emptyList())
+        val state = current(providerId)
+        val fetched = fetcher?.invoke(providerId, query, state).orEmpty()
+        markFetched(providerId, fetched.size)
+        emit(fetched)
     }
 }

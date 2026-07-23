@@ -5,6 +5,11 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.buildJsonObject
+import kotlinx.serialization.json.jsonObject
+import kotlinx.serialization.json.jsonPrimitive
+import kotlinx.serialization.json.put
 import java.io.File
 
 object ProviderMemoryStore {
@@ -64,6 +69,30 @@ object ProviderMemoryStore {
             lastUpdated = System.currentTimeMillis()
         ))
         mirror(providerId)
+    }
+
+    suspend fun saveCategoryMapping(providerId: String, raw: String, corrected: String, confidence: Float) = withContext(Dispatchers.IO) {
+        ensureInit()
+        val existing = db.providerSchemaDao().get(providerId) ?: ProviderSchema(providerId = providerId)
+        val current = runCatching {
+            json.parseToJsonElement(existing.categoryMappings).jsonObject
+        }.getOrDefault(JsonObject(emptyMap()))
+        val merged = buildJsonObject {
+            current.forEach { (key, value) -> put(key, value.jsonPrimitive.content) }
+            put(raw, corrected)
+        }
+        db.providerSchemaDao().upsert(existing.copy(
+            categoryMappings = merged.toString(),
+            confidenceScore = maxOf(existing.confidenceScore, confidence),
+            lastUpdated = System.currentTimeMillis()
+        ))
+        db.correctionLogDao().insert(CorrectionLog(providerId = providerId, fieldCorrected = "category", originalValue = raw, correctedValue = corrected, confidence = confidence))
+        mirror(providerId)
+    }
+
+    suspend fun getSchema(providerId: String): ProviderSchema? = withContext(Dispatchers.IO) {
+        ensureInit()
+        db.providerSchemaDao().get(providerId)
     }
 
     private suspend fun mirror(providerId: String) {

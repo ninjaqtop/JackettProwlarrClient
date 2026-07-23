@@ -144,6 +144,11 @@ class AggregatorRepository @Inject constructor(
         // explicit page requests are reflected immediately.
         return scrapingEngine.searchAllProviders(query, pages, false)
     }
+
+    suspend fun searchProviderPage(providerId: String, query: String, pageOffset: Int): ProviderSearchResults? {
+        val provider = providerDao.getProviderById(providerId) ?: return null
+        return scrapingEngine.searchProviderSmart(provider, query, pageOffset)
+    }
     
     suspend fun aggregateSearchResults(
         query: String,
