@@ -1,3 +1,5 @@
+@file:androidx.annotation.OptIn(markerClass = [androidx.media3.common.util.UnstableApi::class])
+
 package com.aggregatorx.app.ui.screens
 
 import android.content.Intent
@@ -31,7 +33,10 @@ import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
 import androidx.hilt.navigation.compose.hiltViewModel
 import com.aggregatorx.app.data.model.ProviderSearchResults
+import com.aggregatorx.app.data.model.ProviderSearchStatus
 import com.aggregatorx.app.data.model.SearchResult
+import com.aggregatorx.app.engine.media.DownloadState
+import com.aggregatorx.app.engine.media.DownloadStatus
 import com.aggregatorx.app.ui.VideoPlayerActivity
 import com.aggregatorx.app.ui.WebViewActivity
 import com.aggregatorx.app.ui.components.*
@@ -64,9 +69,15 @@ fun SearchScreen(
     val tokenResults         by viewModel.tokenResults.collectAsState()
     val myAiResults          by viewModel.myAiResults.collectAsState()
     val videoExtractionState by viewModel.videoExtractionState.collectAsState()
+    val downloads            by viewModel.downloads.collectAsState()
     val context              = LocalContext.current
     val listState            = rememberLazyListState()
     val scope                = rememberCoroutineScope()
+    val activeDownload = downloads.values.lastOrNull {
+        it.status == DownloadStatus.EXTRACTING ||
+            it.status == DownloadStatus.DOWNLOADING ||
+            it.status == DownloadStatus.PAUSED
+    }
 
     // When true the next extraction Success should launch VideoPlayerActivity
     // instead of showing the in-screen dialog (set by the "In App" button).
@@ -74,7 +85,8 @@ fun SearchScreen(
 
     var activeTab by remember { mutableStateOf(TAB_TOP) }
 
-    val hasResults = providerResults.isNotEmpty()
+    val hasSearchActivity = providerResults.any { it.status != ProviderSearchStatus.READY }
+    val hasResults = providerResults.any { it.status == ProviderSearchStatus.RESULTS }
 
     // ── Scroll-direction tracking: hide header on scroll-down, show on scroll-up ──
     var prevFirstIndex   by remember { mutableStateOf(0) }
@@ -106,7 +118,9 @@ fun SearchScreen(
     )
     // Shrink the top padding for the content area when header is hidden
     val contentTopPad by animateDpAsState(
-        targetValue   = if (headerVisible) 152.dp else 0.dp,
+        targetValue   = if (headerVisible) {
+            if (activeDownload != null) 205.dp else 152.dp
+        } else 0.dp,
         animationSpec = tween(durationMillis = 240, easing = FastOutSlowInEasing),
         label         = "content_top_pad"
     )
@@ -136,7 +150,7 @@ fun SearchScreen(
                     }
                 }
 
-                providerResults.isNotEmpty() -> {
+                hasSearchActivity -> {
                     ResultsFeed(
                         activeTab                = activeTab,
                         providerResults          = providerResults,
@@ -361,8 +375,56 @@ fun SearchScreen(
                     isSearching         = uiState.isSearching
                 )
             }
+            AnimatedVisibility(visible = activeDownload != null) {
+                activeDownload?.let { download ->
+                    DownloadProgressRow(download = download, onCancel = { viewModel.cancelDownload(download.id) })
+                }
+            }
         }
 
+    }
+}
+
+@Composable
+private fun DownloadProgressRow(download: DownloadState, onCancel: () -> Unit) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 3.dp)
+            .clip(RoundedCornerShape(8.dp))
+            .background(DarkCard)
+            .padding(horizontal = 12.dp, vertical = 8.dp)
+    ) {
+        Row(verticalAlignment = Alignment.CenterVertically) {
+            Icon(Icons.Default.Download, contentDescription = null, tint = CyberCyan, modifier = Modifier.size(16.dp))
+            Spacer(Modifier.width(8.dp))
+            Text(
+                download.title,
+                color = TextPrimary,
+                fontSize = 10.sp,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                modifier = Modifier.weight(1f)
+            )
+            Text(
+                if (download.progress >= 0) "${download.progress}%" else "Downloading",
+                color = CyberCyan,
+                fontSize = 10.sp
+            )
+            IconButton(onClick = onCancel, modifier = Modifier.size(28.dp)) {
+                Icon(Icons.Default.Close, "Cancel download", tint = TextTertiary, modifier = Modifier.size(14.dp))
+            }
+        }
+        if (download.progress >= 0) {
+            LinearProgressIndicator(
+                progress = { download.progress.coerceIn(0, 100) / 100f },
+                modifier = Modifier.fillMaxWidth().height(2.dp),
+                color = CyberCyan,
+                trackColor = DarkCardHover
+            )
+        } else {
+            LinearProgressIndicator(modifier = Modifier.fillMaxWidth().height(2.dp), color = CyberCyan)
+        }
     }
 }
 
@@ -478,8 +540,6 @@ fun QuickTabsRow(
     onRefreshProvider: (String) -> Unit,
     onTabSelected: (String) -> Unit
 ) {
-    val successProviders = providerResults.filter { it.success && it.results.isNotEmpty() }
-
     LazyRow(
         modifier = Modifier
             .fillMaxWidth()
@@ -492,14 +552,15 @@ fun QuickTabsRow(
         item { QuickTab("TOKENS", TAB_TOKENS, activeTab, onTabSelected) }
 
         // Dynamic provider tabs
-        items(successProviders) { pr ->
+        items(providerResults, key = { it.provider.id }) { pr ->
             QuickTab(
                 label     = pr.provider.name.take(12).uppercase(),
                 tabId     = pr.provider.id.toString(),
                 activeTab = activeTab,
                 onSelect  = onTabSelected,
                 count     = pr.results.size,
-                isLoading = pr.provider.id in loadingProviderIds,
+                isLoading = pr.status == ProviderSearchStatus.SEARCHING || pr.provider.id in loadingProviderIds,
+                status    = pr.status,
                 onRefresh = { onRefreshProvider(pr.provider.id) }
             )
         }
@@ -514,6 +575,7 @@ fun QuickTab(
     onSelect: (String) -> Unit,
     count: Int = 0,
     isLoading: Boolean = false,
+    status: ProviderSearchStatus? = null,
     onRefresh: (() -> Unit)? = null
 ) {
     val selected = activeTab == tabId
@@ -539,6 +601,22 @@ fun QuickTab(
             if (count > 0) {
                 Spacer(Modifier.width(4.dp))
                 Text("$count", color = textColor.copy(alpha = 0.7f), fontSize = 9.sp)
+            } else if (!isLoading && status != null) {
+                Spacer(Modifier.width(5.dp))
+                Box(
+                    Modifier
+                        .size(6.dp)
+                        .clip(CircleShape)
+                        .background(
+                            when (status) {
+                                ProviderSearchStatus.READY -> TextTertiary
+                                ProviderSearchStatus.EMPTY -> AccentOrange
+                                ProviderSearchStatus.FAILED, ProviderSearchStatus.TIMED_OUT -> AccentRed
+                                ProviderSearchStatus.RESULTS -> AccentGreen
+                                ProviderSearchStatus.SEARCHING -> CyberCyan
+                            }
+                        )
+                )
             }
             if (onRefresh != null) {
                 Spacer(Modifier.width(3.dp))
@@ -608,13 +686,20 @@ fun ResultsFeed(
     modifier: Modifier = Modifier
 ) {
     val PAGE_SIZE = 50
-    val successProviders = providerResults.filter { it.success && it.results.isNotEmpty() }
-    val failedProviders  = providerResults.filter { !it.success }
+    val successProviders = providerResults.filter { it.status == ProviderSearchStatus.RESULTS && it.results.isNotEmpty() }
+    val pendingOrEmptyProviders = providerResults.filter {
+        it.status != ProviderSearchStatus.RESULTS && it.status != ProviderSearchStatus.READY
+    }
 
     // For provider-specific tabs, filter to that provider only
     val displayProviders = when (activeTab) {
         TAB_TOP, TAB_MY_AI, TAB_TOKENS -> successProviders
-        else -> successProviders.filter { it.provider.id.toString() == activeTab }
+        else -> successProviders.filter { it.provider.id == activeTab }
+    }
+    val visibleStatuses = when (activeTab) {
+        TAB_TOP -> pendingOrEmptyProviders
+        TAB_MY_AI, TAB_TOKENS -> emptyList()
+        else -> pendingOrEmptyProviders.filter { it.provider.id == activeTab }
     }
 
     LazyColumn(
@@ -712,6 +797,26 @@ fun ResultsFeed(
             }
         }
 
+        if (visibleStatuses.isNotEmpty()) {
+            item(key = "provider_status_header_$activeTab") {
+                Text(
+                    "PROVIDER STATUS",
+                    color = TextTertiary,
+                    fontSize = 10.sp,
+                    fontWeight = FontWeight.Bold,
+                    letterSpacing = 1.sp,
+                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp)
+                )
+            }
+            items(visibleStatuses, key = { "state_${it.provider.id}" }) { providerResult ->
+                ProviderStatusCard(
+                    providerResult = providerResult,
+                    isRefreshing = providerResult.provider.id in loadingProviderIds,
+                    onRefresh = { onRefreshProvider(providerResult.provider.id) }
+                )
+            }
+        }
+
         // Provider sections with pagination
         displayProviders.forEach { pr ->
             val providerId  = pr.provider.id.toString()
@@ -755,25 +860,74 @@ fun ResultsFeed(
             item(key = "sp_$providerId") { Spacer(Modifier.height(8.dp)) }
         }
 
-        // Failed providers
-        if (failedProviders.isNotEmpty()) {
-            item(key = "fail_hdr") {
-                Text("FAILED PROVIDERS", color = AccentRed, fontSize = 10.sp,
-                    fontWeight = FontWeight.Bold, letterSpacing = 1.sp,
-                    modifier = Modifier.padding(horizontal = 12.dp, vertical = 4.dp))
+    }
+}
+
+@Composable
+private fun ProviderStatusCard(
+    providerResult: ProviderSearchResults,
+    isRefreshing: Boolean,
+    onRefresh: () -> Unit
+) {
+    val statusColor = when (providerResult.status) {
+        ProviderSearchStatus.READY -> TextTertiary
+        ProviderSearchStatus.SEARCHING -> CyberCyan
+        ProviderSearchStatus.EMPTY -> AccentOrange
+        ProviderSearchStatus.FAILED, ProviderSearchStatus.TIMED_OUT -> AccentRed
+        ProviderSearchStatus.RESULTS -> AccentGreen
+    }
+    val statusText = when (providerResult.status) {
+        ProviderSearchStatus.READY -> "Ready to search"
+        ProviderSearchStatus.SEARCHING -> "Searching live site"
+        ProviderSearchStatus.EMPTY -> providerResult.errorMessage ?: "No results for this query"
+        ProviderSearchStatus.TIMED_OUT -> "Timed out; other providers continued"
+        ProviderSearchStatus.FAILED -> providerResult.errorMessage ?: "Provider search failed"
+        ProviderSearchStatus.RESULTS -> "${providerResult.results.size} results"
+    }
+    Surface(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 3.dp),
+        color = DarkCard,
+        shape = RoundedCornerShape(8.dp),
+        border = BorderStroke(1.dp, statusColor.copy(alpha = 0.25f))
+    ) {
+        Row(
+            modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            if (providerResult.status == ProviderSearchStatus.SEARCHING || isRefreshing) {
+                CircularProgressIndicator(
+                    modifier = Modifier.size(16.dp),
+                    color = statusColor,
+                    strokeWidth = 2.dp
+                )
+            } else {
+                Icon(
+                    when (providerResult.status) {
+                        ProviderSearchStatus.READY -> Icons.Default.Dns
+                        ProviderSearchStatus.EMPTY -> Icons.Default.SearchOff
+                        ProviderSearchStatus.FAILED, ProviderSearchStatus.TIMED_OUT -> Icons.Default.ErrorOutline
+                        else -> Icons.Default.CheckCircle
+                    },
+                    contentDescription = null,
+                    tint = statusColor,
+                    modifier = Modifier.size(18.dp)
+                )
             }
-            item(key = "fail_list") {
-                Row(
-                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
-                    horizontalArrangement = Arrangement.spacedBy(6.dp)
-                ) {
-                    failedProviders.forEach { fp ->
-                        Surface(shape = RoundedCornerShape(12.dp), color = DarkCard) {
-                            Text(fp.provider.name, color = AccentRed.copy(alpha = 0.7f),
-                                fontSize = 10.sp,
-                                modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp))
-                        }
-                    }
+            Spacer(Modifier.width(10.dp))
+            Column(Modifier.weight(1f)) {
+                Text(
+                    providerResult.provider.name,
+                    color = TextPrimary,
+                    fontSize = 12.sp,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(statusText, color = TextTertiary, fontSize = 10.sp, maxLines = 2)
+            }
+            if (providerResult.status != ProviderSearchStatus.SEARCHING) {
+                IconButton(onClick = onRefresh, enabled = !isRefreshing, modifier = Modifier.size(32.dp)) {
+                    Icon(Icons.Default.Refresh, "Retry provider", tint = statusColor, modifier = Modifier.size(16.dp))
                 }
             }
         }
@@ -946,6 +1100,7 @@ fun ShieldedResultCard(
                 // Thumbnail — always shown (placeholder when no URL available)
                 InlineThumbnailPreview(
                     thumbnailUrl     = result.thumbnailUrl,
+                    refererUrl       = result.url,
                     duration         = result.duration,
                     isExtracting     = isExtracting,
                     onTapPreview     = { showThumbnailPreview = true },

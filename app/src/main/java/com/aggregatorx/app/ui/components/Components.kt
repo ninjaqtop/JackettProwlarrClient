@@ -40,7 +40,10 @@ import androidx.compose.ui.unit.sp
 import coil3.compose.AsyncImage
 import coil3.request.ImageRequest
 import coil3.request.CachePolicy
+import coil3.network.NetworkHeaders
+import coil3.network.httpHeaders
 import com.aggregatorx.app.data.model.*
+import com.aggregatorx.app.engine.util.EngineUtils
 import com.aggregatorx.app.ui.theme.*
 import com.aggregatorx.app.ui.viewmodel.VideoPreviewResult
 import kotlinx.coroutines.Dispatchers
@@ -439,6 +442,7 @@ fun StatChip(
 @Composable
 fun InlineThumbnailPreview(
     thumbnailUrl: String?,
+    refererUrl: String? = null,
     duration: String? = null,
     modifier: Modifier = Modifier,
     onTapPreview: () -> Unit = {},
@@ -446,7 +450,7 @@ fun InlineThumbnailPreview(
     isExtracting: Boolean = false
 ) {
     val context = LocalContext.current
-    var imageLoadFailed by remember { mutableStateOf(false) }
+    var imageLoadFailed by remember(thumbnailUrl) { mutableStateOf(false) }
     var showTapPulse by remember { mutableStateOf(false) }
     val pulseAlpha by animateFloatAsState(
         targetValue = if (showTapPulse) 0.45f else 0f,
@@ -473,6 +477,12 @@ fun InlineThumbnailPreview(
             AsyncImage(
                 model = ImageRequest.Builder(context)
                     .data(thumbnailUrl)
+                    .httpHeaders(
+                        NetworkHeaders.Builder()
+                            .set("User-Agent", EngineUtils.DEFAULT_USER_AGENT)
+                            .apply { refererUrl?.takeIf { it.startsWith("http") }?.let { set("Referer", it) } }
+                            .build()
+                    )
                     .diskCachePolicy(CachePolicy.ENABLED)
                     .memoryCachePolicy(CachePolicy.ENABLED)
                     .build(),
@@ -942,6 +952,7 @@ fun SearchResultCard(
                 // Thumbnail with gesture: TAP = visual preview pulse, HOLD = fullscreen video
                 InlineThumbnailPreview(
                     thumbnailUrl = result.thumbnailUrl,
+                    refererUrl = result.url,
                     duration = result.duration,
                     isExtracting = isExtractingForFullscreen,
                     modifier = Modifier.size(140.dp),

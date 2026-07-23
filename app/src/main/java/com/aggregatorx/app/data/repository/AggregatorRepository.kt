@@ -10,7 +10,9 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.withTimeout
+import org.jsoup.Jsoup
 import java.net.URL
+import java.net.URLEncoder
 import java.util.UUID
 import javax.inject.Inject
 import javax.inject.Singleton
@@ -38,6 +40,7 @@ class AggregatorRepository @Inject constructor(
     // Providers
     fun getAllProviders(): Flow<List<Provider>> = providerDao.getAllProviders()
     fun getEnabledProviders(): Flow<List<Provider>> = providerDao.getEnabledProviders()
+    suspend fun getEnabledProvidersSnapshot(): List<Provider> = providerDao.getEnabledProvidersSync()
     
     suspend fun getProviderById(id: String): Provider? = providerDao.getProviderById(id)
     
@@ -46,12 +49,17 @@ class AggregatorRepository @Inject constructor(
         val baseUrl = extractBaseUrl(normalizedUrl)
         
         val existingProvider = providerDao.getProviderByUrl(normalizedUrl)
+            ?: providerDao.getProviderByBaseUrl(baseUrl)
         if (existingProvider != null) {
-            if (!existingProvider.isEnabled) {
-                providerDao.setProviderEnabled(existingProvider.id, true)
-            }
+            val updated = existingProvider.copy(
+                url = normalizedUrl,
+                baseUrl = baseUrl,
+                isEnabled = true,
+                name = name ?: existingProvider.name
+            )
+            providerDao.updateProvider(updated)
             clearSearchCache()
-            return existingProvider
+            return updated
         }
         
         val provider = Provider(
@@ -205,15 +213,55 @@ class AggregatorRepository @Inject constructor(
             dateSelector = analysis.dateSelector,
             ratingSelector = analysis.ratingSelector
         )
+        scrapingConfigDao.deleteConfigForProvider(provider.id)
         scrapingConfigDao.insertConfig(config)
     }
     
     private fun buildSearchUrlTemplate(baseUrl: String, analysis: SiteAnalysis): String {
-        return when {
-            analysis.searchFormSelector != null -> "$baseUrl/search?q={query}&page={page}"
-            analysis.hasAPI -> "$baseUrl/api/search?query={query}&page={page}"
-            else -> "$baseUrl/search?q={query}"
+        val analyzedDocument = analysis.rawHtml
+            ?.takeIf { it.isNotBlank() }
+            ?.let { runCatching { Jsoup.parse(it, analysis.url) }.getOrNull() }
+
+        val form = analyzedDocument?.let { document ->
+            analysis.searchFormSelector
+                ?.let { selector -> runCatching { document.selectFirst(selector) }.getOrNull() }
+                ?: document.selectFirst(
+                    "form:has(input[type=search]), form:has(input[name=q]), " +
+                        "form:has(input[name=query]), form:has(input[name=search]), form:has(input[name=s])"
+                )
         }
+
+        if (form != null && !form.attr("method").equals("post", ignoreCase = true)) {
+            val action = form.absUrl("action").ifBlank { analysis.url.ifBlank { baseUrl } }
+            val queryInput = form.select(
+                "input[type=search], input[name=q], input[name=query], input[name=search], " +
+                    "input[name=s], input[name=keyword], input[name=term]"
+            ).firstOrNull()
+            val queryName = queryInput?.attr("name")?.takeIf { it.isNotBlank() } ?: "q"
+            val fixedFields = form.select("input[name]")
+                .filter { input ->
+                    input !== queryInput &&
+                        input.attr("type").lowercase() in setOf("hidden", "submit") &&
+                        input.attr("value").isNotBlank()
+                }
+                .joinToString("&") { input ->
+                    "${URLEncoder.encode(input.attr("name"), "UTF-8")}" +
+                        "=${URLEncoder.encode(input.attr("value"), "UTF-8")}"
+                }
+            val separator = if (action.contains('?')) "&" else "?"
+            return buildString {
+                append(action)
+                append(separator)
+                if (fixedFields.isNotBlank()) {
+                    append(fixedFields)
+                    append('&')
+                }
+                append(URLEncoder.encode(queryName, "UTF-8"))
+                append("={query}&page={page}")
+            }
+        }
+
+        return "$baseUrl/search?q={query}&page={page}"
     }
     
     private fun normalizeUrl(url: String): String {

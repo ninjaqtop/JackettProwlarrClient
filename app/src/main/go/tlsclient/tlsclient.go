@@ -33,6 +33,8 @@ type tlsResponse struct {
 	Error      string              `json:"error,omitempty"`
 }
 
+const maxResponseBodyBytes = 8 * 1024 * 1024
+
 //export request
 func request(reqJson *C.char) *C.char {
 	if reqJson == nil {
@@ -103,7 +105,7 @@ func request(reqJson *C.char) *C.char {
 	}
 	defer resp.Body.Close()
 
-	respBody, err := io.ReadAll(resp.Body)
+	respBody, err := io.ReadAll(io.LimitReader(resp.Body, maxResponseBodyBytes+1))
 	if err != nil {
 		return jsonCString(tlsResponse{
 			StatusCode: resp.StatusCode,
@@ -113,9 +115,15 @@ func request(reqJson *C.char) *C.char {
 		})
 	}
 
+	responseHeaders := mapHeaders(resp.Header)
+	if len(respBody) > maxResponseBodyBytes {
+		respBody = respBody[:maxResponseBodyBytes]
+		responseHeaders["X-AggregatorX-Body-Truncated"] = []string{"true"}
+	}
+
 	return jsonCString(tlsResponse{
 		StatusCode: resp.StatusCode,
-		Headers:    mapHeaders(resp.Header),
+		Headers:    responseHeaders,
 		Body:       string(respBody),
 		FinalURL:   finalURL(resp),
 	})

@@ -132,7 +132,17 @@ class AdvancedVideoExtractorEngine @Inject constructor() {
      * Primary extraction entry point. Runs all strategies in parallel and
      * returns the highest-quality result found.
      */
-    suspend fun extract(pageUrl: String): AdvancedExtractionResult = withContext(Dispatchers.IO) {
+    suspend fun extract(pageUrl: String): AdvancedExtractionResult =
+        extractInternal(pageUrl, depth = 0, visited = mutableSetOf())
+
+    private suspend fun extractInternal(
+        pageUrl: String,
+        depth: Int,
+        visited: MutableSet<String>
+    ): AdvancedExtractionResult = withContext(Dispatchers.IO) {
+        if (depth > 4 || !visited.add(pageUrl)) {
+            return@withContext AdvancedExtractionResult(success = false, error = "Cyclic or excessive iframe chain")
+        }
         Log.d(TAG, "extract: $pageUrl")
         try {
             // Fast path: URL is already a direct media link
@@ -159,7 +169,7 @@ class AdvancedVideoExtractorEngine @Inject constructor() {
             // Run all DOM/script extractors
             candidates += extractFromVideoTags(doc, pageUrl)
             candidates += extractFromSourceTags(doc, pageUrl)
-            candidates += extractFromIframes(doc, pageUrl)
+            candidates += extractFromIframes(doc, pageUrl, depth, visited)
             candidates += extractFromScriptBlocks(html, pageUrl)
             candidates += extractFromDataAttributes(doc, pageUrl)
             candidates += extractFromMetaTags(doc, pageUrl)
@@ -211,7 +221,12 @@ class AdvancedVideoExtractorEngine @Inject constructor() {
         return out
     }
 
-    private suspend fun extractFromIframes(doc: Document, base: String): List<VideoCandidate> {
+    private suspend fun extractFromIframes(
+        doc: Document,
+        base: String,
+        depth: Int,
+        visited: MutableSet<String>
+    ): List<VideoCandidate> {
         val out = mutableListOf<VideoCandidate>()
         val iframes = doc.select("iframe[src], iframe[data-src]")
         for (iframe in iframes.take(5)) {
@@ -220,7 +235,7 @@ class AdvancedVideoExtractorEngine @Inject constructor() {
             val resolved = resolveUrl(src, base)
             // Recurse into iframe
             try {
-                val sub = extract(resolved)
+                val sub = extractInternal(resolved, depth + 1, visited)
                 if (sub.success && sub.videoUrl != null) {
                     out += VideoCandidate(sub.videoUrl, sub.quality ?: "", sub.format ?: "mp4",
                         sub.isStream, "iframe_chain")

@@ -2,11 +2,13 @@ package com.aggregatorx.app.engine.media
 
 import android.app.NotificationChannel
 import android.app.NotificationManager
+import android.content.ContentValues
 import android.content.Context
 import android.content.Intent
 import android.net.Uri
 import android.os.Build
 import android.os.Environment
+import android.provider.MediaStore
 import androidx.core.app.NotificationCompat
 import androidx.core.content.FileProvider
 import com.aggregatorx.app.engine.network.TlsFingerprintEngine
@@ -20,6 +22,8 @@ import okhttp3.OkHttpClient
 import okhttp3.Request
 import java.io.File
 import java.io.FileOutputStream
+import java.io.OutputStream
+import java.net.URI
 import java.text.SimpleDateFormat
 import java.util.*
 import java.util.concurrent.TimeUnit
@@ -170,7 +174,9 @@ class DownloadManager @Inject constructor(
      */
     suspend fun downloadDirect(
         videoUrl: String,
-        title: String
+        title: String,
+        headers: Map<String, String> = emptyMap(),
+        pageUrl: String? = null
     ): String {
         val downloadId = UUID.randomUUID().toString()
         
@@ -179,7 +185,9 @@ class DownloadManager @Inject constructor(
                 downloadId = downloadId,
                 videoUrl = videoUrl,
                 title = title,
-                quality = "Direct"
+                quality = "Direct",
+                pageUrl = pageUrl,
+                requestHeaders = headers
             )
         }
         
@@ -194,7 +202,8 @@ class DownloadManager @Inject constructor(
         videoUrl: String,
         title: String,
         quality: String,
-        pageUrl: String? = null
+        pageUrl: String? = null,
+        requestHeaders: Map<String, String> = emptyMap()
     ) = withContext(Dispatchers.IO) {
         val nId = notificationId.getAndIncrement()
         
@@ -211,19 +220,37 @@ class DownloadManager @Inject constructor(
         
         showDownloadNotification(nId, title, 0)
         
+        var target: DownloadTarget? = null
         try {
+            if (videoUrl.contains(".m3u8", ignoreCase = true)) {
+                downloadHls(
+                    downloadId = downloadId,
+                    notificationId = nId,
+                    videoUrl = videoUrl,
+                    title = title,
+                    quality = quality,
+                    pageUrl = pageUrl,
+                    requestHeaders = requestHeaders
+                )
+                return@withContext
+            }
+            if (videoUrl.contains(".mpd", ignoreCase = true)) {
+                throw IllegalArgumentException("DASH manifest downloads are not yet a single downloadable media file")
+            }
+
             // Build request with proper headers (use referer from page URL if available)
             val referer = pageUrl?.let { Uri.parse(it).host?.let { host -> "https://$host/" } }
                 ?: Uri.parse(videoUrl).host?.let { "https://$it/" }
                 ?: ""
             
-            val request = Request.Builder()
+            val requestBuilder = Request.Builder()
                 .url(videoUrl)
                 .header("User-Agent", USER_AGENT)
                 .header("Referer", referer)
                 .header("Accept", "*/*")
                 .header("Accept-Encoding", "identity") // Avoid compressed responses for accurate progress
-                .build()
+            requestHeaders.forEach { (name, value) -> requestBuilder.header(name, value) }
+            val request = requestBuilder.build()
             
             val response = httpClient.newCall(request).execute()
             
@@ -234,31 +261,20 @@ class DownloadManager @Inject constructor(
             val body = response.body ?: throw Exception("Empty response body")
             val totalBytes = body.contentLength()
             
-            // Use user-selected directory if set, else default
-            val downloadDir = if (!downloadDirectory.isNullOrEmpty()) {
-                File(Uri.parse(downloadDirectory).path ?: getDefaultDownloadDir().absolutePath)
-            } else {
-                getDefaultDownloadDir()
-            }
-            
-            if (!downloadDir.exists()) {
-                downloadDir.mkdirs()
-            }
-            
             // Generate filename with quality indicator
             val extension = detectExtension(videoUrl)
             val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
             val sanitizedTitle = title.replace(Regex("[^a-zA-Z0-9._-]"), "_").take(50)
             val qualityTag = quality.replace(Regex("[^a-zA-Z0-9]"), "")
             val fileName = "${sanitizedTitle}_${qualityTag}_${timestamp}$extension"
-            val file = File(downloadDir, fileName)
+            target = createDownloadTarget(fileName, mimeTypeFor(extension))
             
             // Download with progress tracking
             var downloadedBytes = 0L
             var lastNotificationUpdate = 0L
             var lastProgressUpdate = 0L
             
-            FileOutputStream(file).use { output ->
+            target.output.use { output ->
                 body.byteStream().use { input ->
                     val buffer = ByteArray(32768) // 32KB buffer
                     var bytesRead: Int
@@ -297,18 +313,20 @@ class DownloadManager @Inject constructor(
                     }
                 }
             }
+            finalizeDownloadTarget(target)
             
             // Success
             updateDownloadState(downloadId, getDownloadState(downloadId)?.copy(
                 status = DownloadStatus.COMPLETED,
                 progress = 100,
-                filePath = file.absolutePath,
-                fileSize = file.length()
+                filePath = target.location,
+                fileSize = downloadedBytes
             ))
             
-            showCompletedNotification(nId, title, file)
+            showCompletedNotification(nId, title, target.location)
             
         } catch (e: Exception) {
+            target?.let(::deleteDownloadTarget)
             updateDownloadState(downloadId, getDownloadState(downloadId)?.copy(
                 status = DownloadStatus.FAILED,
                 error = e.message ?: "Download failed"
@@ -316,6 +334,177 @@ class DownloadManager @Inject constructor(
             
             showFailedNotification(nId, title, e.message ?: "Unknown error")
         }
+    }
+
+    private suspend fun downloadHls(
+        downloadId: String,
+        notificationId: Int,
+        videoUrl: String,
+        title: String,
+        quality: String,
+        pageUrl: String?,
+        requestHeaders: Map<String, String>
+    ) {
+        val initialPlaylist = fetchText(videoUrl, pageUrl, requestHeaders)
+        val mediaUrl = selectHlsMediaPlaylist(videoUrl, initialPlaylist)
+        val playlist = if (mediaUrl == videoUrl) initialPlaylist else fetchText(mediaUrl, pageUrl, requestHeaders)
+        if (!playlist.contains("#EXT-X-ENDLIST")) {
+            throw IllegalArgumentException("Live HLS streams cannot be saved as a complete finite video")
+        }
+        if (playlist.contains("#EXT-X-KEY") && !playlist.contains("METHOD=NONE")) {
+            throw IllegalArgumentException("Encrypted HLS downloads are not supported")
+        }
+        if (playlist.contains("#EXT-X-BYTERANGE")) {
+            throw IllegalArgumentException("Byte-range HLS downloads are not supported")
+        }
+
+        val initSegment = Regex("""#EXT-X-MAP:.*URI=[\"']([^\"']+)[\"']""")
+            .find(playlist)?.groupValues?.getOrNull(1)
+        val segmentUrls = buildList {
+            initSegment?.let { add(resolveUrl(mediaUrl, it)) }
+            playlist.lineSequence()
+                .map(String::trim)
+                .filter { it.isNotBlank() && !it.startsWith('#') }
+                .forEach { add(resolveUrl(mediaUrl, it)) }
+        }
+        if (segmentUrls.isEmpty()) throw IllegalArgumentException("HLS playlist contains no media segments")
+
+        val extension = if (initSegment != null) ".mp4" else ".ts"
+        val timestamp = SimpleDateFormat("yyyyMMdd_HHmmss", Locale.US).format(Date())
+        val sanitizedTitle = title.replace(Regex("[^a-zA-Z0-9._-]"), "_").take(50)
+        val qualityTag = quality.replace(Regex("[^a-zA-Z0-9]"), "")
+        val target = createDownloadTarget(
+            "${sanitizedTitle}_${qualityTag}_${timestamp}$extension",
+            mimeTypeFor(extension)
+        )
+        var downloadedBytes = 0L
+        try {
+            target.output.use { output ->
+                segmentUrls.forEachIndexed { index, segmentUrl ->
+                    val request = mediaRequest(segmentUrl, pageUrl ?: mediaUrl, requestHeaders)
+                    httpClient.newCall(request).execute().use { response ->
+                        if (!response.isSuccessful) error("HLS segment ${index + 1} failed: HTTP ${response.code}")
+                        val body = response.body ?: error("HLS segment ${index + 1} had no body")
+                        body.byteStream().use { input ->
+                            val buffer = ByteArray(32 * 1024)
+                            while (true) {
+                                val read = input.read(buffer)
+                                if (read < 0) break
+                                if (getDownloadState(downloadId)?.status == DownloadStatus.CANCELLED) {
+                                    error("Download cancelled")
+                                }
+                                output.write(buffer, 0, read)
+                                downloadedBytes += read
+                            }
+                        }
+                    }
+                    val progress = ((index + 1) * 100 / segmentUrls.size).coerceIn(0, 100)
+                    updateDownloadState(downloadId, getDownloadState(downloadId)?.copy(
+                        progress = progress,
+                        downloadedBytes = downloadedBytes,
+                        totalBytes = -1L
+                    ))
+                    updateDownloadNotification(notificationId, title, progress)
+                }
+            }
+            finalizeDownloadTarget(target)
+            updateDownloadState(downloadId, getDownloadState(downloadId)?.copy(
+                status = DownloadStatus.COMPLETED,
+                progress = 100,
+                filePath = target.location,
+                fileSize = downloadedBytes
+            ))
+            showCompletedNotification(notificationId, title, target.location)
+        } catch (error: Throwable) {
+            deleteDownloadTarget(target)
+            throw error
+        }
+    }
+
+    private fun fetchText(url: String, pageUrl: String?, headers: Map<String, String>): String {
+        val request = mediaRequest(url, pageUrl ?: url, headers)
+        return httpClient.newCall(request).execute().use { response ->
+            if (!response.isSuccessful) error("Manifest request failed: HTTP ${response.code}")
+            response.body?.string() ?: error("Manifest response was empty")
+        }
+    }
+
+    private fun mediaRequest(url: String, referer: String, headers: Map<String, String>): Request {
+        val builder = Request.Builder()
+            .url(url)
+            .header("User-Agent", USER_AGENT)
+            .header("Referer", referer)
+            .header("Accept", "*/*")
+            .header("Accept-Encoding", "identity")
+        headers.forEach { (name, value) -> builder.header(name, value) }
+        return builder.build()
+    }
+
+    private fun selectHlsMediaPlaylist(masterUrl: String, playlist: String): String {
+        val lines = playlist.lineSequence().map(String::trim).toList()
+        val variants = lines.mapIndexedNotNull { index, line ->
+            if (!line.startsWith("#EXT-X-STREAM-INF")) return@mapIndexedNotNull null
+            val relative = lines.drop(index + 1).firstOrNull { it.isNotBlank() && !it.startsWith('#') }
+                ?: return@mapIndexedNotNull null
+            val bandwidth = Regex("BANDWIDTH=(\\d+)").find(line)?.groupValues?.getOrNull(1)?.toLongOrNull() ?: 0L
+            bandwidth to resolveUrl(masterUrl, relative)
+        }
+        return variants.maxByOrNull { it.first }?.second ?: masterUrl
+    }
+
+    private fun resolveUrl(baseUrl: String, value: String): String =
+        runCatching { URI(baseUrl).resolve(value).toString() }.getOrDefault(value)
+
+    private data class DownloadTarget(
+        val location: String,
+        val output: OutputStream,
+        val contentUri: Uri? = null,
+        val file: File? = null
+    )
+
+    private fun createDownloadTarget(fileName: String, mimeType: String): DownloadTarget {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, fileName)
+                put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
+                put(MediaStore.MediaColumns.RELATIVE_PATH, "${Environment.DIRECTORY_DOWNLOADS}/AggregatorX")
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
+            }
+            val uri = context.contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, values)
+                ?: error("Could not create download in MediaStore")
+            val output = context.contentResolver.openOutputStream(uri, "w")
+                ?: run {
+                    context.contentResolver.delete(uri, null, null)
+                    error("Could not open download output")
+                }
+            return DownloadTarget(uri.toString(), output, contentUri = uri)
+        }
+
+        val directory = getDefaultDownloadDir().apply { mkdirs() }
+        val file = File(directory, fileName)
+        return DownloadTarget(file.absolutePath, FileOutputStream(file), file = file)
+    }
+
+    private fun finalizeDownloadTarget(target: DownloadTarget) {
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q && target.contentUri != null) {
+            val values = ContentValues().apply { put(MediaStore.MediaColumns.IS_PENDING, 0) }
+            context.contentResolver.update(target.contentUri, values, null, null)
+        }
+    }
+
+    private fun deleteDownloadTarget(target: DownloadTarget) {
+        runCatching { target.output.close() }
+        target.contentUri?.let { context.contentResolver.delete(it, null, null) }
+        target.file?.delete()
+    }
+
+    private fun mimeTypeFor(extension: String): String = when (extension.lowercase()) {
+        ".mp4", ".m4v" -> "video/mp4"
+        ".webm" -> "video/webm"
+        ".mkv" -> "video/x-matroska"
+        ".ts" -> "video/mp2t"
+        ".mov" -> "video/quicktime"
+        else -> "application/octet-stream"
     }
     
     /**
@@ -451,22 +640,11 @@ class DownloadManager @Inject constructor(
     /**
      * Show completed notification
      */
-    private fun showCompletedNotification(notificationId: Int, title: String, file: File) {
-        val uri = FileProvider.getUriForFile(
-            context,
-            "${context.packageName}.provider",
-            file
-        )
-        
-        val openIntent = Intent(Intent.ACTION_VIEW).apply {
-            setDataAndType(uri, "video/*")
-            addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
-        }
-        
+    private fun showCompletedNotification(notificationId: Int, title: String, location: String) {
         val builder = NotificationCompat.Builder(context, CHANNEL_ID)
             .setSmallIcon(android.R.drawable.stat_sys_download_done)
             .setContentTitle("Download Complete")
-            .setContentText(title)
+            .setContentText("$title saved to Downloads/AggregatorX")
             .setPriority(NotificationCompat.PRIORITY_DEFAULT)
             .setAutoCancel(true)
         
@@ -491,20 +669,19 @@ class DownloadManager @Inject constructor(
      * Open downloaded file
      */
     fun openFile(filePath: String) {
-        val file = File(filePath)
-        if (file.exists()) {
-            val uri = FileProvider.getUriForFile(
-                context,
-                "${context.packageName}.provider",
-                file
-            )
-            
+        val uri = if (filePath.startsWith("content://")) {
+            Uri.parse(filePath)
+        } else {
+            val file = File(filePath)
+            if (!file.exists()) return
+            FileProvider.getUriForFile(context, "${context.packageName}.provider", file)
+        }
+        runCatching {
             val intent = Intent(Intent.ACTION_VIEW).apply {
                 setDataAndType(uri, "video/*")
                 addFlags(Intent.FLAG_GRANT_READ_URI_PERMISSION)
                 addFlags(Intent.FLAG_ACTIVITY_NEW_TASK)
             }
-            
             context.startActivity(intent)
         }
     }

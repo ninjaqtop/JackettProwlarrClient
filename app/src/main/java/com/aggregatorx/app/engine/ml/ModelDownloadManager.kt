@@ -59,6 +59,15 @@ object ModelDownloadManager {
         }
     }
 
+    fun retryDownload(context: Context) {
+        _state.value = DownloadState.Queued
+        WorkManager.getInstance(context.applicationContext).enqueueUniqueWork(
+            UNIQUE_WORK,
+            ExistingWorkPolicy.REPLACE,
+            createDownloadRequest()
+        )
+    }
+
     fun modelFile(context: Context): File = File(context.filesDir, MODEL_FILE_NAME)
 
     fun updateState(state: DownloadState) {
@@ -70,12 +79,17 @@ object ModelDownloadManager {
 
     private fun enqueueDownload(context: Context) {
         _state.value = DownloadState.Queued
-        val request = OneTimeWorkRequestBuilder<ModelDownloadWorker>()
+        WorkManager.getInstance(context).enqueueUniqueWork(
+            UNIQUE_WORK,
+            ExistingWorkPolicy.KEEP,
+            createDownloadRequest()
+        )
+    }
+
+    private fun createDownloadRequest() = OneTimeWorkRequestBuilder<ModelDownloadWorker>()
             .setConstraints(Constraints.Builder().setRequiredNetworkType(NetworkType.CONNECTED).build())
             .setBackoffCriteria(BackoffPolicy.EXPONENTIAL, 30, TimeUnit.SECONDS)
             .build()
-        WorkManager.getInstance(context).enqueueUniqueWork(UNIQUE_WORK, ExistingWorkPolicy.KEEP, request)
-    }
 
     fun isValidModel(file: File): Boolean = file.exists() && file.isFile && file.length() > 1024L * 1024L && sha256OrNull(file) == MODEL_SHA256
 

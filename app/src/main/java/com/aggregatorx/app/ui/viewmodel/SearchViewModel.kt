@@ -12,8 +12,12 @@ import com.aggregatorx.app.engine.util.EngineUtils
 import dagger.hilt.android.lifecycle.HiltViewModel
 import kotlinx.coroutines.Job
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
+import kotlinx.coroutines.sync.Semaphore
+import kotlinx.coroutines.sync.withPermit
+import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
 
 /**
@@ -71,6 +75,8 @@ class SearchViewModel @Inject constructor(
     private val sessionSeenUrls = mutableSetOf<String>()
     private val videoPreviewCache = java.util.concurrent.ConcurrentHashMap<String, VideoPreviewResult>()
     private var currentSearchJob: Job? = null
+    private val autoFillJobs = ConcurrentHashMap<String, Job>()
+    private val autoFillSemaphore = Semaphore(2)
 
     init {
         ProviderPaginationManager.configure { providerId, query, state ->
@@ -86,6 +92,22 @@ class SearchViewModel @Inject constructor(
                 _uiState.update { it.copy(recentSearches = searches) }
             }
         }
+        viewModelScope.launch {
+            repository.getEnabledProviders().collect { providers ->
+                if (!_uiState.value.isSearching && !_uiState.value.searchCompleted) {
+                    _providerResults.value = providers.map { provider ->
+                        ProviderSearchResults(
+                            provider = provider,
+                            results = emptyList(),
+                            searchTime = 0L,
+                            success = false,
+                            errorMessage = "Ready to search",
+                            status = ProviderSearchStatus.READY
+                        )
+                    }
+                }
+            }
+        }
         viewModelScope.launch { _likedUrls.value = repository.getAllLikedUrls() }
     }
 
@@ -99,6 +121,8 @@ class SearchViewModel @Inject constructor(
 
         currentSearchJob = viewModelScope.launch {
             if (!isLoadMore) {
+                autoFillJobs.values.forEach(Job::cancel)
+                autoFillJobs.clear()
                 sessionSeenUrls.clear()
                 repository.clearSearchCache()
                 videoPreviewCache.clear()
@@ -110,7 +134,23 @@ class SearchViewModel @Inject constructor(
             }
 
             _uiState.update { it.copy(isSearching = true, currentSearchQuery = query, error = null) }
-            val currentResults = if (isLoadMore) _providerResults.value.toMutableList() else mutableListOf()
+            val currentResults = if (isLoadMore) {
+                _providerResults.value.toMutableList()
+            } else {
+                repository.getEnabledProvidersSnapshot().map { provider ->
+                    ProviderSearchResults(
+                        provider = provider,
+                        results = emptyList(),
+                        searchTime = 0L,
+                        success = false,
+                        errorMessage = null,
+                        status = ProviderSearchStatus.SEARCHING
+                    )
+                }.toMutableList()
+            }
+            _providerResults.value = currentResults.toList()
+            if (!isLoadMore) currentResults.forEach { ProviderPaginationManager.reset(it.provider.id) }
+            updateSearchStats(currentResults)
 
             try {
                 // Calls Repository using the new pages parameter fix
@@ -120,41 +160,52 @@ class SearchViewModel @Inject constructor(
                         try {
                             val normalizedResults = safeNormalize(providerResult)
                             ProviderPaginationManager.markFetched(providerResult.provider.id, normalizedResults.size)
+                            val terminalStatus = when {
+                                normalizedResults.isNotEmpty() -> ProviderSearchStatus.RESULTS
+                                providerResult.status == ProviderSearchStatus.TIMED_OUT -> ProviderSearchStatus.TIMED_OUT
+                                providerResult.success -> ProviderSearchStatus.EMPTY
+                                else -> ProviderSearchStatus.FAILED
+                            }
                             val normalizedProviderResult = providerResult.copy(
                                 results = normalizedResults,
                                 totalResults = normalizedResults.size,
-                                hasMore = normalizedResults.size >= PROVIDER_PAGE_SIZE
+                                hasMore = providerResult.hasMore,
+                                success = normalizedResults.isNotEmpty(),
+                                errorMessage = providerResult.errorMessage
+                                    ?: if (normalizedResults.isEmpty()) "No parseable results found" else null,
+                                status = terminalStatus
                             )
-                            // Session-level de-duplication
-                            val uniqueNewOnes = normalizedProviderResult.results.filter { sessionSeenUrls.add(it.url) }
-
-                            if (uniqueNewOnes.isNotEmpty()) {
-                                val filteredResult = normalizedProviderResult.copy(results = uniqueNewOnes)
-                                val existingIndex = currentResults.indexOfFirst { it.provider.id == normalizedProviderResult.provider.id }
-                                if (existingIndex >= 0) {
-                                    val existing = currentResults[existingIndex]
-                                    currentResults[existingIndex] = existing.copy(
-                                        results = (existing.results + uniqueNewOnes).distinctBy { it.url },
-                                        searchTime = normalizedProviderResult.searchTime,
-                                        success = normalizedProviderResult.success,
-                                        errorMessage = normalizedProviderResult.errorMessage,
-                                        totalResults = existing.results.size + uniqueNewOnes.size,
-                                        hasMore = normalizedProviderResult.hasMore,
-                                        nextPageUrl = normalizedProviderResult.nextPageUrl
-                                    )
-                                } else {
-                                    currentResults.add(filteredResult)
-                                }
-                                _providerResults.value = currentResults.toList()
-
-                                updateSearchStats(currentResults)
+                            normalizedResults.forEach { sessionSeenUrls.add(it.url) }
+                            upsertProviderResult(currentResults, normalizedProviderResult)
+                            _providerResults.value = currentResults.toList()
+                            updateSearchStats(currentResults)
+                            if (terminalStatus == ProviderSearchStatus.RESULTS && normalizedResults.size < PROVIDER_PAGE_SIZE) {
+                                scheduleAutoFill(providerResult.provider.id, query)
                             }
                         } catch (e: CancellationException) {
                             throw e
                         } catch (e: Throwable) {
-                            appendProviderFailure(providerResult, e)
+                            val failed = providerResult.copy(
+                                results = emptyList(),
+                                success = false,
+                                errorMessage = e.message ?: e.javaClass.simpleName,
+                                status = ProviderSearchStatus.FAILED
+                            )
+                            upsertProviderResult(currentResults, failed)
+                            _providerResults.value = currentResults.toList()
+                            updateSearchStats(currentResults)
                         }
                     }
+                currentResults.replaceAll { result ->
+                    if (result.status == ProviderSearchStatus.SEARCHING) {
+                        result.copy(
+                            success = false,
+                            errorMessage = "Search ended before this provider responded",
+                            status = ProviderSearchStatus.FAILED
+                        )
+                    } else result
+                }
+                _providerResults.value = currentResults.toList()
                 finalizeAggregatedState(query, currentResults)
             } catch (e: CancellationException) {
                 throw e
@@ -270,25 +321,48 @@ class SearchViewModel @Inject constructor(
             ?.map { it.url }
             .orEmpty()
         sessionSeenUrls.removeAll(removedUrls.toSet())
-        _providerResults.value = _providerResults.value.filterNot { it.provider.id == providerId }
         if (query.isBlank()) return
         viewModelScope.launch {
             _loadingProviderIds.update { it + providerId }
             try {
                 repository.searchProviderPage(providerId, query, 0)?.let { providerResult ->
                     val normalized = safeNormalize(providerResult)
+                    ProviderPaginationManager.markFetched(providerId, normalized.size)
+                    val status = when {
+                        normalized.isNotEmpty() -> ProviderSearchStatus.RESULTS
+                        providerResult.status == ProviderSearchStatus.TIMED_OUT -> ProviderSearchStatus.TIMED_OUT
+                        providerResult.success -> ProviderSearchStatus.EMPTY
+                        else -> ProviderSearchStatus.FAILED
+                    }
                     _providerResults.update { current ->
                         current.filterNot { it.provider.id == providerId } + providerResult.copy(
                             results = normalized,
                             totalResults = normalized.size,
-                            hasMore = normalized.size >= PROVIDER_PAGE_SIZE
+                            hasMore = providerResult.hasMore,
+                            success = normalized.isNotEmpty(),
+                            status = status,
+                            errorMessage = providerResult.errorMessage
+                                ?: if (normalized.isEmpty()) "No parseable results found" else null
                         )
                     }
                     normalized.forEach { sessionSeenUrls.add(it.url) }
+                    updateSearchStats(_providerResults.value)
                 }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Throwable) {
+                _providerResults.update { current ->
+                    current.map { providerResult ->
+                        if (providerResult.provider.id == providerId) {
+                            providerResult.copy(
+                                results = emptyList(),
+                                success = false,
+                                errorMessage = e.message ?: e.javaClass.simpleName,
+                                status = ProviderSearchStatus.FAILED
+                            )
+                        } else providerResult
+                    }
+                }
                 _uiState.update { it.copy(error = "Provider refresh failed: ${e.message ?: e.javaClass.simpleName}") }
             } finally {
                 _loadingProviderIds.update { it - providerId }
@@ -313,10 +387,73 @@ class SearchViewModel @Inject constructor(
         _uiState.update { state ->
             state.copy(
                 totalResults = sessionSeenUrls.size,
-                successfulProviders = currentResults.count { it.success && it.results.isNotEmpty() },
-                failedProviders = currentResults.count { !it.success }
+                successfulProviders = currentResults.count { it.status == ProviderSearchStatus.RESULTS },
+                failedProviders = currentResults.count {
+                    it.status == ProviderSearchStatus.FAILED || it.status == ProviderSearchStatus.TIMED_OUT
+                }
             )
         }
+    }
+
+    private fun upsertProviderResult(
+        currentResults: MutableList<ProviderSearchResults>,
+        providerResult: ProviderSearchResults
+    ) {
+        val existingIndex = currentResults.indexOfFirst { it.provider.id == providerResult.provider.id }
+        if (existingIndex >= 0) currentResults[existingIndex] = providerResult else currentResults.add(providerResult)
+    }
+
+    private fun scheduleAutoFill(providerId: String, query: String) {
+        if (autoFillJobs[providerId]?.isActive == true) return
+        val job = viewModelScope.launch {
+            autoFillSemaphore.withPermit {
+                _loadingProviderIds.update { it + providerId }
+                try {
+                    repeat(2) {
+                        val currentProvider = _providerResults.value.firstOrNull { it.provider.id == providerId }
+                            ?: return@repeat
+                        if (currentProvider.results.size >= PROVIDER_PAGE_SIZE || !currentProvider.hasMore) return@repeat
+
+                        val fetched = ProviderPaginationManager.fetchMoreResults(providerId, query).first()
+                        val unique = fetched.filter { newResult ->
+                            currentProvider.results.none { it.url == newResult.url }
+                        }
+                        if (unique.isEmpty()) {
+                            _providerResults.update { current ->
+                                current.map { result ->
+                                    if (result.provider.id == providerId) result.copy(hasMore = false) else result
+                                }
+                            }
+                            return@repeat
+                        }
+                        unique.forEach { sessionSeenUrls.add(it.url) }
+                        _providerResults.update { current ->
+                            current.map { result ->
+                                if (result.provider.id == providerId) {
+                                    val combined = (result.results + unique).distinctBy { it.url }
+                                    result.copy(
+                                        results = combined,
+                                        totalResults = combined.size,
+                                        success = true,
+                                        status = ProviderSearchStatus.RESULTS,
+                                        hasMore = unique.isNotEmpty()
+                                    )
+                                } else result
+                            }
+                        }
+                        updateSearchStats(_providerResults.value)
+                    }
+                } catch (e: CancellationException) {
+                    throw e
+                } catch (_: Throwable) {
+                    // Initial results stay visible if background pagination fails.
+                } finally {
+                    _loadingProviderIds.update { it - providerId }
+                }
+            }
+        }
+        autoFillJobs[providerId] = job
+        job.invokeOnCompletion { autoFillJobs.remove(providerId, job) }
     }
 
     private suspend fun finalizeAggregatedState(query: String, currentResults: List<ProviderSearchResults>) {
@@ -325,26 +462,11 @@ class SearchViewModel @Inject constructor(
             _uiState.update { it.copy(
                 aggregatedResults = aggregated,
                 totalResults = sessionSeenUrls.size,
-                successfulProviders = aggregated.successfulProviders,
-                failedProviders = aggregated.failedProviders
+                successfulProviders = currentResults.count { result -> result.status == ProviderSearchStatus.RESULTS },
+                failedProviders = currentResults.count { result ->
+                    result.status == ProviderSearchStatus.FAILED || result.status == ProviderSearchStatus.TIMED_OUT
+                }
             ) }
-        }
-    }
-
-    private fun appendProviderFailure(providerResult: ProviderSearchResults, error: Throwable) {
-        _providerResults.update { current ->
-            val failed = providerResult.copy(
-                results = emptyList(),
-                success = false,
-                errorMessage = error.message ?: error.javaClass.simpleName
-            )
-            current.filterNot { it.provider.id == providerResult.provider.id } + failed
-        }
-        _uiState.update { state ->
-            state.copy(
-                failedProviders = state.failedProviders + 1,
-                error = "Provider ${providerResult.provider.name} failed but search continued"
-            )
         }
     }
 
@@ -392,7 +514,19 @@ class SearchViewModel @Inject constructor(
     
     fun clearSearch() {
         _uiState.update { it.copy(query = "", aggregatedResults = null, searchCompleted = false, error = null) }
-        _providerResults.value = emptyList()
+        _providerResults.update { current ->
+            current.map { result ->
+                result.copy(
+                    results = emptyList(),
+                    searchTime = 0L,
+                    success = false,
+                    errorMessage = "Ready to search",
+                    totalResults = 0,
+                    hasMore = false,
+                    status = ProviderSearchStatus.READY
+                )
+            }
+        }
         sessionSeenUrls.clear()
         videoPreviewCache.clear()
     }
@@ -447,17 +581,23 @@ class SearchViewModel @Inject constructor(
         viewModelScope.launch {
             _videoExtractionState.value = VideoExtractionState.Extracting(result.title)
             try {
-                val adv = advancedExtractor.extract(result.url)
-                if (adv.success && !adv.videoUrl.isNullOrEmpty()) {
+                val resolved = withTimeoutOrNull(35_000L) { extractVideoForPreview(result.url) }
+                if (resolved != null && isLikelyMediaUrl(resolved.videoUrl)) {
                     _videoExtractionState.value = VideoExtractionState.Success(
-                        videoUrl = adv.videoUrl, title = result.title, 
-                        quality = adv.quality, isStream = adv.isStream, 
-                        headers = buildPlaybackHeaders(result.url)
+                        videoUrl = resolved.videoUrl,
+                        title = result.title,
+                        quality = result.quality,
+                        isStream = resolved.videoUrl.contains(".m3u8", true) || resolved.videoUrl.contains(".mpd", true),
+                        headers = resolved.headers.ifEmpty { buildPlaybackHeaders(result.url) }
                     )
                     return@launch
                 }
-                _videoExtractionState.value = VideoExtractionState.Error("Extraction failed. Try browser.")
-            } catch (e: Exception) { _videoExtractionState.value = VideoExtractionState.Error(e.message ?: "Error") }
+                _videoExtractionState.value = VideoExtractionState.Error(
+                    "No direct playable stream was found. Open this result In App instead."
+                )
+            } catch (e: Exception) {
+                _videoExtractionState.value = VideoExtractionState.Error(e.message ?: "Video extraction failed")
+            }
         }
     }
 
@@ -465,8 +605,18 @@ class SearchViewModel @Inject constructor(
 
     fun downloadResult(result: SearchResult) {
         viewModelScope.launch {
-            try { downloadManager.downloadFromPage(result.url, result.title) } 
-            catch (e: Exception) { _uiState.update { it.copy(error = "Download failed: ${e.message}") } }
+            try {
+                val resolved = withTimeoutOrNull(35_000L) { extractVideoForPreview(result.url) }
+                if (resolved != null && isLikelyMediaUrl(resolved.videoUrl)) {
+                    downloadManager.downloadDirect(resolved.videoUrl, result.title, resolved.headers, result.url)
+                } else {
+                    _uiState.update {
+                        it.copy(error = "Download unavailable: this page did not expose a downloadable media stream")
+                    }
+                }
+            } catch (e: Exception) {
+                _uiState.update { it.copy(error = "Download failed: ${e.message ?: e.javaClass.simpleName}") }
+            }
         }
     }
 

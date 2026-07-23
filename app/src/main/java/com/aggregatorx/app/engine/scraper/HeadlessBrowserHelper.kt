@@ -14,6 +14,8 @@ import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
+import kotlinx.coroutines.sync.Mutex
+import kotlinx.coroutines.sync.withLock
 import okhttp3.FormBody
 import okhttp3.OkHttpClient
 import okhttp3.Request
@@ -34,6 +36,7 @@ object HeadlessBrowserHelper {
 
     private const val TAG = "HeadlessBrowserHelper"
     @Volatile private var appContext: Context? = null
+    private val renderMutex = Mutex()
     private val tlsFingerprintEngine = TlsFingerprintEngine()
     private val cookieJar = InMemoryCookieJar()
 
@@ -270,9 +273,9 @@ object HeadlessBrowserHelper {
         url: String,
         waitSelector: String?,
         timeout: Int
-    ): String? {
+    ): String? = renderMutex.withLock {
         val context = appContext ?: return null
-        return withContext(Dispatchers.Main.immediate) {
+        withContext(Dispatchers.Main.immediate) {
             suspendCancellableCoroutine { cont ->
                 var completed = false
                 var webView: WebView? = null

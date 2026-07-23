@@ -164,8 +164,24 @@ data class ProviderSearchResults(
     val errorMessage: String? = null,
     val totalResults: Int = results.size,
     val hasMore: Boolean = false,
-    val nextPageUrl: String? = null
+    val nextPageUrl: String? = null,
+    val status: ProviderSearchStatus = when {
+        success && results.isNotEmpty() -> ProviderSearchStatus.RESULTS
+        success -> ProviderSearchStatus.EMPTY
+        errorMessage.equals("Timed out", ignoreCase = true) -> ProviderSearchStatus.TIMED_OUT
+        else -> ProviderSearchStatus.FAILED
+    }
 )
+
+@Serializable
+enum class ProviderSearchStatus {
+    READY,
+    SEARCHING,
+    RESULTS,
+    EMPTY,
+    FAILED,
+    TIMED_OUT
+}
 
 /**
  * Aggregated Search Results - All results from all providers

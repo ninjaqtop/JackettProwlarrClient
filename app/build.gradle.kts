@@ -16,8 +16,8 @@ android {
         applicationId = "com.aggregatorx.app"
         minSdk = 26
         targetSdk = 35
-        versionCode = 1
-        versionName = "1.0.0"
+        versionCode = 2
+        versionName = "1.1.0"
         multiDexEnabled = true
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -75,6 +75,11 @@ android {
             pickFirsts += "META-INF/coil3-network-okhttp.kotlin_module"
             pickFirsts += "META-INF/okhttp3/okhttp.kotlin_module"
         }
+    }
+
+    lint {
+        // Lifecycle 2.9's detector is binary-incompatible with this Kotlin analysis API.
+        disable += "NullSafeMutableLiveData"
     }
 }
 

@@ -26,6 +26,9 @@ interface ProviderDao {
     
     @Query("SELECT * FROM providers WHERE url = :url")
     suspend fun getProviderByUrl(url: String): Provider?
+
+    @Query("SELECT * FROM providers WHERE baseUrl = :baseUrl LIMIT 1")
+    suspend fun getProviderByBaseUrl(baseUrl: String): Provider?
     
     @Insert(onConflict = OnConflictStrategy.REPLACE)
     suspend fun insertProvider(provider: Provider)
@@ -87,7 +90,7 @@ interface ScrapingConfigDao {
     @Query("SELECT * FROM scraping_configs")
     fun getAllConfigs(): Flow<List<ScrapingConfig>>
     
-    @Query("SELECT * FROM scraping_configs WHERE providerId = :providerId")
+    @Query("SELECT * FROM scraping_configs WHERE providerId = :providerId LIMIT 1")
     suspend fun getConfigForProvider(providerId: String): ScrapingConfig?
     
     @Insert(onConflict = OnConflictStrategy.REPLACE)

@@ -7,6 +7,8 @@ import com.aggregatorx.app.engine.token.TokenManager
 import com.aggregatorx.app.engine.vision.VisionEngine
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
 import kotlinx.coroutines.withTimeoutOrNull
 import kotlinx.coroutines.withContext
 import org.jsoup.Jsoup
@@ -142,17 +144,20 @@ class SiteAnalyzerEngine @Inject constructor(
             // Fetch the page with modern browser headers, then fall back to
             // rendered content so JS-heavy sites can still be analyzed.
             val fetchedPage = fetchAnalyzerPage(normalizedUrl)
-            val renderedHtml = try {
-                withTimeoutOrNull(RENDER_TIMEOUT_MS) {
-                    HeadlessBrowserHelper.fetchPageContentWithShadowAndAdSkip(
-                        url = normalizedUrl,
-                        waitSelector = "body",
-                        timeout = DEFAULT_TIMEOUT
-                    )
+            val fetchedDocument = Jsoup.parse(fetchedPage.html, normalizedUrl)
+            val renderedHtml = if (detectJavaScriptRequirement(fetchedDocument)) {
+                try {
+                    withTimeoutOrNull(RENDER_TIMEOUT_MS) {
+                        HeadlessBrowserHelper.fetchPageContentWithShadowAndAdSkip(
+                            url = normalizedUrl,
+                            waitSelector = "body",
+                            timeout = RENDER_TIMEOUT_MS.toInt()
+                        )
+                    }
+                } catch (_: Exception) {
+                    null
                 }
-            } catch (_: Exception) {
-                null
-            }
+            } else null
             val activeHtml = renderedHtml ?: fetchedPage.html
             val document = Jsoup.parse(activeHtml, normalizedUrl)
             val loadTime = System.currentTimeMillis() - startTime
@@ -1012,12 +1017,34 @@ class SiteAnalyzerEngine @Inject constructor(
         loadTime: Long
     ): AnalyzerCapabilityReport {
         val baseUrl = extractBaseUrl(url)
-        val tokenBundle = try { withTimeoutOrNull(CAPABILITY_STEP_TIMEOUT_MS) { tokenManager.harvestTokens(url) } } catch (_: Exception) { null }
-        val deepEndpoints = try { withTimeoutOrNull(CAPABILITY_STEP_TIMEOUT_MS) { endpointDiscoveryEngine.deepDiscoverEndpoints(baseUrl, "test") } } catch (_: Exception) { null }
         val thumbnails = collectThumbnailUrls(document, baseUrl)
-        val ocrKeywords = try { withTimeoutOrNull(CAPABILITY_STEP_TIMEOUT_MS) { visionEngine.batchExtract(thumbnails.take(8)) } } catch (_: Exception) { null }.orEmpty()
-        val network = withTimeoutOrNull(CAPABILITY_STEP_TIMEOUT_MS) { analyzeNetworkTopology(url, headers) }
-            ?: NetworkTopologyResult(emptyList(), "Unknown", emptyList())
+        val probes = coroutineScope {
+            val tokenProbe = async {
+                try { withTimeoutOrNull(CAPABILITY_STEP_TIMEOUT_MS) { tokenManager.harvestTokens(url) } }
+                catch (_: Exception) { null }
+            }
+            val endpointProbe = async {
+                try { withTimeoutOrNull(CAPABILITY_STEP_TIMEOUT_MS) { endpointDiscoveryEngine.deepDiscoverEndpoints(baseUrl, "test") } }
+                catch (_: Exception) { null }
+            }
+            val ocrProbe = async {
+                try { withTimeoutOrNull(CAPABILITY_STEP_TIMEOUT_MS) { visionEngine.batchExtract(thumbnails.take(8)) } }
+                catch (_: Exception) { null }
+            }
+            val networkProbe = async {
+                withTimeoutOrNull(CAPABILITY_STEP_TIMEOUT_MS) { analyzeNetworkTopology(url, headers) }
+            }
+            CapabilityProbeResults(
+                tokenBundle = tokenProbe.await(),
+                deepEndpoints = endpointProbe.await(),
+                ocrKeywords = ocrProbe.await().orEmpty(),
+                network = networkProbe.await() ?: NetworkTopologyResult(emptyList(), "Unknown", emptyList())
+            )
+        }
+        val tokenBundle = probes.tokenBundle
+        val deepEndpoints = probes.deepEndpoints
+        val ocrKeywords = probes.ocrKeywords
+        val network = probes.network
         val tlsProfile = tlsFingerprintEngine.defaultProfileInfo()
         val nativeTls = tlsFingerprintEngine.nativeImpersonationInfo()
         val waf = analyzeWafFingerprint(headers, html)
@@ -1377,6 +1404,13 @@ class SiteAnalyzerEngine @Inject constructor(
         val ips: List<String>,
         val cdnProvider: String,
         val reverseProxySignals: List<String>
+    )
+
+    private data class CapabilityProbeResults(
+        val tokenBundle: TokenManager.TokenBundle?,
+        val deepEndpoints: DiscoveredEndpoints?,
+        val ocrKeywords: Map<String, List<String>>,
+        val network: NetworkTopologyResult
     )
 
     data class WafFingerprintResult(

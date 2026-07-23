@@ -24,6 +24,7 @@ import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.graphics.Color
 import androidx.compose.ui.graphics.drawscope.Stroke
 import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.platform.LocalContext
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.unit.dp
 import androidx.compose.ui.unit.sp
@@ -76,6 +77,8 @@ fun MainScreen() {
     val searchViewModel: SearchViewModel = hiltViewModel()
     val isDiscoveryPaused by searchViewModel.isDiscoveryPaused.collectAsState()
     val modelDownloadState by ModelDownloadManager.state.collectAsState()
+    val context = LocalContext.current
+    var modelOverlayDismissed by remember { mutableStateOf(false) }
 
     val screens = listOf(Screen.Search, Screen.Providers, Screen.Settings)
 
@@ -134,12 +137,22 @@ fun MainScreen() {
             }
         }
 
-        ModelDownloadOverlay(modelDownloadState)
+        if (!modelOverlayDismissed) {
+            ModelDownloadOverlay(
+                state = modelDownloadState,
+                onContinue = { modelOverlayDismissed = true },
+                onRetry = { ModelDownloadManager.retryDownload(context) }
+            )
+        }
     }
 }
 
 @Composable
-private fun ModelDownloadOverlay(state: DownloadState) {
+private fun ModelDownloadOverlay(
+    state: DownloadState,
+    onContinue: () -> Unit,
+    onRetry: () -> Unit
+) {
     val visible = state is DownloadState.Queued || state is DownloadState.Downloading || state is DownloadState.Failed
     if (!visible) return
     Box(
@@ -173,11 +186,22 @@ private fun ModelDownloadOverlay(state: DownloadState) {
                 }
                 is DownloadState.Failed -> {
                     Text(state.message, color = AccentRed, fontSize = 12.sp, textAlign = androidx.compose.ui.text.style.TextAlign.Center)
+                    Spacer(Modifier.height(16.dp))
+                    Row(horizontalArrangement = Arrangement.spacedBy(10.dp)) {
+                        Button(onClick = onRetry) { Text("Retry") }
+                        OutlinedButton(onClick = onContinue) { Text("Continue without model") }
+                    }
                 }
                 else -> {
                     LinearProgressIndicator(modifier = Modifier.fillMaxWidth(), color = NeonGreen, trackColor = DarkSurfaceVariant)
                     Spacer(Modifier.height(8.dp))
                     Text("Queued for download", color = TextSecondary, fontSize = 12.sp)
+                }
+            }
+            if (state is DownloadState.Queued || state is DownloadState.Downloading) {
+                Spacer(Modifier.height(16.dp))
+                TextButton(onClick = onContinue) {
+                    Text("Continue while downloading", color = TextSecondary)
                 }
             }
         }

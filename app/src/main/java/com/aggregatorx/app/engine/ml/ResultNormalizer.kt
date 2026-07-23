@@ -27,7 +27,11 @@ object ResultNormalizer {
             .take(50)
 
         if (normalized.isNotEmpty()) {
-            runCatching { ProviderMemoryStore.updateProviderSchema(providerId, json.encodeToString(normalized.take(5)), 0.86f) }
+            scope.launch {
+                runCatching {
+                    ProviderMemoryStore.updateProviderSchema(providerId, json.encodeToString(normalized.take(5)), 0.86f)
+                }
+            }
             learnInBackground(providerId, providerBaseUrl, normalized)
         }
         return normalized
@@ -42,7 +46,7 @@ object ResultNormalizer {
         }.getOrDefault(emptyMap())
     }
 
-    private suspend fun normalizeLocal(
+    private fun normalizeLocal(
         providerId: String,
         providerBaseUrl: String,
         result: SearchResult,
@@ -55,7 +59,9 @@ object ResultNormalizer {
         if (normalizedUrl.isBlank() || normalizedUrl.contains("javascript:", ignoreCase = true)) return null
 
         if (normalizedUrl != result.url) {
-            runCatching { ProviderMemoryStore.saveCorrection(providerId, "url", result.url, normalizedUrl, 0.92f) }
+            scope.launch {
+                runCatching { ProviderMemoryStore.saveCorrection(providerId, "url", result.url, normalizedUrl, 0.92f) }
+            }
         }
 
         val normalizedThumb = result.thumbnailUrl
