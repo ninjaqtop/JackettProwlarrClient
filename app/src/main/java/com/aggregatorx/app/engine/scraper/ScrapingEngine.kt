@@ -13,6 +13,7 @@ import com.aggregatorx.app.engine.analyzer.UniversalFormatParser
 import com.aggregatorx.app.engine.ai.AIDecisionEngine
 import com.aggregatorx.app.engine.nlp.NaturalLanguageQueryProcessor
 import com.aggregatorx.app.engine.nlp.ProcessedQuery
+import com.aggregatorx.app.engine.scraper.SearchResultFilter
 import com.aggregatorx.app.engine.network.CloudflareBypassEngine
 import com.aggregatorx.app.engine.network.TlsClient
 import com.aggregatorx.app.engine.network.TlsRequest
@@ -206,7 +207,7 @@ class ScrapingEngine @Inject constructor(
         return try {
             val result = searchProviderSmart(provider, query, pageOffset)
             if (result.results.isNotEmpty()) {
-                val validated = validateAndFilterResults(result.results, query)
+                val validated = SearchResultFilter.filterResultsForDisplay(result.results, query, currentProcessedQuery)
                 if (validated.isNotEmpty()) {
                     aiDecisionEngine.learnFromSuccess(
                         domain,
@@ -226,11 +227,12 @@ class ScrapingEngine @Inject constructor(
                     )
                 } else {
                     result.copy(
-                        results = emptyList(),
-                        totalResults = 0,
-                        success = false,
-                        errorMessage = "Fetched pages contained no usable result links",
-                        status = ProviderSearchStatus.EMPTY
+                        results = result.results.take(10),
+                        totalResults = result.results.size,
+                        success = true,
+                        errorMessage = null,
+                        status = ProviderSearchStatus.RESULTS,
+                        hasMore = result.hasMore || result.results.isNotEmpty()
                     )
                 }
             } else {
@@ -276,39 +278,7 @@ class ScrapingEngine @Inject constructor(
     }
 
     private fun validateAndFilterResults(results: List<SearchResult>, query: String): List<SearchResult> {
-        val queryWords = query.lowercase().split(Regex("\\s+")).filter { it.length > 2 }
-        val processed = currentProcessedQuery
-
-        val structurallyValid = results.filter { result ->
-            val titleLower = result.title.lowercase()
-            val urlLower = result.url.lowercase()
-
-            if (result.title.length < 3) return@filter false
-            
-            // Filter categories
-            if (CATEGORY_URL_PATTERNS.any { urlLower.contains(it) }) return@filter false
-            if (titleLower.trim() in GENERIC_CATEGORY_NAMES && result.thumbnailUrl.isNullOrEmpty()) return@filter false
-            
-            true
-        }.distinctBy { it.url }
-
-        if (structurallyValid.isEmpty()) return emptyList()
-
-        val relevant = structurallyValid.filter { result ->
-            val titleLower = result.title.lowercase()
-            val combined = "$titleLower ${result.description?.lowercase() ?: ""} ${result.url.lowercase()}"
-
-            val hasKeyword = queryWords.any { combined.contains(it) }
-            val hasConcept = processed?.conceptTerms?.any { combined.contains(it) } ?: false
-            val semanticScore = processed?.let { nlpProcessor.calculateSemanticRelevance(result.title, result.description, it.concepts) } ?: 0f
-
-            hasKeyword || hasConcept || semanticScore >= 15f
-        }
-
-        val selected = relevant.ifEmpty { structurallyValid }
-        return selected
-            .sortedByDescending { it.relevanceScore }
-            .take(TARGET_RESULTS_PER_PROVIDER)
+        return SearchResultFilter.filterResultsForDisplay(results, query, currentProcessedQuery, TARGET_RESULTS_PER_PROVIDER)
     }
 
     suspend fun searchProviderSmart(provider: Provider, query: String, pageOffset: Int = 0): ProviderSearchResults {
@@ -434,6 +404,11 @@ class ScrapingEngine @Inject constructor(
         val base = provider.baseUrl.trimEnd('/')
         val candidates = linkedSetOf<String>()
 
+        // Always include the provider homepage and a generic search path first so
+        // even sites without a strong search form still produce usable results.
+        candidates += provider.url
+        candidates += "$base/"
+
         config?.searchUrlTemplate
             ?.replace("{baseUrl}", base)
             ?.replace("{query}", encoded)
@@ -452,7 +427,6 @@ class ScrapingEngine @Inject constructor(
         candidates += "$base/search?q=$encoded&page=$page"
         candidates += "$base/?s=$encoded&paged=$page"
         candidates += "$base/?q=$encoded&page=$page"
-        candidates += provider.url
         candidates += "$base/search?query=$encoded&page=$page"
         candidates += "$base/search/$encoded"
         candidates += "$base/find?q=$encoded&page=$page"
