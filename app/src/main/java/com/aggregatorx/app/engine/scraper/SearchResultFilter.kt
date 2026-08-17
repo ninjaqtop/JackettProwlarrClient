@@ -65,13 +65,24 @@ object SearchResultFilter {
         val hasConcept = processedQuery?.conceptTerms?.any { combined.contains(it) } ?: false
         if (hasConcept) return true
 
-        val semanticScore = processedQuery?.let {
+        val semanticScore = processedQuery?.let { pq ->
             val description = result.description ?: ""
-            it.concepts.takeIf { concepts -> concepts.isNotEmpty() }?.let { concepts ->
+            val conceptTerms = listOf(
+                pq.concepts.subjects,
+                pq.concepts.actions,
+                pq.concepts.descriptors,
+                pq.concepts.contexts,
+                pq.concepts.emotions,
+                pq.concepts.compoundConcepts
+            ).flatten().filter { it.length > 2 }.distinct()
+
+            if (conceptTerms.isEmpty()) {
+                false
+            } else {
                 // Keep the fallback permissive so generic content links are not dropped.
-                val score = similarityScore(result.title, description, query, concepts)
+                val score = similarityScore(result.title, description, query, conceptTerms)
                 score >= 10f
-            } ?: false
+            }
         } ?: false
 
         if (semanticScore) return true

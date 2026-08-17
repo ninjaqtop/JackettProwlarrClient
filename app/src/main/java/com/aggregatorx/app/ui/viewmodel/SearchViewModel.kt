@@ -72,11 +72,19 @@ class SearchViewModel @Inject constructor(
     }
 
     // ── MISSION CONTROL: Session Tracking ───────────────────────────────
-    private val sessionSeenUrls = mutableSetOf<String>()
+    private val sessionSeenUrls = ConcurrentHashMap.newKeySet<String>()
     private val videoPreviewCache = java.util.concurrent.ConcurrentHashMap<String, VideoPreviewResult>()
     private var currentSearchJob: Job? = null
     private val autoFillJobs = ConcurrentHashMap<String, Job>()
     private val autoFillSemaphore = Semaphore(2)
+
+    private fun rememberSeenUrls(urls: Iterable<String>) {
+        urls.filter { it.isNotBlank() }.forEach(sessionSeenUrls::add)
+    }
+
+    private fun forgetSeenUrls(urls: Iterable<String>) {
+        urls.filter { it.isNotBlank() }.forEach(sessionSeenUrls::remove)
+    }
 
     init {
         ProviderPaginationManager.configure { providerId, query, state ->
@@ -175,7 +183,7 @@ class SearchViewModel @Inject constructor(
                                     ?: if (normalizedResults.isEmpty()) "No parseable results found" else null,
                                 status = terminalStatus
                             )
-                            normalizedResults.forEach { sessionSeenUrls.add(it.url) }
+                            rememberSeenUrls(normalizedResults.map { it.url })
                             upsertProviderResult(currentResults, normalizedProviderResult)
                             _providerResults.value = currentResults.toList()
                             updateSearchStats(currentResults)
@@ -246,7 +254,7 @@ class SearchViewModel @Inject constructor(
                                     url = url,
                                     relevanceScore = 60f
                                 ))
-                                sessionSeenUrls.add(url)
+                                rememberSeenUrls(listOf(url))
                             }
                         }
                     } catch (_: Exception) {}
@@ -320,7 +328,7 @@ class SearchViewModel @Inject constructor(
             ?.results
             ?.map { it.url }
             .orEmpty()
-        sessionSeenUrls.removeAll(removedUrls.toSet())
+        forgetSeenUrls(removedUrls)
         if (query.isBlank()) return
         viewModelScope.launch {
             _loadingProviderIds.update { it + providerId }
@@ -345,7 +353,7 @@ class SearchViewModel @Inject constructor(
                                 ?: if (normalized.isEmpty()) "No parseable results found" else null
                         )
                     }
-                    normalized.forEach { sessionSeenUrls.add(it.url) }
+                    rememberSeenUrls(normalized.map { it.url })
                     updateSearchStats(_providerResults.value)
                 }
             } catch (e: CancellationException) {
@@ -426,7 +434,7 @@ class SearchViewModel @Inject constructor(
                             }
                             return@repeat
                         }
-                        unique.forEach { sessionSeenUrls.add(it.url) }
+                        rememberSeenUrls(unique.map { it.url })
                         _providerResults.update { current ->
                             current.map { result ->
                                 if (result.provider.id == providerId) {

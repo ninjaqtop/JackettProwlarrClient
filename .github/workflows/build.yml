@@ -29,6 +29,11 @@ jobs:
       - name: Setup Android SDK
         uses: android-actions/setup-android@v4
 
+      - name: Install Android SDK components
+        run: |
+          echo "y" | sdkmanager --install "platform-tools" "platforms;android-35" "build-tools;35.0.0" "cmake;3.22.1" "ndk;27.0.12077973"
+          echo "sdk.dir=$ANDROID_HOME" > local.properties
+
       - name: Cache Gradle packages
         uses: actions/cache@v4
         with:
@@ -43,9 +48,11 @@ jobs:
         run: chmod +x gradlew
 
       - name: Build Debug APK
-        run: ./gradlew assembleDebug --no-daemon --warning-mode all
+        run: ./gradlew --no-daemon --max-workers=1 -Dkotlin.compiler.execution.strategy=in-process assembleDebug --warning-mode all
         env:
-          GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=512m -Dorg.gradle.daemon=false -Dkotlin.incremental=false"
+          GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g -Dorg.gradle.daemon=false -Dkotlin.incremental=false -Dkotlin.daemon.jvmargs=-Xmx2g -XX:MaxMetaspaceSize=768m"
+          ANDROID_HOME: /usr/local/lib/android/sdk
+          ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
 
       - name: Rename and stage APK
         run: |

@@ -168,7 +168,7 @@ data class ProviderSearchResults(
     val status: ProviderSearchStatus = when {
         success && results.isNotEmpty() -> ProviderSearchStatus.RESULTS
         success -> ProviderSearchStatus.EMPTY
-        errorMessage.equals("Timed out", ignoreCase = true) -> ProviderSearchStatus.TIMED_OUT
+        errorMessage?.equals("Timed out", ignoreCase = true) == true -> ProviderSearchStatus.TIMED_OUT
         else -> ProviderSearchStatus.FAILED
     }
 )
