@@ -207,34 +207,25 @@ class ScrapingEngine @Inject constructor(
         return try {
             val result = searchProviderSmart(provider, query, pageOffset)
             if (result.results.isNotEmpty()) {
-                val validated = SearchResultFilter.filterResultsForDisplay(result.results, query, currentProcessedQuery)
-                if (validated.isNotEmpty()) {
-                    aiDecisionEngine.learnFromSuccess(
-                        domain,
-                        ScrapingStrategy.HYBRID,
-                        null,
-                        null,
-                        null,
-                        validated.size,
-                        System.currentTimeMillis() - startTime
-                    )
-                    result.copy(
-                        results = validated,
-                        totalResults = validated.size,
-                        success = true,
-                        status = ProviderSearchStatus.RESULTS,
-                        hasMore = result.hasMore || validated.isNotEmpty()
-                    )
-                } else {
-                    result.copy(
-                        results = result.results.take(10),
-                        totalResults = result.results.size,
-                        success = true,
-                        errorMessage = null,
-                        status = ProviderSearchStatus.RESULTS,
-                        hasMore = result.hasMore || result.results.isNotEmpty()
-                    )
-                }
+                // Keep exactly what the provider's own search page returned, in the
+                // provider's order. Re-filtering/re-sorting here is what made the app
+                // diverge from the results a user sees when searching on the site.
+                aiDecisionEngine.learnFromSuccess(
+                    domain,
+                    ScrapingStrategy.HYBRID,
+                    null,
+                    null,
+                    null,
+                    result.results.size,
+                    System.currentTimeMillis() - startTime
+                )
+                result.copy(
+                    totalResults = result.results.size,
+                    success = true,
+                    errorMessage = null,
+                    status = ProviderSearchStatus.RESULTS,
+                    hasMore = true
+                )
             } else {
                 result
             }
@@ -283,10 +274,9 @@ class ScrapingEngine @Inject constructor(
 
     suspend fun searchProviderSmart(provider: Provider, query: String, pageOffset: Int = 0): ProviderSearchResults {
         val startTime = System.currentTimeMillis()
-        val processed = currentProcessedQuery
-        val effectiveQuery = if (processed != null && processed.isNaturalLanguage && query == processed.originalQuery) {
-            processed.searchQueries.firstOrNull() ?: query
-        } else query
+        // Send the user's query to the site exactly as typed, the same as typing it
+        // into the site's own search box. NLP rewriting changed the results.
+        val effectiveQuery = query.trim()
 
         return try {
             enforceRateLimit(provider.id)
@@ -333,63 +323,107 @@ class ScrapingEngine @Inject constructor(
     ): List<SearchResult> {
         val candidates = buildSearchCandidates(provider, query, pageOffset, config, analysis)
             .take(MAX_SEARCH_CANDIDATES)
-        val combined = linkedMapOf<String, SearchResult>()
-        var hasRelevantResults = false
 
+        // Candidates are ordered best-first (the site's real search URL comes first).
+        // We take the FIRST search page that yields results and use only that page,
+        // in the site's own order, instead of merging homepage links from several
+        // guessed URLs and re-sorting them by our own score.
+        var fallback: List<SearchResult> = emptyList()
         for (batch in candidates.chunked(CANDIDATE_BATCH_SIZE)) {
             val outcomes = supervisorScope {
                 batch.map { candidate ->
                     async(Dispatchers.IO) {
-                        withTimeoutOrNull(FAST_CANDIDATE_TIMEOUT_MS + 1_000L) {
+                        candidate to withTimeoutOrNull(FAST_CANDIDATE_TIMEOUT_MS + 1_000L) {
                             fetchFastOutcome(candidate, config)
                         }
                     }
-                }.awaitAll().filterNotNull()
+                }.awaitAll()
             }
 
-            for (outcome in outcomes) {
+            for ((candidate, outcome) in outcomes) {
+                if (outcome == null) continue
+                if (isHomepage(outcome.finalUrl, provider)) {
+                    Log.i(TAG, "provider=${provider.name} candidate redirected to homepage, skipping: $candidate")
+                    continue
+                }
                 val extracted = extractFromFetchedOutcome(outcome, provider, query, config, analysis)
-                extracted.forEach { result -> combined.putIfAbsent(result.url, result) }
-                hasRelevantResults = hasRelevantResults || extracted.any { matchesQueryEnhanced(it, query) }
                 Log.i(
                     TAG,
                     "provider=${provider.name} transport=${outcome.transport} status=${outcome.statusCode} " +
                         "bytes=${outcome.body.length} parsed=${extracted.size} url=${outcome.finalUrl.take(180)}"
                 )
+                if (extracted.isEmpty()) continue
+                if (extracted.any { matchesQueryEnhanced(it, query) }) {
+                    return withSiteOrder(extracted)
+                }
+                if (fallback.isEmpty()) fallback = extracted
             }
-            if (hasRelevantResults) break
         }
 
-        if (!hasRelevantResults) {
-            val renderUrl = if (analysis?.requiresJavaScript == true && analysis.searchFormSelector == null) {
-                provider.url
-            } else {
-                candidates.firstOrNull() ?: provider.url
-            }
-            val renderedHtml = withTimeoutOrNull(RENDERED_FALLBACK_TIMEOUT_MS) {
+        // Nothing matched over plain HTTP: render the real search page (or submit the
+        // site's own search form) in the WebView, which handles JS-rendered results.
+        val renderUrl = candidates.firstOrNull()
+        val renderedHtml = renderUrl?.let {
+            withTimeoutOrNull(RENDERED_FALLBACK_TIMEOUT_MS) {
                 HeadlessBrowserHelper.fetchPageContentWithShadowAndAdSkip(
-                    url = renderUrl,
-                    waitSelector = analysis?.resultContainerSelector ?: "body",
+                    url = it,
+                    waitSelector = analysis?.resultItemSelector ?: analysis?.resultContainerSelector ?: "body",
                     timeout = RENDERED_FALLBACK_TIMEOUT_MS.toInt()
                 )
             }
-            if (!renderedHtml.isNullOrBlank()) {
-                val outcome = FetchOutcome(
-                    document = Jsoup.parse(renderedHtml, renderUrl),
-                    body = renderedHtml,
-                    finalUrl = renderUrl,
-                    statusCode = 200,
-                    transport = "webview"
+        }
+        if (renderUrl != null && !renderedHtml.isNullOrBlank()) {
+            val outcome = FetchOutcome(
+                document = Jsoup.parse(renderedHtml, renderUrl),
+                body = renderedHtml,
+                finalUrl = renderUrl,
+                statusCode = 200,
+                transport = "webview"
+            )
+            val extracted = extractFromFetchedOutcome(outcome, provider, query, config, analysis)
+            Log.i(TAG, "provider=${provider.name} transport=webview bytes=${renderedHtml.length} parsed=${extracted.size}")
+            if (extracted.isNotEmpty()) return withSiteOrder(extracted)
+        }
+
+        val formUrl = runCatching { HeadlessBrowserHelper.searchViaHeadlessForm(provider.url, query) }.getOrNull()
+        if (!formUrl.isNullOrBlank() && formUrl.startsWith("http") && formUrl != renderUrl) {
+            val formHtml = withTimeoutOrNull(RENDERED_FALLBACK_TIMEOUT_MS) {
+                HeadlessBrowserHelper.fetchPageContentWithShadowAndAdSkip(
+                    url = formUrl,
+                    waitSelector = analysis?.resultItemSelector ?: "body",
+                    timeout = RENDERED_FALLBACK_TIMEOUT_MS.toInt()
                 )
+            }
+            if (!formHtml.isNullOrBlank()) {
+                val outcome = FetchOutcome(Jsoup.parse(formHtml, formUrl), formHtml, formUrl, 200, "webview-form")
                 val extracted = extractFromFetchedOutcome(outcome, provider, query, config, analysis)
-                extracted.forEach { result -> combined.putIfAbsent(result.url, result) }
-                Log.i(TAG, "provider=${provider.name} transport=webview bytes=${renderedHtml.length} parsed=${extracted.size}")
+                if (extracted.isNotEmpty()) return withSiteOrder(extracted)
             }
         }
 
-        return combined.values
-            .sortedByDescending { it.relevanceScore }
-            .take(TARGET_RESULTS_PER_PROVIDER)
+        return withSiteOrder(fallback)
+    }
+
+    /**
+     * Stamp results with their position on the provider's page. Downstream code
+     * (ranking, normalizer, AI tab) sorts by relevanceScore, so a position-based
+     * score keeps the site's own order everywhere.
+     */
+    private fun withSiteOrder(results: List<SearchResult>): List<SearchResult> {
+        val list = results.take(TARGET_RESULTS_PER_PROVIDER)
+        return list.mapIndexed { index, result ->
+            result.copy(
+                relevanceScore = (100f - index * (50f / list.size.coerceAtLeast(1))).coerceIn(50f, 100f),
+                metadata = result.metadata + ("siteRank" to (index + 1).toString())
+            )
+        }
+    }
+
+    private fun isHomepage(url: String, provider: Provider): Boolean {
+        fun norm(u: String) = u.substringBefore('#').trimEnd('/').lowercase()
+            .removePrefix("https://").removePrefix("http://").removePrefix("www.")
+        val target = norm(url)
+        return target == norm(provider.baseUrl) || target == norm(provider.url)
     }
 
     private fun buildSearchCandidates(
@@ -404,32 +438,39 @@ class ScrapingEngine @Inject constructor(
         val base = provider.baseUrl.trimEnd('/')
         val candidates = linkedSetOf<String>()
 
-        // Always include the provider homepage and a generic search path first so
-        // even sites without a strong search form still produce usable results.
-        candidates += provider.url
-        candidates += "$base/"
-
+        // 1. The search URL learned from the site's own search form (most faithful).
         config?.searchUrlTemplate
+            ?.let { template ->
+                // Page 1 on a site is the URL without a page param; adding page=1
+                // changes results on some sites.
+                if (page == 1) template.replace("&page={page}", "").replace("?page={page}&", "?").replace("?page={page}", "")
+                else template
+            }
             ?.replace("{baseUrl}", base)
             ?.replace("{query}", encoded)
             ?.replace("{page}", page.toString())
             ?.takeIf { it.startsWith("http") }
             ?.let(candidates::add)
 
+        // 2. A URL built from the search form in the analyzed HTML.
         analysis?.rawHtml
             ?.takeIf { it.isNotBlank() }
             ?.let { html -> runCatching { Jsoup.parse(html, analysis.url.ifBlank { provider.url }) }.getOrNull() }
             ?.let(smartNavigationEngine::findSearchForm)
             ?.let { form -> smartNavigationEngine.buildSearchUrlFromForm(base, form, query) }
+            ?.let { if (page > 1) "$it&page=$page" else it }
             ?.takeIf { it.startsWith("http") }
             ?.let(candidates::add)
 
-        candidates += "$base/search?q=$encoded&page=$page"
-        candidates += "$base/?s=$encoded&paged=$page"
-        candidates += "$base/?q=$encoded&page=$page"
-        candidates += "$base/search?query=$encoded&page=$page"
+        // 3. Common search URL shapes. The homepage is never a candidate: its links
+        // are not search results and used to crowd out the real ones.
+        val pageSuffix = if (page > 1) "&page=$page" else ""
+        candidates += "$base/search?q=$encoded$pageSuffix"
+        candidates += "$base/?s=$encoded${if (page > 1) "&paged=$page" else ""}"
+        candidates += "$base/search?query=$encoded$pageSuffix"
         candidates += "$base/search/$encoded"
-        candidates += "$base/find?q=$encoded&page=$page"
+        candidates += "$base/?q=$encoded$pageSuffix"
+        candidates += "$base/find?q=$encoded$pageSuffix"
         return candidates.toList()
     }
 
@@ -513,16 +554,23 @@ class ScrapingEngine @Inject constructor(
         config: ScrapingConfig?,
         analysis: SiteAnalysis?
     ): List<SearchResult> {
-        val results = mutableListOf<SearchResult>()
+        fun clean(list: List<SearchResult>) = list
+            .filter { it.title.length >= 3 && it.url.startsWith("http") }
+            .distinctBy { it.url }
+
+        // Use the most specific extractor that works and keep the page's order.
+        // Mixing every extractor and sorting by our own score reshuffled results
+        // and pulled in nav/sidebar links.
         val raw = outcome.body.trimStart()
         if (raw.startsWith('{') || raw.startsWith('[')) {
-            results += extractResultsFromJson(outcome.body, provider, query)
+            clean(extractResultsFromJson(outcome.body, provider, query)).takeIf { it.isNotEmpty() }?.let { return it }
         }
-        if (config != null) results += runCatching {
-            extractResultsWithConfig(outcome.document, provider, query, config)
-        }.getOrDefault(emptyList())
+        if (config != null) {
+            clean(runCatching { extractResultsWithConfig(outcome.document, provider, query, config) }
+                .getOrDefault(emptyList())).takeIf { it.size >= 2 }?.let { return it }
+        }
         if (analysis?.resultItemSelector != null) {
-            results += runCatching {
+            clean(runCatching {
                 outcome.document.select(analysis.resultItemSelector).mapNotNull { item ->
                     val title = extractBestTitle(item)
                     val resultUrl = extractUrlFromItem(item, provider.baseUrl)
@@ -536,14 +584,9 @@ class ScrapingEngine @Inject constructor(
                         relevanceScore = calculateRelevanceScore(title, query, extractBestDescription(item), resultUrl)
                     )
                 }
-            }.getOrDefault(emptyList())
+            }.getOrDefault(emptyList())).takeIf { it.size >= 2 }?.let { return it }
         }
-        results += extractResultsGeneric(outcome.document, provider, query)
-        return results
-            .filter { it.title.length >= 3 && it.url.startsWith("http") }
-            .distinctBy { it.url }
-            .sortedByDescending { it.relevanceScore }
-            .take(TARGET_RESULTS_PER_PROVIDER)
+        return clean(extractResultsGeneric(outcome.document, provider, query, keepPageOrder = true))
     }
 
     private fun extractResultsFromJson(body: String, provider: Provider, query: String): List<SearchResult> {
@@ -869,7 +912,7 @@ class ScrapingEngine @Inject constructor(
         emptyList()
     }
 
-    private fun extractResultsGeneric(doc: Document, p: Provider, q: String): List<SearchResult> {
+    private fun extractResultsGeneric(doc: Document, p: Provider, q: String, keepPageOrder: Boolean = false): List<SearchResult> {
         val selectorResults = detectResultItemSelector(doc)?.let { selector ->
             doc.select(selector).mapNotNull { item ->
                 val title = extractBestTitle(item)
@@ -924,6 +967,13 @@ class ScrapingEngine @Inject constructor(
             )
         }
 
+        if (keepPageOrder) {
+            // Result-item selector output is the page's result list in order; only
+            // fall back to loose link scraping when no list was detected.
+            val primary = selectorResults.distinctBy { it.url }
+            if (primary.size >= 3) return primary
+            return (primary + parsedResults + contentLinkResults).distinctBy { it.url }
+        }
         return (selectorResults + contentLinkResults + parsedResults)
             .distinctBy { it.url }
             .sortedByDescending { it.relevanceScore }
