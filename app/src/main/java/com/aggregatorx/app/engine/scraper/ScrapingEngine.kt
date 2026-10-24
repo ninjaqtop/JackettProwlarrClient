@@ -31,6 +31,7 @@ import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
 import org.jsoup.nodes.Element
 import com.aggregatorx.app.engine.util.EngineUtils
+import java.net.URLDecoder
 import java.net.URLEncoder
 import java.util.concurrent.ConcurrentHashMap
 import javax.inject.Inject
@@ -224,7 +225,10 @@ class ScrapingEngine @Inject constructor(
                     success = true,
                     errorMessage = null,
                     status = ProviderSearchStatus.RESULTS,
-                    hasMore = true
+                    // Preserve the engine's real next-page knowledge instead of
+                    // forcing hasMore on for every provider.
+                    hasMore = result.hasMore,
+                    nextPageUrl = result.nextPageUrl
                 )
             } else {
                 result
@@ -283,7 +287,8 @@ class ScrapingEngine @Inject constructor(
             providerDao.incrementSearchCount(provider.id)
             val config = scrapingConfigDao.getConfigForProvider(provider.id)
             val analysis = siteAnalysisDao.getLatestAnalysis(provider.id)
-            val results = searchBoundedCandidates(provider, effectiveQuery, pageOffset, config, analysis)
+            val outcome = searchBoundedCandidates(provider, effectiveQuery, pageOffset, config, analysis)
+            val results = outcome.results
             val elapsed = System.currentTimeMillis() - startTime
             updateProviderHealth(provider.id, results.isNotEmpty(), elapsed)
             if (results.isEmpty()) providerDao.incrementFailedCount(provider.id)
@@ -294,7 +299,11 @@ class ScrapingEngine @Inject constructor(
                 success = results.isNotEmpty(),
                 errorMessage = if (results.isEmpty()) "No parseable results found on live pages" else null,
                 totalResults = results.size,
-                hasMore = results.isNotEmpty(),
+                // Only claim there is another page when the provider's own page
+                // actually linked to one, or the page came back completely full.
+                // Guessing true here made Load More fetch duplicate/wrong pages.
+                hasMore = outcome.hasMore,
+                nextPageUrl = outcome.nextPageUrl,
                 status = if (results.isNotEmpty()) ProviderSearchStatus.RESULTS else ProviderSearchStatus.EMPTY
             )
         } catch (e: CancellationException) {
@@ -314,21 +323,163 @@ class ScrapingEngine @Inject constructor(
         }
     }
 
+    /**
+     * Fetch one specific provider page by its exact URL — the real next-page
+     * link discovered on the previous page — instead of guessing a page URL
+     * from a template. The same verification/gating as a first-page search
+     * applies, and the page's own next link is discovered in turn.
+     */
+    suspend fun searchProviderPageByUrl(provider: Provider, query: String, pageUrl: String): ProviderSearchResults {
+        val startTime = System.currentTimeMillis()
+        return try {
+            enforceRateLimit(provider.id)
+            providerDao.incrementSearchCount(provider.id)
+            val config = scrapingConfigDao.getConfigForProvider(provider.id)
+            val analysis = siteAnalysisDao.getLatestAnalysis(provider.id)
+            val outcome = withTimeoutOrNull(FAST_CANDIDATE_TIMEOUT_MS + 1_000L) {
+                fetchFastOutcome(pageUrl, config)
+            }
+            if (outcome == null || isHomepage(outcome.finalUrl, provider) || isNoResultsPage(outcome.document)) {
+                return ProviderSearchResults(
+                    provider = provider, results = emptyList(),
+                    searchTime = System.currentTimeMillis() - startTime,
+                    success = false, errorMessage = "Next page could not be loaded",
+                    hasMore = false, status = ProviderSearchStatus.EMPTY
+                )
+            }
+            val extracted = extractFromFetchedOutcome(outcome, provider, query, config, analysis)
+            // This URL was either discovered as the site's own next-page link or
+            // built from its learned template, so it is a trusted search request.
+            val verified = isVerifiedSearchPage(outcome, pageUrl, query, config, analysis, trustedRequest = true)
+            val gated = gateResultsForPage(extracted, query, verified)
+            val currentPage = pageNumberOfUrl(pageUrl) ?: 1
+            val nextPageUrl = if (gated.isNotEmpty()) discoverNextPageUrl(outcome, currentPage) else null
+            val results = withSiteOrder(gated)
+            ProviderSearchResults(
+                provider = provider,
+                results = results,
+                searchTime = System.currentTimeMillis() - startTime,
+                success = results.isNotEmpty(),
+                errorMessage = if (results.isEmpty()) "No parseable results found on live pages" else null,
+                totalResults = results.size,
+                hasMore = nextPageUrl != null || gated.size >= TARGET_RESULTS_PER_PROVIDER,
+                nextPageUrl = nextPageUrl,
+                status = if (results.isNotEmpty()) ProviderSearchStatus.RESULTS else ProviderSearchStatus.EMPTY
+            )
+        } catch (e: CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            ProviderSearchResults(
+                provider = provider, results = emptyList(),
+                searchTime = System.currentTimeMillis() - startTime,
+                success = false, errorMessage = e.message ?: e.javaClass.simpleName,
+                hasMore = false, status = ProviderSearchStatus.FAILED
+            )
+        }
+    }
+
+    private fun pageNumberOfUrl(url: String): Int? {
+        Regex("[?&](?:page|paged|p)=(\\d+)").find(url)?.let { return it.groupValues[1].toIntOrNull() }
+        Regex("/page/(\\d+)").find(url)?.let { return it.groupValues[1].toIntOrNull() }
+        return null
+    }
+
+    private data class BoundedSearchOutcome(
+        val results: List<SearchResult>,
+        val nextPageUrl: String?,
+        /** True only when a real next page was linked, or the page came back
+         *  completely full (a strong sign the provider has more pages). */
+        val hasMore: Boolean = nextPageUrl != null
+    )
+
     private suspend fun searchBoundedCandidates(
         provider: Provider,
         query: String,
         pageOffset: Int,
         config: ScrapingConfig?,
         analysis: SiteAnalysis?
-    ): List<SearchResult> {
+    ): BoundedSearchOutcome {
         val candidates = buildSearchCandidates(provider, query, pageOffset, config, analysis)
             .take(MAX_SEARCH_CANDIDATES)
+        val learnedUrls = buildLearnedSearchUrls(provider, query, pageOffset, config, analysis).toSet()
+
+        // The site's own route comes first, in the site's own way:
+        //
+        // 1. POST search: if the analyzer saved a POST route (the site's search
+        //    form submits POST), submit exactly that body to exactly that action.
+        //    A POST route's results are the site's own — taken whole, in order.
+        val postData = config?.postData?.takeIf { it.isNotBlank() }
+        if (postData != null) {
+            val actionUrl = candidates.firstOrNull()
+            if (actionUrl != null) {
+                val body = postData
+                    .replace("{query}", URLEncoder.encode(query, "UTF-8"))
+                    .replace("{page}", (pageOffset + 1).toString())
+                val postOutcome = withTimeoutOrNull(FAST_CANDIDATE_TIMEOUT_MS + 1_000L) {
+                    fetchPostOutcome(actionUrl, body, config)
+                }
+                if (postOutcome != null && !isHomepage(postOutcome.finalUrl, provider) &&
+                    !isNoResultsPage(postOutcome.document)
+                ) {
+                    val extracted = extractFromFetchedOutcome(postOutcome, provider, query, config, analysis)
+                    if (extracted.isNotEmpty()) {
+                        val nextPageUrl = discoverNextPageUrl(postOutcome, pageOffset + 1)
+                        return BoundedSearchOutcome(
+                            withSiteOrder(extracted), nextPageUrl,
+                            hasMore = nextPageUrl != null || extracted.size >= TARGET_RESULTS_PER_PROVIDER
+                        )
+                    }
+                }
+            }
+        }
+
+        // 2. JavaScript sites: if the analyzer found this site needs JavaScript,
+        //    go straight to rendering the learned search URL in the WebView so
+        //    the site's own scripts run its own search — the same code path a
+        //    browser uses — instead of scraping a static shell page first.
+        if (analysis?.requiresJavaScript == true) {
+            val renderUrl = learnedUrls.firstOrNull() ?: candidates.firstOrNull()
+            if (renderUrl != null) {
+                val renderedHtml = withTimeoutOrNull(RENDERED_FALLBACK_TIMEOUT_MS) {
+                    HeadlessBrowserHelper.fetchPageContentWithShadowAndAdSkip(
+                        url = renderUrl,
+                        waitSelector = analysis.resultItemSelector ?: analysis.resultContainerSelector ?: "body",
+                        timeout = RENDERED_FALLBACK_TIMEOUT_MS.toInt()
+                    )
+                }
+                if (!renderedHtml.isNullOrBlank()) {
+                    val outcome = FetchOutcome(
+                        document = Jsoup.parse(renderedHtml, renderUrl),
+                        body = renderedHtml,
+                        finalUrl = renderUrl,
+                        statusCode = 200,
+                        transport = "webview-first"
+                    )
+                    val extracted = extractFromFetchedOutcome(outcome, provider, query, config, analysis)
+                    if (extracted.isNotEmpty() && !isNoResultsPage(outcome.document)) {
+                        val verified = isVerifiedSearchPage(
+                            outcome, renderUrl, query, config, analysis,
+                            trustedRequest = renderUrl in learnedUrls
+                        )
+                        val gated = gateResultsForPage(extracted, query, verified)
+                        if (gated.isNotEmpty()) {
+                            val nextPageUrl = discoverNextPageUrl(outcome, pageOffset + 1)
+                            return BoundedSearchOutcome(
+                                withSiteOrder(gated), nextPageUrl,
+                                hasMore = nextPageUrl != null || gated.size >= TARGET_RESULTS_PER_PROVIDER
+                            )
+                        }
+                    }
+                }
+            }
+        }
 
         // Candidates are ordered best-first (the site's real search URL comes first).
-        // We take the FIRST search page that yields results and use only that page,
-        // in the site's own order, instead of merging homepage links from several
-        // guessed URLs and re-sorting them by our own score.
-        var fallback: List<SearchResult> = emptyList()
+        // We take the FIRST page that is verified as a real search-results page for
+        // this query and use only that page, in the site's own order. A page that
+        // cannot be verified only contributes results that actually match the query.
+        // A page with no matching results at all is NOT a fallback: returning its
+        // links anyway is what produced the "random results" bug.
         for (batch in candidates.chunked(CANDIDATE_BATCH_SIZE)) {
             val outcomes = supervisorScope {
                 batch.map { candidate ->
@@ -353,10 +504,28 @@ class ScrapingEngine @Inject constructor(
                         "bytes=${outcome.body.length} parsed=${extracted.size} url=${outcome.finalUrl.take(180)}"
                 )
                 if (extracted.isEmpty()) continue
-                if (extracted.any { matchesQueryEnhanced(it, query) }) {
-                    return withSiteOrder(extracted)
+                if (isNoResultsPage(outcome.document)) {
+                    Log.i(TAG, "provider=${provider.name} candidate is a no-results page, skipping: ${outcome.finalUrl.take(180)}")
+                    continue
                 }
-                if (fallback.isEmpty()) fallback = extracted
+                val verified = isVerifiedSearchPage(
+                    outcome, candidate, query, config, analysis,
+                    trustedRequest = candidate in learnedUrls
+                )
+                val gated = gateResultsForPage(extracted, query, verified)
+                if (gated.isNotEmpty()) {
+                    val nextPageUrl = discoverNextPageUrl(outcome, pageOffset + 1)
+                    return BoundedSearchOutcome(
+                        withSiteOrder(gated),
+                        nextPageUrl,
+                        hasMore = nextPageUrl != null || gated.size >= TARGET_RESULTS_PER_PROVIDER
+                    )
+                }
+                Log.i(
+                    TAG,
+                    "provider=${provider.name} candidate rejected: not a verified search page " +
+                        "with results matching the query url=${outcome.finalUrl.take(180)}"
+                )
             }
         }
 
@@ -382,7 +551,24 @@ class ScrapingEngine @Inject constructor(
             )
             val extracted = extractFromFetchedOutcome(outcome, provider, query, config, analysis)
             Log.i(TAG, "provider=${provider.name} transport=webview bytes=${renderedHtml.length} parsed=${extracted.size}")
-            if (extracted.isNotEmpty()) return withSiteOrder(extracted)
+            if (extracted.isNotEmpty() && !isNoResultsPage(outcome.document)) {
+                // The rendered fallback used to return any non-empty extraction
+                // with no checks at all. Apply the same verification/gating as
+                // the fast HTTP path so JS-rendered homepage/trending links are
+                // not presented as search results either.
+                val verified = isVerifiedSearchPage(
+                    outcome, renderUrl, query, config, analysis,
+                    trustedRequest = renderUrl in learnedUrls
+                )
+                val gated = gateResultsForPage(extracted, query, verified)
+                if (gated.isNotEmpty()) {
+                    val nextPageUrl = discoverNextPageUrl(outcome, pageOffset + 1)
+                    return BoundedSearchOutcome(
+                        withSiteOrder(gated), nextPageUrl,
+                        hasMore = nextPageUrl != null || gated.size >= TARGET_RESULTS_PER_PROVIDER
+                    )
+                }
+            }
         }
 
         val formUrl = runCatching { HeadlessBrowserHelper.searchViaHeadlessForm(provider.url, query) }.getOrNull()
@@ -394,14 +580,168 @@ class ScrapingEngine @Inject constructor(
                     timeout = RENDERED_FALLBACK_TIMEOUT_MS.toInt()
                 )
             }
-            if (!formHtml.isNullOrBlank()) {
+            if (!formHtml.isNullOrBlank() && !isHomepage(formUrl, provider)) {
                 val outcome = FetchOutcome(Jsoup.parse(formHtml, formUrl), formHtml, formUrl, 200, "webview-form")
                 val extracted = extractFromFetchedOutcome(outcome, provider, query, config, analysis)
-                if (extracted.isNotEmpty()) return withSiteOrder(extracted)
+                if (extracted.isNotEmpty() && !isNoResultsPage(outcome.document)) {
+                    // Submitting the site's own search form is strong evidence this
+                    // is a real search page, unless it dumped us on the homepage.
+                    val gated = gateResultsForPage(extracted, query, verified = true)
+                    if (gated.isNotEmpty()) {
+                        val nextPageUrl = discoverNextPageUrl(outcome, pageOffset + 1)
+                        return BoundedSearchOutcome(
+                            withSiteOrder(gated), nextPageUrl,
+                            hasMore = nextPageUrl != null || gated.size >= TARGET_RESULTS_PER_PROVIDER
+                        )
+                    }
+                }
             }
         }
 
-        return withSiteOrder(fallback)
+        // No candidate produced a verified search page with matching results.
+        // Report an honest empty result for this provider. Never substitute the
+        // links from a non-matching page: that is the random-results bug.
+        return BoundedSearchOutcome(emptyList(), null)
+    }
+
+    private fun queryTerms(query: String): List<String> =
+        query.lowercase().split(Regex("[^a-z0-9]+")).filter { it.length > 2 }
+
+    /**
+     * Decide whether a fetched page really is a search-results page for [query],
+     * as opposed to a homepage, category, tag or "latest" page that merely
+     * contains extractable links.
+     */
+    private fun isVerifiedSearchPage(
+        outcome: FetchOutcome,
+        requestedUrl: String,
+        query: String,
+        config: ScrapingConfig?,
+        analysis: SiteAnalysis?,
+        trustedRequest: Boolean = false
+    ): Boolean {
+        val terms = queryTerms(query)
+        val finalUrl = outcome.finalUrl
+        val finalLower = finalUrl.lowercase()
+        val decodedFinal = runCatching { URLDecoder.decode(finalUrl, "UTF-8") }.getOrDefault(finalUrl).lowercase()
+
+        // A category/genre landing is never a search page, even if it has links.
+        if (CATEGORY_URL_PATTERNS.any { finalLower.contains(it) } &&
+            terms.none { decodedFinal.contains(it) }
+        ) return false
+
+        // 1. The query survived into the final URL (possibly after redirects).
+        if (terms.isNotEmpty() && terms.any { decodedFinal.contains(it) }) return true
+        if (finalLower.contains("search") &&
+            listOf("q=", "query=", "s=", "keyword", "search_query").any { finalLower.contains(it) }
+        ) return true
+
+        // 2. The redirect kept the requested search path (e.g. /search/...) even
+        // though the query itself is not visible in the final URL.
+        fun pathOf(u: String) = u.substringBefore('?').substringBefore('#')
+            .removePrefix("https://").removePrefix("http://")
+            .substringAfter('/', "").lowercase()
+        if (pathOf(finalUrl).isNotBlank() && pathOf(finalUrl) == pathOf(requestedUrl) &&
+            (pathOf(finalUrl).contains("search") || pathOf(finalUrl).contains("find"))
+        ) return true
+
+        val document = outcome.document
+
+        // 3. The page's own search box still holds the user's query.
+        val searchInputHasQuery = runCatching {
+            document.select("input[type=search], input[name*=q], input[name*=query], input[name*=search], input[name=s], input[name=keyword]")
+                .any { input ->
+                    val value = input.attr("value").trim().lowercase()
+                    value.isNotBlank() && (value == query.trim().lowercase() || terms.any { value.contains(it) })
+                }
+        }.getOrDefault(false)
+        if (searchInputHasQuery) return true
+
+        // 4. The learned result container/item structure is present on this page.
+        // Only trusted for requests to a learned search URL (stored template or
+        // the site's own search form): the same item markup also appears on
+        // category and listing pages, so for a guessed URL this signal alone
+        // must not verify the page.
+        val containerSelectors = listOfNotNull(
+            config?.resultSelector,
+            analysis?.resultContainerSelector, analysis?.resultItemSelector
+        ).filter { it.isNotBlank() }
+        val hasContainer = containerSelectors.any { selector ->
+            runCatching { document.select(selector).isNotEmpty() }.getOrDefault(false)
+        }
+        if (hasContainer && trustedRequest) return true
+
+        // 5. Page title announces results for this query.
+        val title = runCatching { document.title().lowercase() }.getOrDefault("")
+        if (terms.isNotEmpty() && terms.any { title.contains(it) } &&
+            (title.contains("search") || title.contains("result"))
+        ) return true
+
+        return false
+    }
+
+    /**
+     * Results from a verified search page are kept whole, in site order: the
+     * site's own ranking decides relevance there. Results from an unverified
+     * page are only kept when they actually match the query, so generic page
+     * links can never leak in as "random results".
+     */
+    private fun gateResultsForPage(
+        extracted: List<SearchResult>,
+        query: String,
+        verified: Boolean
+    ): List<SearchResult> {
+        if (verified) return extracted
+        val queryLower = query.trim().lowercase()
+        return extracted.filter { result ->
+            matchesQueryEnhanced(result, query) ||
+                (queryLower.length >= 2 &&
+                    "${result.title} ${result.url}".lowercase().contains(queryLower))
+        }
+    }
+
+    private fun isNoResultsPage(document: Document): Boolean {
+        val text = runCatching { document.body().text().lowercase() }.getOrDefault("")
+        if (text.isBlank()) return false
+        return listOf(
+            "no results found", "no result found", "no matches found",
+            "no items found", "nothing found for", "no search results",
+            "0 results for", "we couldn't find", "we could not find"
+        ).any { text.contains(it) }
+    }
+
+    /**
+     * Find the provider page's real next-page URL: an explicit next link first,
+     * then a numbered pagination link for exactly the following page. Returns
+     * null when the page offers no next page, so Load More can honestly stop.
+     */
+    private fun discoverNextPageUrl(outcome: FetchOutcome, currentPage: Int): String? {
+        val document = outcome.document
+        val currentUrl = outcome.finalUrl
+        fun usable(raw: String?): String? {
+            val href = raw?.trim().orEmpty()
+            if (href.isBlank() || href.startsWith("#") || href.startsWith("javascript:", true)) return null
+            val absolute = runCatching { normalizeUrl(href, currentUrl) }.getOrNull() ?: return null
+            return absolute.takeIf { it.startsWith("http") && it != currentUrl }
+        }
+
+        val explicitNext = runCatching {
+            document.select(
+                "a[rel~=next], a.next, .next a, .pagination .next a, " +
+                    "a[aria-label*=Next i], [class*=pagination] a:contains(Next), .pagination a:contains(›), .pagination a:contains(»)"
+            ).firstNotNullOfOrNull { usable(it.attr("href")) }
+        }.getOrNull()
+        if (explicitNext != null) return explicitNext
+
+        val links = runCatching {
+            smartNavigationEngine.getPaginationLinks(document, currentUrl)
+        }.getOrDefault(emptyList())
+        fun pageNumberOf(url: String): Int? {
+            Regex("[?&](?:page|paged|p)=(\\d+)").find(url)?.let { return it.groupValues[1].toIntOrNull() }
+            Regex("/page/(\\d+)").find(url)?.let { return it.groupValues[1].toIntOrNull() }
+            return null
+        }
+        return links.firstOrNull { it != currentUrl && pageNumberOf(it) == currentPage + 1 }
     }
 
     /**
@@ -426,7 +766,12 @@ class ScrapingEngine @Inject constructor(
         return target == norm(provider.baseUrl) || target == norm(provider.url)
     }
 
-    private fun buildSearchCandidates(
+    /**
+     * The search URLs actually learned from this provider: the stored template
+     * and the URL built from the site's own search form. These are the only
+     * candidates whose identity as search URLs is known rather than guessed.
+     */
+    private fun buildLearnedSearchUrls(
         provider: Provider,
         query: String,
         pageOffset: Int,
@@ -436,7 +781,7 @@ class ScrapingEngine @Inject constructor(
         val encoded = URLEncoder.encode(query, "UTF-8")
         val page = pageOffset + 1
         val base = provider.baseUrl.trimEnd('/')
-        val candidates = linkedSetOf<String>()
+        val learned = linkedSetOf<String>()
 
         // 1. The search URL learned from the site's own search form (most faithful).
         config?.searchUrlTemplate
@@ -450,7 +795,7 @@ class ScrapingEngine @Inject constructor(
             ?.replace("{query}", encoded)
             ?.replace("{page}", page.toString())
             ?.takeIf { it.startsWith("http") }
-            ?.let(candidates::add)
+            ?.let(learned::add)
 
         // 2. A URL built from the search form in the analyzed HTML.
         analysis?.rawHtml
@@ -460,9 +805,25 @@ class ScrapingEngine @Inject constructor(
             ?.let { form -> smartNavigationEngine.buildSearchUrlFromForm(base, form, query) }
             ?.let { if (page > 1) "$it&page=$page" else it }
             ?.takeIf { it.startsWith("http") }
-            ?.let(candidates::add)
+            ?.let(learned::add)
 
-        // 3. Common search URL shapes. The homepage is never a candidate: its links
+        return learned.toList()
+    }
+
+    private fun buildSearchCandidates(
+        provider: Provider,
+        query: String,
+        pageOffset: Int,
+        config: ScrapingConfig?,
+        analysis: SiteAnalysis?
+    ): List<String> {
+        val encoded = URLEncoder.encode(query, "UTF-8")
+        val page = pageOffset + 1
+        val base = provider.baseUrl.trimEnd('/')
+        val candidates = linkedSetOf<String>()
+        candidates += buildLearnedSearchUrls(provider, query, pageOffset, config, analysis)
+
+        // Common search URL shapes. The homepage is never a candidate: its links
         // are not search results and used to crowd out the real ones.
         val pageSuffix = if (page > 1) "&page=$page" else ""
         candidates += "$base/search?q=$encoded$pageSuffix"
@@ -531,9 +892,92 @@ class ScrapingEngine @Inject constructor(
             }.getOrNull()
         }
 
+        // Prefer the response that stayed on the requested search URL. Picking
+        // purely by body size let a fat landing/category page from one transport
+        // beat the lean true search-results page from the other.
+        fun stayedOnSearchPage(outcome: FetchOutcome): Boolean {
+            fun pathOf(u: String) = u.substringBefore('?').substringBefore('#')
+                .removePrefix("https://").removePrefix("http://")
+                .substringAfter('/', "").lowercase()
+            return outcome.finalUrl == url || pathOf(outcome.finalUrl) == pathOf(url)
+        }
         listOf(native.await(), standard.await())
             .filterNotNull()
-            .maxWithOrNull(compareBy<FetchOutcome> { it.body.length }.thenBy { it.transport == "native-tls" })
+            .maxWithOrNull(
+                compareBy<FetchOutcome> { stayedOnSearchPage(it) }
+                    .thenBy { it.body.length }
+                    .thenBy { it.transport == "native-tls" }
+            )
+    }
+
+    /**
+     * Submit a POST search exactly as the site's own form would: same action
+     * URL, same fields, form-encoded body. Native TLS transport first-class,
+     * Jsoup as the parallel fallback, same winner rules as the GET path.
+     */
+    private suspend fun fetchPostOutcome(url: String, formBody: String, config: ScrapingConfig?): FetchOutcome? = supervisorScope {
+        val timeout = minOf(config?.timeout ?: DEFAULT_TIMEOUT, FAST_CANDIDATE_TIMEOUT_MS.toInt())
+        val headers = mapOf(
+            "User-Agent" to (config?.userAgent ?: EngineUtils.DEFAULT_USER_AGENT),
+            "Accept" to "text/html,application/xhtml+xml,application/json;q=0.9,*/*;q=0.8",
+            "Accept-Language" to "en-US,en;q=0.9",
+            "Content-Type" to "application/x-www-form-urlencoded",
+            "Cache-Control" to "no-cache, no-store"
+        )
+        val native = async(Dispatchers.IO) {
+            if (!TlsClient.isAvailable) return@async null
+            val response = TlsClient.execute(
+                TlsRequest(
+                    url = url,
+                    method = "POST",
+                    headers = headers,
+                    body = formBody,
+                    clientProfile = TlsClient.DEFAULT_PROFILE,
+                    timeoutMs = timeout
+                )
+            )
+            response.body.takeIf {
+                response.error.isNullOrBlank() &&
+                    response.statusCode in 200..399 &&
+                    isUsableBody(it)
+            }?.let { body ->
+                val finalUrl = response.finalUrl.ifBlank { url }
+                FetchOutcome(
+                    document = Jsoup.parse(body, finalUrl),
+                    body = body,
+                    finalUrl = finalUrl,
+                    statusCode = response.statusCode,
+                    transport = "native-tls-post"
+                )
+            }
+        }
+        val standard = async(Dispatchers.IO) {
+            runCatching {
+                val response = Jsoup.connect(url)
+                    .headers(headers)
+                    .timeout(timeout)
+                    .followRedirects(true)
+                    .ignoreContentType(true)
+                    .ignoreHttpErrors(true)
+                    .requestBody(formBody)
+                    .method(org.jsoup.Connection.Method.POST)
+                    .maxBodySize(8 * 1024 * 1024)
+                    .execute()
+                val body = response.body()
+                if (response.statusCode() !in 200..399 || !isUsableBody(body)) return@runCatching null
+                val finalUrl = response.url().toString()
+                FetchOutcome(
+                    document = Jsoup.parse(body, finalUrl),
+                    body = body,
+                    finalUrl = finalUrl,
+                    statusCode = response.statusCode(),
+                    transport = "jsoup-post"
+                )
+            }.getOrNull()
+        }
+        listOf(native.await(), standard.await())
+            .filterNotNull()
+            .maxWithOrNull(compareBy<FetchOutcome> { it.body.length }.thenBy { it.transport == "native-tls-post" })
     }
 
     private fun isUsableBody(body: String): Boolean {

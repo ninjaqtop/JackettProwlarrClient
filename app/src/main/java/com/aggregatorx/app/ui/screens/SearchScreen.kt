@@ -830,6 +830,7 @@ fun ResultsFeed(
                     resultCount  = pr.results.size,
                     currentPage  = currentPage,
                     totalPages   = totalPages,
+                    hasMore      = pr.hasMore,
                     isLoading    = providerId in loadingProviderIds,
                     onPrev       = { onPrevPage(providerId) },
                     onNext       = { onNextPage(providerId) },
@@ -850,8 +851,12 @@ fun ResultsFeed(
 
             item(key = "more_$providerId") {
                 ProviderLoadMoreFooter(
-                    canLoadMore = pr.hasMore || pr.results.size >= PAGE_SIZE,
-                    isEnd = !pr.hasMore && pr.results.size < PAGE_SIZE,
+                    // hasMore now carries the engine's real knowledge (a next-page
+                    // link was found, or the page came back full). The old
+                    // "or 50+ results loaded" condition resurrected the button
+                    // forever after a provider was actually exhausted.
+                    canLoadMore = pr.hasMore,
+                    isEnd = !pr.hasMore,
                     isLoading = providerId in loadingProviderIds,
                     onLoadMore = { onNextPage(providerId) }
                 )
@@ -976,11 +981,16 @@ fun ProviderSectionHeader(
     resultCount: Int,
     currentPage: Int,
     totalPages: Int,
+    hasMore: Boolean = false,
     isLoading: Boolean,
     onPrev: () -> Unit,
     onNext: () -> Unit,
     onRefresh: () -> Unit
 ) {
+    // Next must also work when the following page lives on the provider's site
+    // and has not been loaded yet — previously it was disabled unless enough
+    // results were already in memory, so real site pagination looked broken.
+    val canGoNext = currentPage < totalPages - 1 || hasMore
     Row(
         modifier = Modifier
             .fillMaxWidth()
@@ -1019,20 +1029,21 @@ fun ProviderSectionHeader(
                     tint = if (currentPage > 0) NeonGreen else TextMuted,
                     modifier = Modifier.size(16.dp))
             }
-            // Page indicator
+            // Page indicator ("+" = more pages exist on the provider's site
+            // and will be loaded when you page forward)
             Text(
-                "${currentPage + 1}/$totalPages",
+                "${currentPage + 1}/$totalPages${if (hasMore && currentPage >= totalPages - 1) "+" else ""}",
                 color = TextSecondary, fontSize = 10.sp,
                 modifier = Modifier.padding(horizontal = 2.dp)
             )
             // Next
             IconButton(
                 onClick = onNext,
-                enabled = currentPage < totalPages - 1,
+                enabled = canGoNext,
                 modifier = Modifier.size(28.dp)
             ) {
                 Icon(Icons.Default.ChevronRight, ">",
-                    tint = if (currentPage < totalPages - 1) NeonGreen else TextMuted,
+                    tint = if (canGoNext) NeonGreen else TextMuted,
                     modifier = Modifier.size(16.dp))
             }
         }
