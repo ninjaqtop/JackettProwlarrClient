@@ -44,10 +44,12 @@ object SearchResultFilter {
             hasQueryAffinity(result, query, processed)
         }
 
-        val selected = relevant.ifEmpty { structurallyValid }
-        return selected
-            .sortedByDescending { it.relevanceScore }
-            .take(limit)
+        // Never fall back to showing every structurally valid link when nothing
+        // matches the query. That fallback is what surfaced homepage, trending
+        // and recommendation links as "random results" for an unrelated search.
+        // If nothing on the page is relevant, the honest answer is no results.
+        // Preserve the provider page's own order; do not re-sort by our score.
+        return relevant.take(limit)
     }
 
     fun hasQueryAffinity(
@@ -87,9 +89,10 @@ object SearchResultFilter {
 
         if (semanticScore) return true
 
-        // Best-effort fallback: preserve structured content links even when the query
-        // wording is only loosely related, which prevents providers from being marked failed.
-        return result.relevanceScore >= 8f || result.url.contains(query.replace(Regex("\\s+"), ""), ignoreCase = true)
+        // No permissive fallback here. A generic internal relevance score must not
+        // mark an unrelated link as matching the user's query; a provider that
+        // genuinely has no matching results should report Empty, not random links.
+        return false
     }
 
     private fun similarityScore(title: String, description: String, query: String, concepts: List<String>): Float {

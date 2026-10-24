@@ -5,6 +5,7 @@ import androidx.lifecycle.viewModelScope
 import com.aggregatorx.app.data.model.*
 import com.aggregatorx.app.data.repository.AggregatorRepository
 import com.aggregatorx.app.engine.media.*
+import com.aggregatorx.app.engine.ml.ProviderPageFetch
 import com.aggregatorx.app.engine.ml.ProviderPaginationManager
 import com.aggregatorx.app.engine.ml.ResultNormalizer
 import com.aggregatorx.app.engine.token.TokenManager
@@ -88,11 +89,26 @@ class SearchViewModel @Inject constructor(
 
     init {
         ProviderPaginationManager.configure { providerId, query, state ->
-            val providerResult = repository.searchProviderPage(providerId, query, state.page - 1)
-            if (providerResult == null) {
-                emptyList()
+            // Prefer the provider site's own next-page URL, discovered on the
+            // previous page. Only fall back to a page-number request when the
+            // site did not expose a next link.
+            val providerResult = if (!state.nextPageUrl.isNullOrBlank()) {
+                repository.searchProviderPageByUrl(providerId, query, state.nextPageUrl)
             } else {
-                ResultNormalizer.normalize(providerResult.provider.id, providerResult.provider.baseUrl, providerResult.results)
+                repository.searchProviderPage(providerId, query, state.page - 1)
+            }
+            if (providerResult == null) {
+                null
+            } else {
+                ProviderPageFetch(
+                    results = ResultNormalizer.normalize(
+                        providerResult.provider.id,
+                        providerResult.provider.baseUrl,
+                        providerResult.results
+                    ),
+                    hasMore = providerResult.hasMore,
+                    nextPageUrl = providerResult.nextPageUrl
+                )
             }
         }
         viewModelScope.launch {
@@ -167,7 +183,11 @@ class SearchViewModel @Inject constructor(
                     .collect { providerResult ->
                         try {
                             val normalizedResults = safeNormalize(providerResult)
-                            ProviderPaginationManager.markFetched(providerResult.provider.id, normalizedResults.size)
+                            ProviderPaginationManager.markFetched(
+                                providerResult.provider.id, normalizedResults.size,
+                                hasMore = providerResult.hasMore,
+                                nextPageUrl = providerResult.nextPageUrl
+                            )
                             val terminalStatus = when {
                                 normalizedResults.isNotEmpty() -> ProviderSearchStatus.RESULTS
                                 providerResult.status == ProviderSearchStatus.TIMED_OUT -> ProviderSearchStatus.TIMED_OUT
@@ -187,7 +207,7 @@ class SearchViewModel @Inject constructor(
                             upsertProviderResult(currentResults, normalizedProviderResult)
                             _providerResults.value = currentResults.toList()
                             updateSearchStats(currentResults)
-                            if (terminalStatus == ProviderSearchStatus.RESULTS && normalizedResults.size < PROVIDER_PAGE_SIZE) {
+                            if (terminalStatus == ProviderSearchStatus.RESULTS && normalizedResults.size < PROVIDER_PAGE_SIZE && providerResult.hasMore) {
                                 scheduleAutoFill(providerResult.provider.id, query)
                             }
                         } catch (e: CancellationException) {
@@ -283,23 +303,31 @@ class SearchViewModel @Inject constructor(
                 try {
                     ProviderPaginationManager.fetchMoreResults(providerId, query).collect { fetched ->
                         val existingIndex = _providerResults.value.indexOfFirst { it.provider.id == providerId }
-                        if (existingIndex >= 0 && fetched.isNotEmpty()) {
+                        if (existingIndex >= 0) {
                             val next = _providerResults.value.toMutableList()
                             val existing = next[existingIndex]
-                            val unique = fetched.filter { sessionSeenUrls.add(it.url) }
+                            val unique = fetched.results.filter { sessionSeenUrls.add(it.url) }
+                            val combined = (existing.results + unique).distinctBy { it.url }
                             next[existingIndex] = existing.copy(
-                                results = (existing.results + unique).distinctBy { it.url },
-                                totalResults = existing.results.size + unique.size,
-                                hasMore = unique.isNotEmpty()
+                                results = combined,
+                                totalResults = combined.size,
+                                // More pages exist only if the engine said so AND
+                                // this fetch actually added something new. A page of
+                                // pure duplicates means the site is repeating itself:
+                                // stop instead of looping forever.
+                                hasMore = fetched.hasMore && unique.isNotEmpty(),
+                                nextPageUrl = fetched.nextPageUrl
                             )
                             _providerResults.value = next
-                        } else if (existingIndex >= 0) {
-                            val next = _providerResults.value.toMutableList()
-                            next[existingIndex] = next[existingIndex].copy(hasMore = false)
-                            _providerResults.value = next
+                            // Advance the visible page only when there is now a
+                            // full page beyond the current one to show. The old
+                            // code advanced unconditionally, landing the user on
+                            // an empty page when the fetch came back empty.
+                            if (combined.size > (current + 1) * PROVIDER_PAGE_SIZE) {
+                                _providerPages.update { it + (providerId to current + 1) }
+                            }
                         }
                     }
-                    _providerPages.update { it + (providerId to current + 1) }
                 } catch (e: CancellationException) {
                     throw e
                 } catch (e: Throwable) {
@@ -335,7 +363,11 @@ class SearchViewModel @Inject constructor(
             try {
                 repository.searchProviderPage(providerId, query, 0)?.let { providerResult ->
                     val normalized = safeNormalize(providerResult)
-                    ProviderPaginationManager.markFetched(providerId, normalized.size)
+                    ProviderPaginationManager.markFetched(
+                        providerId, normalized.size,
+                        hasMore = providerResult.hasMore,
+                        nextPageUrl = providerResult.nextPageUrl
+                    )
                     val status = when {
                         normalized.isNotEmpty() -> ProviderSearchStatus.RESULTS
                         providerResult.status == ProviderSearchStatus.TIMED_OUT -> ProviderSearchStatus.TIMED_OUT
@@ -423,7 +455,7 @@ class SearchViewModel @Inject constructor(
                         if (currentProvider.results.size >= PROVIDER_PAGE_SIZE || !currentProvider.hasMore) return@repeat
 
                         val fetched = ProviderPaginationManager.fetchMoreResults(providerId, query).first()
-                        val unique = fetched.filter { newResult ->
+                        val unique = fetched.results.filter { newResult ->
                             currentProvider.results.none { it.url == newResult.url }
                         }
                         if (unique.isEmpty()) {
@@ -444,7 +476,8 @@ class SearchViewModel @Inject constructor(
                                         totalResults = combined.size,
                                         success = true,
                                         status = ProviderSearchStatus.RESULTS,
-                                        hasMore = unique.isNotEmpty()
+                                        hasMore = fetched.hasMore,
+                                        nextPageUrl = fetched.nextPageUrl
                                     )
                                 } else result
                             }

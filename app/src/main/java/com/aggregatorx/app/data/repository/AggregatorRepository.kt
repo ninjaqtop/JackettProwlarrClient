@@ -157,6 +157,12 @@ class AggregatorRepository @Inject constructor(
         val provider = providerDao.getProviderById(providerId) ?: return null
         return scrapingEngine.searchProviderSmart(provider, query, pageOffset)
     }
+
+    /** Fetch the provider's real next page by the exact URL its own site linked to. */
+    suspend fun searchProviderPageByUrl(providerId: String, query: String, pageUrl: String): ProviderSearchResults? {
+        val provider = providerDao.getProviderById(providerId) ?: return null
+        return scrapingEngine.searchProviderPageByUrl(provider, query, pageUrl)
+    }
     
     suspend fun aggregateSearchResults(
         query: String,
@@ -200,24 +206,49 @@ class AggregatorRepository @Inject constructor(
     }
     
     // Helper methods
+    private data class SearchRouteParts(
+        val searchUrlTemplate: String,
+        val postData: String? = null
+    )
+
     private suspend fun generateScrapingConfig(provider: Provider, analysis: SiteAnalysis) {
-        val searchUrlTemplate = buildSearchUrlTemplate(provider.baseUrl, analysis)
+        val route = buildSearchUrlTemplate(provider.baseUrl, analysis)
         val config = ScrapingConfig(
             providerId = provider.id,
-            searchUrlTemplate = searchUrlTemplate,
+            searchUrlTemplate = route.searchUrlTemplate,
             resultSelector = analysis.resultItemSelector ?: ".item, .result, article",
             titleSelector = analysis.titleSelector ?: "h2, .title, a",
             urlSelector = "a[href]",
             descriptionSelector = analysis.descriptionSelector,
             thumbnailSelector = analysis.thumbnailSelector,
             dateSelector = analysis.dateSelector,
-            ratingSelector = analysis.ratingSelector
+            ratingSelector = analysis.ratingSelector,
+            // Previously dropped on the floor: the analyzer's pagination and
+            // session knowledge is part of the site's own search behaviour.
+            nextPageSelector = analysis.paginationSelector,
+            postData = route.postData,
+            cookies = analysis.cookies.takeIf { it.trim().startsWith("{") } ?: "{}"
         )
         scrapingConfigDao.deleteConfigForProvider(provider.id)
         scrapingConfigDao.insertConfig(config)
     }
-    
-    private fun buildSearchUrlTemplate(baseUrl: String, analysis: SiteAnalysis): String {
+
+    /**
+     * Work out the search route the site itself uses and save THAT — never a
+     * blind guess when the site's own form can be read.
+     *
+     * 1. If the analyzed page has a search form, the route is built from the
+     *    form itself: its real action URL, its real query parameter name, and
+     *    any fixed hidden fields it submits. POST forms are saved as a POST
+     *    route (action + body template) instead of being silently replaced
+     *    with a GET guess.
+     * 2. Only when no form exists do we fall back to common URL shapes, and
+     *    each shape is PROBED with a live request during analysis. The first
+     *    shape that demonstrably behaves like that site's search page is the
+     *    one saved. If nothing probes clean, the first shape is saved as a
+     *    best effort and search-time verification still protects the user.
+     */
+    private suspend fun buildSearchUrlTemplate(baseUrl: String, analysis: SiteAnalysis): SearchRouteParts {
         val analyzedDocument = analysis.rawHtml
             ?.takeIf { it.isNotBlank() }
             ?.let { runCatching { Jsoup.parse(it, analysis.url) }.getOrNull() }
@@ -231,7 +262,7 @@ class AggregatorRepository @Inject constructor(
                 )
         }
 
-        if (form != null && !form.attr("method").equals("post", ignoreCase = true)) {
+        if (form != null) {
             val action = form.absUrl("action").ifBlank { analysis.url.ifBlank { baseUrl } }
             val queryInput = form.select(
                 "input[type=search], input[name=q], input[name=query], input[name=search], " +
@@ -248,8 +279,23 @@ class AggregatorRepository @Inject constructor(
                     "${URLEncoder.encode(input.attr("name"), "UTF-8")}" +
                         "=${URLEncoder.encode(input.attr("value"), "UTF-8")}"
                 }
+
+            if (form.attr("method").equals("post", ignoreCase = true)) {
+                // The site's search is a POST. Save the real action and a body
+                // template so search submits exactly what the form submits.
+                val body = buildString {
+                    if (fixedFields.isNotBlank()) {
+                        append(fixedFields)
+                        append('&')
+                    }
+                    append(URLEncoder.encode(queryName, "UTF-8"))
+                    append("={query}")
+                }
+                return SearchRouteParts(searchUrlTemplate = action, postData = body)
+            }
+
             val separator = if (action.contains('?')) "&" else "?"
-            return buildString {
+            val template = buildString {
                 append(action)
                 append(separator)
                 if (fixedFields.isNotBlank()) {
@@ -259,11 +305,89 @@ class AggregatorRepository @Inject constructor(
                 append(URLEncoder.encode(queryName, "UTF-8"))
                 append("={query}&page={page}")
             }
+            return SearchRouteParts(searchUrlTemplate = template)
         }
 
-        return "$baseUrl/search?q={query}&page={page}"
+        // No form found: probe the common shapes and save the first one that
+        // actually behaves like this site's search page.
+        val base = baseUrl.trimEnd('/')
+        val shapes = listOf(
+            "$base/search?q={query}&page={page}",
+            "$base/?s={query}&paged={page}",
+            "$base/search?query={query}&page={page}",
+            "$base/?q={query}&page={page}",
+            "$base/find?q={query}&page={page}",
+            "$base/search/{query}"
+        )
+        val probeTerm = probeTermFor(analysis, analyzedDocument)
+        for (shape in shapes) {
+            if (probeSearchRoute(shape, probeTerm, base, analysis)) {
+                return SearchRouteParts(searchUrlTemplate = shape)
+            }
+        }
+        return SearchRouteParts(searchUrlTemplate = shapes.first())
     }
-    
+
+    /** A neutral word from the site's own page, used only to probe routes at analysis time. */
+    private fun probeTermFor(analysis: SiteAnalysis, document: org.jsoup.nodes.Document?): String {
+        val title = document?.title().orEmpty()
+        return title.lowercase().split(Regex("[^a-z0-9]+"))
+            .firstOrNull { it.length >= 4 && it !in setOf("http", "https", "www", "com", "home", "page") }
+            ?: "search"
+    }
+
+    /**
+     * Fetch a candidate search URL once, with a probe term, and decide whether
+     * it behaves like a real search page for this site: successful status, did
+     * not dump us on the homepage, and either kept the probe in the final URL,
+     * echoes it in the page's search box/title, or shows the learned result
+     * structure. Any failure simply means "not this site's route".
+     */
+    private suspend fun probeSearchRoute(
+        template: String,
+        probeTerm: String,
+        baseUrl: String,
+        analysis: SiteAnalysis
+    ): Boolean {
+        val encoded = URLEncoder.encode(probeTerm, "UTF-8")
+        val url = template
+            .replace("{query}", encoded)
+            .replace("{page}", "1")
+            .replace("{baseUrl}", baseUrl)
+        return runCatching {
+            kotlinx.coroutines.withTimeoutOrNull(6_000L) {
+                val response = Jsoup.connect(url)
+                    .userAgent(com.aggregatorx.app.engine.util.EngineUtils.DEFAULT_USER_AGENT)
+                    .timeout(6_000)
+                    .followRedirects(true)
+                    .ignoreContentType(true)
+                    .ignoreHttpErrors(true)
+                    .execute()
+                if (response.statusCode() !in 200..399) return@withTimeoutOrNull false
+                val finalUrl = response.url().toString()
+                fun norm(u: String) = u.substringBefore('#').trimEnd('/').lowercase()
+                    .removePrefix("https://").removePrefix("http://").removePrefix("www.")
+                if (norm(finalUrl) == norm(baseUrl) || norm(finalUrl) == norm(analysis.url)) {
+                    return@withTimeoutOrNull false
+                }
+                val decoded = runCatching {
+                    java.net.URLDecoder.decode(finalUrl, "UTF-8")
+                }.getOrDefault(finalUrl).lowercase()
+                if (decoded.contains(probeTerm)) return@withTimeoutOrNull true
+                val doc = response.parse()
+                val inputEcho = doc.select("input[type=search], input[name*=q], input[name*=query], input[name*=search]")
+                    .any { it.attr("value").trim().equals(probeTerm, ignoreCase = true) }
+                if (inputEcho) return@withTimeoutOrNull true
+                if (doc.title().lowercase().contains(probeTerm)) return@withTimeoutOrNull true
+                val selectors = listOfNotNull(analysis.resultContainerSelector, analysis.resultItemSelector)
+                    .filter { it.isNotBlank() }
+                selectors.any { selector ->
+                    runCatching { doc.select(selector).isNotEmpty() }.getOrDefault(false)
+                }
+            } ?: false
+        }.getOrDefault(false)
+    }
+
     private fun normalizeUrl(url: String): String {
         var normalized = url.trim()
         if (!normalized.startsWith("http://") && !normalized.startsWith("https://")) {
