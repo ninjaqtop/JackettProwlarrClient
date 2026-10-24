@@ -3,6 +3,7 @@ package com.aggregatorx.app.data.repository
 import com.aggregatorx.app.data.database.*
 import com.aggregatorx.app.data.model.*
 import com.aggregatorx.app.engine.analyzer.SiteAnalyzerEngine
+import com.aggregatorx.app.engine.analyzer.SiteMapEngine
 import com.aggregatorx.app.engine.nlp.NaturalLanguageQueryProcessor
 import com.aggregatorx.app.engine.ranking.RankingEngine
 import com.aggregatorx.app.engine.scraper.ScrapingEngine
@@ -26,6 +27,7 @@ class AggregatorRepository @Inject constructor(
     private val likedResultDao: LikedResultDao,
     private val learnedProfileDao: LearnedProfileDao,
     private val siteAnalyzerEngine: SiteAnalyzerEngine,
+    private val siteMapEngine: SiteMapEngine,
     private val scrapingEngine: ScrapingEngine,
     private val rankingEngine: RankingEngine,
     private val nlpProcessor: NaturalLanguageQueryProcessor
@@ -308,10 +310,17 @@ class AggregatorRepository @Inject constructor(
             return SearchRouteParts(searchUrlTemplate = template)
         }
 
-        // No form found: probe the common shapes and save the first one that
-        // actually behaves like this site's search page.
+        // No form found. Before guessing any URL shape, MAP the site: the
+        // SiteMapEngine reads the site's own robots.txt, sitemaps, homepage
+        // links and discovered API/CMS endpoints, and derives the search
+        // routes the site itself uses. Mapped routes are probed first;
+        // generic shapes are only a last resort.
         val base = baseUrl.trimEnd('/')
-        val shapes = listOf(
+        val siteMap = kotlinx.coroutines.withTimeoutOrNull(25_000L) {
+            runCatching { siteMapEngine.mapSite(base, analysis.rawHtml) }.getOrNull()
+        }
+        val mappedTemplates = siteMap?.searchUrlTemplates.orEmpty()
+        val shapes = mappedTemplates + listOf(
             "$base/search?q={query}&page={page}",
             "$base/?s={query}&paged={page}",
             "$base/search?query={query}&page={page}",
@@ -325,6 +334,7 @@ class AggregatorRepository @Inject constructor(
                 return SearchRouteParts(searchUrlTemplate = shape)
             }
         }
+        // Nothing probed clean: prefer a mapped (real) route over a guess.
         return SearchRouteParts(searchUrlTemplate = shapes.first())
     }
 
