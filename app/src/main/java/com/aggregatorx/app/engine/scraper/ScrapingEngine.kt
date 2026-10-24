@@ -663,7 +663,7 @@ class ScrapingEngine @Inject constructor(
         // category and listing pages, so for a guessed URL this signal alone
         // must not verify the page.
         val containerSelectors = listOfNotNull(
-            config?.resultContainerSelector, config?.resultItemSelector,
+            config?.resultSelector,
             analysis?.resultContainerSelector, analysis?.resultItemSelector
         ).filter { it.isNotBlank() }
         val hasContainer = containerSelectors.any { selector ->
