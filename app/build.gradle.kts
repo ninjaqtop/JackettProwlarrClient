@@ -152,3 +152,9 @@ dependencies {
 kapt {
     correctErrorTypes = true
 }
+
+// Room writes the generated schema JSON here; CI checks the v3->v4 migration's
+// CREATE statement against it (scripts/room_schema_check.py).
+ksp {
+    arg("room.schemaLocation", "$projectDir/schemas")
+}
