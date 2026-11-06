@@ -122,6 +122,115 @@ class SiteAnalyzerEngine @Inject constructor(
             "Upgrade-Insecure-Requests" to "1",
             "Cache-Control" to "no-cache"
         )
+
+        // Pre-compiled patterns / constant selector lists. These were previously
+        // rebuilt on every call of the functions below; Regex instances and lists
+        // are immutable and only ever read, so sharing one instance is equivalent.
+        private val REST_API_PATTERNS = listOf(
+            Regex("""(?:fetch|axios\.get|axios\.post|http\.get|http\.post)\s*\(\s*['"`](\/api\/[^'"`\s\)]+)['"`]""", RegexOption.IGNORE_CASE),
+            Regex("""(?:\$\.ajax|XMLHttpRequest)[^'"]*url['":\s]+['"`](\/[^'"`\s,\)]+)['"`]""", RegexOption.IGNORE_CASE),
+            Regex("""url\s*:\s*['"`](\/api\/[^'"`\s,\)]+)['"`]""", RegexOption.IGNORE_CASE),
+            Regex("""['"`](\/api\/v\d+\/[^'"`\s]+)['"`]"""),
+            Regex("""['"`](\/rest\/[^'"`\s]+)['"`]"""),
+            Regex("""['"`](\/wp-json\/[^'"`\s]+)['"`]"""),  // WordPress REST
+            Regex("""['"`](\/ghost\/api\/[^'"`\s]+)['"`]"""),  // Ghost CMS
+            Regex("""['"`](\/admin\/api\/[^'"`\s]+)['"`]"""),
+            Regex("""['"`](\/content\/api\/[^'"`\s]+)['"`]"""),
+            Regex("""['"`](\/cms\/api\/[^'"`\s]+)['"`]""")
+        )
+        private val GRAPHQL_ENDPOINT_PATTERNS = listOf(
+            Regex("""['"`](\/graphql[^'"`\s]*)['"`]"""),
+            Regex("""['"](https?:\/\/[^'"`\s]+\/graphql[^'"`\s]*)['"]""")
+        )
+        private val GRAPHQL_URI_PATTERN = Regex("""uri\s*:\s*['"`]([^'"`\s]+)['"`]""")
+        private val WEBSOCKET_PATTERN = Regex("""new WebSocket\s*\(\s*['"`](wss?:\/\/[^'"`\s]+)['"`]""")
+        private val STRAPI_API_PATTERN = Regex("""['"`](\/api\/[a-z-]+(?:\?[^'"`\s]*)?)['"`]""")
+        private val DIRECTUS_API_PATTERN = Regex("""['"`](\/items\/[^'"`\s]+)['"`]""")
+        private val JSON_ENDPOINT_PATTERNS = listOf(
+            Regex("""['"`](https?:\/\/[^'"`\s]+\.json[^'"`\s]*)['"`]"""),
+            Regex("""['"`](\/[^'"`\s]+\.json[^'"`\s]*)['"`]"""),
+            Regex("""data-src=['"`](https?:\/\/[^'"`\s]+)['"`]""")
+        )
+        private val DATA_ENDPOINT_ATTRIBUTES = listOf("data-api", "data-url", "data-endpoint", "data-src-url", "data-ajax-url")
+        private val GRAPHQL_INDICATORS = listOf("graphql", "gql`", " query {", " mutation {", " subscription {", "ApolloClient", "urql")
+
+        private val JS_REQUIREMENT_INDICATORS = listOf(
+            // Angular (2+)
+            "ng-app", "ng-version", "[_nghost", "[_ngcontent",
+            // Next.js / React
+            "__NEXT_DATA__", "/_next/static", "data-reactroot", "__react",
+            // Nuxt.js / Vue
+            "__NUXT__", "/_nuxt/", "data-v-", "__vue_",
+            // SvelteKit
+            "__sveltekit", "sveltekit", "svelte-",
+            // Astro
+            "astro-island", "astro:load", "/@astro/",
+            // Remix
+            "__remixContext", "/__remix-",
+            // SolidJS
+            "solid-js", "window._solid",
+            // Gatsby
+            "___gatsby", "gatsby-runtime",
+            // Qwik
+            "qwik-", "q:base",
+            // Generic SSR/SPA injection
+            "window.__INITIAL_STATE__", "window.__PRELOADED_STATE__",
+            "window.__APP_STATE__", "window.__SERVER_DATA__",
+            // JSON embedded state blobs
+            "application/json\">{",
+            // CloudFlare JS challenge
+            "cf-chl-bypass", "__cf_chl_"
+        )
+
+        private val LOGIN_INDICATOR_SELECTORS = listOf(
+            "form[action*='login']", "form#login", ".login-form",
+            "input[name='password']", "input[type='password']",
+            ".auth-required", "#login-required"
+        )
+
+        private val POPUP_SELECTORS = listOf(
+            ".popup, .modal, .overlay, .ad, .banner, .cookie, .notification, .interstitial",
+            "[class*='popup']", "[class*='modal']", "[class*='overlay']", "[class*='ad']",
+            "[id*='popup']", "[id*='modal']", "[id*='overlay']", "[id*='ad']"
+        )
+        private val CLOSE_BUTTON_SELECTORS = listOf(
+            ".close, .dismiss, .exit, .btn-close, .close-btn, .close-button, .modal-close, .popup-close",
+            "button[aria-label='Close']", "button[aria-label='Dismiss']", "[data-dismiss]", "[data-close]"
+        )
+
+        private val MEDIA_THUMBNAIL_SELECTORS = listOf(
+            ".thumbnail img", ".thumb img", "img.thumbnail",
+            ".poster", "img.poster", "[data-poster]"
+        )
+        private val MAIN_CONTENT_SELECTORS = listOf(
+            "main", "#main", ".main", "#content", ".content",
+            "article", ".articles", "#articles", ".container"
+        )
+        private val TITLE_SELECTOR_CANDIDATES = listOf(
+            "h1", "h2.title", ".title", "#title", "[class*='title']",
+            ".name", ".item-title", ".video-title", ".movie-title"
+        )
+        private val DESCRIPTION_SELECTOR_CANDIDATES = listOf(
+            ".description", "#description", ".desc", ".synopsis",
+            ".summary", "[class*='description']", "p.info"
+        )
+        private val DATE_SELECTOR_CANDIDATES = listOf(
+            ".date", ".time", ".timestamp", "[datetime]",
+            ".posted", ".published", "[class*='date']"
+        )
+        private val RATING_SELECTOR_CANDIDATES = listOf(
+            ".rating", ".stars", ".score", "[data-rating]",
+            ".imdb-rating", "[class*='rating']"
+        )
+        private val DRM_SIGNALS = listOf("widevine", "playready", "fairplay", "encrypted-media", "eme")
+        private val MEDIA_CONTENT_SIGNALS = listOf(".m3u8", ".mpd", ".mp4", ".webm", "videoplayback", "manifest")
+
+        private val WHITESPACE_SPLIT_REGEX = Regex("\\s+")
+        private val BACKGROUND_IMAGE_URL_REGEX = Regex("""background(?:-image)?\s*:\s*url\(['"]?([^'")]+)['"]?\)""", RegexOption.IGNORE_CASE)
+        private val MEDIA_FILE_URL_REGEX = Regex("""['"`]([^'"`]+(?:\.m3u8|\.mpd|\.mp4|\.webm)[^'"`]*)['"`]""", RegexOption.IGNORE_CASE)
+        private val WEBPACK_SIGNALS_REGEX = Regex("""webpackJsonp|__webpack_require__|webpackChunk""")
+        private val SOURCE_MAP_REGEX = Regex("""sourceMappingURL=([^*\s]+)""")
+        private val ENDPOINT_SIGNAL_REGEX = Regex("""['"`]([^'"`]*(?:api|ajax|graphql|search|endpoint)[^'"`]*)['"`]""", RegexOption.IGNORE_CASE)
     }
     
     /**
@@ -378,7 +487,7 @@ class SiteAnalyzerEngine @Inject constructor(
      */
     private fun analyzeDOMStructure(document: Document): DOMAnalysisResult {
         val allElements = document.allElements
-        val uniqueTags = allElements.map { it.tagName() }.distinct().size
+        val uniqueTags = allElements.mapTo(mutableSetOf()) { it.tagName() }.size
         
         // Calculate max depth
         var maxDepth = 0
@@ -409,12 +518,7 @@ class SiteAnalyzerEngine @Inject constructor(
         val areas = mutableListOf<ContentArea>()
         
         // Look for main content areas
-        val mainSelectors = listOf(
-            "main", "#main", ".main", "#content", ".content",
-            "article", ".articles", "#articles", ".container"
-        )
-        
-        mainSelectors.forEach { selector ->
+        MAIN_CONTENT_SELECTORS.forEach { selector ->
             document.select(selector).firstOrNull()?.let { element ->
                 areas.add(ContentArea(
                     selector = selector,
@@ -574,10 +678,12 @@ class SiteAnalyzerEngine @Inject constructor(
     }
     
     private fun detectAdditionalPatterns(document: Document, patterns: MutableList<DetectedPattern>) {
-        // Infinite scroll detection
+        // Infinite scroll detection (serialize the document at most once for both
+        // checks; lazy keeps the short-circuited path serialization-free as before)
+        val html by lazy { document.html() }
         if (document.select("[data-infinite-scroll], .infinite-scroll, [class*='infinite']").isNotEmpty() ||
-            document.html().contains("IntersectionObserver") ||
-            document.html().contains("infinite")) {
+            html.contains("IntersectionObserver") ||
+            html.contains("infinite")) {
             patterns.add(DetectedPattern(
                 type = PatternType.INFINITE_SCROLL,
                 selector = "[data-infinite-scroll]",
@@ -687,10 +793,7 @@ class SiteAnalyzerEngine @Inject constructor(
         }
 
         // Find thumbnail selectors
-        thumbnailSelector = listOf(
-            ".thumbnail img", ".thumb img", "img.thumbnail",
-            ".poster", "img.poster", "[data-poster]"
-        ).firstOrNull { cleanedDoc.select(it).isNotEmpty() }
+        thumbnailSelector = MEDIA_THUMBNAIL_SELECTORS.firstOrNull { cleanedDoc.select(it).isNotEmpty() }
 
         return MediaAnalysisResult(
             playerType = playerType,
@@ -703,23 +806,13 @@ class SiteAnalyzerEngine @Inject constructor(
      * Remove overlays/popups/ads and auto-click close/dismiss buttons
      */
     private fun dismissOverlaysAndAds(document: Document): Document {
-        val popupSelectors = listOf(
-            ".popup, .modal, .overlay, .ad, .banner, .cookie, .notification, .interstitial",
-            "[class*='popup']", "[class*='modal']", "[class*='overlay']", "[class*='ad']",
-            "[id*='popup']", "[id*='modal']", "[id*='overlay']", "[id*='ad']"
-        )
-        val closeButtonSelectors = listOf(
-            ".close, .dismiss, .exit, .btn-close, .close-btn, .close-button, .modal-close, .popup-close",
-            "button[aria-label='Close']", "button[aria-label='Dismiss']", "[data-dismiss]", "[data-close]"
-        )
-
         // Remove overlays/popups/ads
-        popupSelectors.forEach { selector ->
+        POPUP_SELECTORS.forEach { selector ->
             document.select(selector).forEach { it.remove() }
         }
 
         // Simulate auto-clicking close/dismiss buttons
-        closeButtonSelectors.forEach { selector ->
+        CLOSE_BUTTON_SELECTORS.forEach { selector ->
             document.select(selector).forEach { it.remove() }
         }
 
@@ -739,19 +832,7 @@ class SiteAnalyzerEngine @Inject constructor(
         val allText = html
 
         // --- REST API patterns (fetch, axios, jQuery ajax, XHR, Angular http) ---
-        val restPatterns = listOf(
-            Regex("""(?:fetch|axios\.get|axios\.post|http\.get|http\.post)\s*\(\s*['"`](\/api\/[^'"`\s\)]+)['"`]""", RegexOption.IGNORE_CASE),
-            Regex("""(?:\$\.ajax|XMLHttpRequest)[^'"]*url['":\s]+['"`](\/[^'"`\s,\)]+)['"`]""", RegexOption.IGNORE_CASE),
-            Regex("""url\s*:\s*['"`](\/api\/[^'"`\s,\)]+)['"`]""", RegexOption.IGNORE_CASE),
-            Regex("""['"`](\/api\/v\d+\/[^'"`\s]+)['"`]"""),
-            Regex("""['"`](\/rest\/[^'"`\s]+)['"`]"""),
-            Regex("""['"`](\/wp-json\/[^'"`\s]+)['"`]"""),  // WordPress REST
-            Regex("""['"`](\/ghost\/api\/[^'"`\s]+)['"`]"""),  // Ghost CMS
-            Regex("""['"`](\/admin\/api\/[^'"`\s]+)['"`]"""),
-            Regex("""['"`](\/content\/api\/[^'"`\s]+)['"`]"""),
-            Regex("""['"`](\/cms\/api\/[^'"`\s]+)['"`]""")
-        )
-        restPatterns.forEach { pattern ->
+        REST_API_PATTERNS.forEach { pattern ->
             pattern.findAll(scripts).forEach { match ->
                 val ep = match.groupValues[1]
                 if (ep.length > 3 && !ep.contains("//")) {
@@ -762,24 +843,19 @@ class SiteAnalyzerEngine @Inject constructor(
         }
 
         // --- GraphQL detection ---
-        val graphqlIndicators = listOf("graphql", "gql`", " query {", " mutation {", " subscription {", "ApolloClient", "urql")
-        if (graphqlIndicators.any { scripts.contains(it, ignoreCase = true) }) {
+        if (GRAPHQL_INDICATORS.any { scripts.contains(it, ignoreCase = true) }) {
             detectedTypes.add("GraphQL")
-            listOf(
-                Regex("""['"`](\/graphql[^'"`\s]*)['"`]"""),
-                Regex("""['"](https?:\/\/[^'"`\s]+\/graphql[^'"`\s]*)['"]""")
-            ).forEach { p ->
+            GRAPHQL_ENDPOINT_PATTERNS.forEach { p ->
                 p.findAll(allText).forEach { m -> endpoints.add(m.groupValues[1]) }
             }
             // Look for Apollo/GraphQL endpoint config
-            Regex("""uri\s*:\s*['"`]([^'"`\s]+)['"`]""").findAll(scripts).forEach { m ->
+            GRAPHQL_URI_PATTERN.findAll(scripts).forEach { m ->
                 if (m.groupValues[1].length > 3) endpoints.add(m.groupValues[1])
             }
         }
 
         // --- WebSocket endpoint detection ---
-        val wsPattern = Regex("""new WebSocket\s*\(\s*['"`](wss?:\/\/[^'"`\s]+)['"`]""")
-        wsPattern.findAll(scripts).forEach { match ->
+        WEBSOCKET_PATTERN.findAll(scripts).forEach { match ->
             endpoints.add(match.groupValues[1])
             detectedTypes.add("WebSocket")
         }
@@ -787,23 +863,19 @@ class SiteAnalyzerEngine @Inject constructor(
         // --- Strapi CMS ---
         if (allText.contains("strapi", ignoreCase = true)) {
             detectedTypes.add("Strapi")
-            Regex("""['"`](\/api\/[a-z-]+(?:\?[^'"`\s]*)?)['"`]""").findAll(scripts)
+            STRAPI_API_PATTERN.findAll(scripts)
                 .forEach { m -> endpoints.add(m.groupValues[1]) }
         }
 
         // --- Directus CMS ---
         if (allText.contains("directus", ignoreCase = true)) {
             detectedTypes.add("Directus")
-            Regex("""['"`](\/items\/[^'"`\s]+)['"`]""").findAll(scripts)
+            DIRECTUS_API_PATTERN.findAll(scripts)
                 .forEach { m -> endpoints.add(m.groupValues[1]) }
         }
 
         // --- JSON data endpoints embedded in HTML ---
-        listOf(
-            Regex("""['"`](https?:\/\/[^'"`\s]+\.json[^'"`\s]*)['"`]"""),
-            Regex("""['"`](\/[^'"`\s]+\.json[^'"`\s]*)['"`]"""),
-            Regex("""data-src=['"`](https?:\/\/[^'"`\s]+)['"`]""")
-        ).forEach { p ->
+        JSON_ENDPOINT_PATTERNS.forEach { p ->
             p.findAll(allText).forEach { m ->
                 val ep = m.groupValues[1]
                 if (ep.contains("json") || ep.contains("api")) {
@@ -815,7 +887,7 @@ class SiteAnalyzerEngine @Inject constructor(
 
         // --- Data attributes ---
         document.select("[data-api], [data-url], [data-endpoint], [data-src-url], [data-ajax-url]").forEach { el ->
-            listOf("data-api", "data-url", "data-endpoint", "data-src-url", "data-ajax-url").forEach { attr ->
+            DATA_ENDPOINT_ATTRIBUTES.forEach { attr ->
                 el.attr(attr).takeIf { it.isNotEmpty() && it.startsWith("/") }?.let {
                     endpoints.add(it)
                     detectedTypes.add("REST")
@@ -921,35 +993,7 @@ class SiteAnalyzerEngine @Inject constructor(
     private fun detectJavaScriptRequirement(document: Document): Boolean {
         val html = document.html()
         // 2026-era SPA and SSR framework indicators
-        val indicators = listOf(
-            // Angular (2+)
-            "ng-app", "ng-version", "[_nghost", "[_ngcontent",
-            // Next.js / React
-            "__NEXT_DATA__", "/_next/static", "data-reactroot", "__react",
-            // Nuxt.js / Vue
-            "__NUXT__", "/_nuxt/", "data-v-", "__vue_",
-            // SvelteKit
-            "__sveltekit", "sveltekit", "svelte-",
-            // Astro
-            "astro-island", "astro:load", "/@astro/",
-            // Remix
-            "__remixContext", "/__remix-",
-            // SolidJS
-            "solid-js", "window._solid",
-            // Gatsby
-            "___gatsby", "gatsby-runtime",
-            // Qwik
-            "qwik-", "q:base",
-            // Generic SSR/SPA injection
-            "window.__INITIAL_STATE__", "window.__PRELOADED_STATE__",
-            "window.__APP_STATE__", "window.__SERVER_DATA__",
-            // JSON embedded state blobs
-            "application/json\">{",
-            // CloudFlare JS challenge
-            "cf-chl-bypass", "__cf_chl_"
-        )
-
-        if (indicators.any { html.contains(it) }) return true
+        if (JS_REQUIREMENT_INDICATORS.any { html.contains(it) }) return true
 
         // If body text is sparse but scripts are heavy → JS-rendered
         val bodyText = document.body()?.text() ?: ""
@@ -964,13 +1008,7 @@ class SiteAnalyzerEngine @Inject constructor(
     }
     
     private fun detectAuthRequirement(document: Document): Boolean {
-        val loginIndicators = listOf(
-            "form[action*='login']", "form#login", ".login-form",
-            "input[name='password']", "input[type='password']",
-            ".auth-required", "#login-required"
-        )
-        
-        return loginIndicators.any { document.select(it).isNotEmpty() }
+        return LOGIN_INDICATOR_SELECTORS.any { document.select(it).isNotEmpty() }
     }
     
     // Helper functions
@@ -1062,7 +1100,7 @@ class SiteAnalyzerEngine @Inject constructor(
             document.select("template[shadowroot], template[shadowrootmode]").isNotEmpty()
         val iframeDepth = calculateIframeDepth(document)
         val mediaUrls = extractMediaUrls(document, html, baseUrl)
-        val drmSignals = listOf("widevine", "playready", "fairplay", "encrypted-media", "eme")
+        val drmSignals = DRM_SIGNALS
             .filter { html.contains(it, ignoreCase = true) }
 
         // Computed once and reused by the checks below. The document is not
@@ -1216,7 +1254,7 @@ class SiteAnalyzerEngine @Inject constructor(
         val srcset = element.attr("srcset").takeIf { it.isNotBlank() }
             ?: element.attr("data-srcset").takeIf { it.isNotBlank() }
         val fromSrcset = srcset?.split(",")
-            ?.map { it.trim().split(Regex("\\s+")).firstOrNull().orEmpty() }
+            ?.map { it.trim().split(WHITESPACE_SPLIT_REGEX).firstOrNull().orEmpty() }
             ?.firstOrNull { it.isNotBlank() && !it.startsWith("data:", true) }
         val raw = listOf(
             element.attr("src"),
@@ -1229,7 +1267,7 @@ class SiteAnalyzerEngine @Inject constructor(
             element.attr("data-image"),
             element.attr("poster"),
             fromSrcset,
-            Regex("""background(?:-image)?\s*:\s*url\(['"]?([^'")]+)['"]?\)""", RegexOption.IGNORE_CASE)
+            BACKGROUND_IMAGE_URL_REGEX
                 .find(element.attr("style"))?.groupValues?.getOrNull(1)
         ).firstOrNull { !it.isNullOrBlank() && !it.startsWith("data:", true) } ?: return null
         return normalizeAssetUrl(raw, baseUrl)
@@ -1241,7 +1279,7 @@ class SiteAnalyzerEngine @Inject constructor(
             val raw = element.attr("src").ifBlank { element.attr("href") }
             if (raw.containsMediaSignal()) urls.add(normalizeAssetUrl(raw, baseUrl))
         }
-        Regex("""['"`]([^'"`]+(?:\.m3u8|\.mpd|\.mp4|\.webm)[^'"`]*)['"`]""", RegexOption.IGNORE_CASE)
+        MEDIA_FILE_URL_REGEX
             .findAll(html)
             .forEach { match -> urls.add(normalizeAssetUrl(match.groupValues[1].replace("\\/", "/"), baseUrl)) }
         return urls.take(20)
@@ -1249,7 +1287,7 @@ class SiteAnalyzerEngine @Inject constructor(
 
     private fun String.containsMediaSignal(): Boolean {
         val lower = lowercase()
-        return listOf(".m3u8", ".mpd", ".mp4", ".webm", "videoplayback", "manifest").any { lower.contains(it) }
+        return MEDIA_CONTENT_SIGNALS.any { lower.contains(it) }
     }
 
     private fun calculateIframeDepth(document: Document): Int {
@@ -1304,10 +1342,10 @@ class SiteAnalyzerEngine @Inject constructor(
     private fun analyzeJsBundles(document: Document, html: String, baseUrl: String): JsBundleResult {
         val scripts = document.select("script[src]").map { normalizeAssetUrl(it.attr("src"), baseUrl) }
         val webpackSignals = scripts.count { it.contains("chunk", true) || it.contains("webpack", true) || it.contains("_next/", true) } +
-            Regex("""webpackJsonp|__webpack_require__|webpackChunk""").findAll(html).count()
-        val sourceMaps = Regex("""sourceMappingURL=([^*\s]+)""").findAll(html).count() +
+            WEBPACK_SIGNALS_REGEX.findAll(html).count()
+        val sourceMaps = SOURCE_MAP_REGEX.findAll(html).count() +
             scripts.count { it.endsWith(".map", true) }
-        val endpointSignals = Regex("""['"`]([^'"`]*(?:api|ajax|graphql|search|endpoint)[^'"`]*)['"`]""", RegexOption.IGNORE_CASE)
+        val endpointSignals = ENDPOINT_SIGNAL_REGEX
             .findAll(html)
             .count()
         return JsBundleResult(webpackChunks = webpackSignals, sourceMaps = sourceMaps, obfuscatedEndpointSignals = endpointSignals)
@@ -1330,35 +1368,19 @@ class SiteAnalyzerEngine @Inject constructor(
     }
     
     private fun findTitleSelector(document: Document, patterns: List<DetectedPattern>): String? {
-        val candidates = listOf(
-            "h1", "h2.title", ".title", "#title", "[class*='title']",
-            ".name", ".item-title", ".video-title", ".movie-title"
-        )
-        return candidates.firstOrNull { document.select(it).isNotEmpty() }
+        return TITLE_SELECTOR_CANDIDATES.firstOrNull { document.select(it).isNotEmpty() }
     }
-    
+
     private fun findDescriptionSelector(document: Document): String? {
-        val candidates = listOf(
-            ".description", "#description", ".desc", ".synopsis",
-            ".summary", "[class*='description']", "p.info"
-        )
-        return candidates.firstOrNull { document.select(it).isNotEmpty() }
+        return DESCRIPTION_SELECTOR_CANDIDATES.firstOrNull { document.select(it).isNotEmpty() }
     }
-    
+
     private fun findDateSelector(document: Document): String? {
-        val candidates = listOf(
-            ".date", ".time", ".timestamp", "[datetime]",
-            ".posted", ".published", "[class*='date']"
-        )
-        return candidates.firstOrNull { document.select(it).isNotEmpty() }
+        return DATE_SELECTOR_CANDIDATES.firstOrNull { document.select(it).isNotEmpty() }
     }
-    
+
     private fun findRatingSelector(document: Document): String? {
-        val candidates = listOf(
-            ".rating", ".stars", ".score", "[data-rating]",
-            ".imdb-rating", "[class*='rating']"
-        )
-        return candidates.firstOrNull { document.select(it).isNotEmpty() }
+        return RATING_SELECTOR_CANDIDATES.firstOrNull { document.select(it).isNotEmpty() }
     }
     
     private fun extractUrlPattern(url: String): String {
