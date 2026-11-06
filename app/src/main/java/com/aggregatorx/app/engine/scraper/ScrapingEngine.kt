@@ -81,6 +81,24 @@ class ScrapingEngine @Inject constructor(
             "/type/", "/sort/", "/order/", "?genre=", "?category=",
             "?type=", "/all-", "/list/genre", "/movies/genre"
         )
+
+        // Shared constants for values that were rebuilt on every call below.
+        // Regex and List instances here are immutable and only read, so sharing
+        // them cannot change results.
+        private val WHITESPACE_SPLIT_REGEX = Regex("\\s+")
+        private val CHALLENGE_MARKERS = listOf(
+            "cf_chl_opt",
+            "checking your browser",
+            "just a moment...",
+            "enable javascript and cookies to continue"
+        )
+        private val RESULT_ITEM_SELECTOR_CANDIDATES = listOf(
+            ".result", ".item", ".card", "article", ".video-item", ".movie-item"
+        )
+        private val BACKGROUND_IMAGE_URL_REGEX = Regex(
+            """background(?:-image)?\s*:\s*url\(['"]?([^'")]+)['"]?\)""",
+            RegexOption.IGNORE_CASE
+        )
         
         private val GENERIC_CATEGORY_NAMES = setOf(
             "action", "comedy", "drama", "horror", "thriller", "romance",
@@ -464,12 +482,7 @@ class ScrapingEngine @Inject constructor(
     private fun isUsableBody(body: String): Boolean {
         if (body.length < 80) return false
         val sample = body.take(20_000).lowercase()
-        return listOf(
-            "cf_chl_opt",
-            "checking your browser",
-            "just a moment...",
-            "enable javascript and cookies to continue"
-        ).none(sample::contains)
+        return CHALLENGE_MARKERS.none(sample::contains)
     }
 
     private suspend fun extractFromFetchedOutcome(
@@ -569,7 +582,7 @@ class ScrapingEngine @Inject constructor(
     private fun calculateRelevanceScore(title: String, query: String, description: String? = null, url: String? = null): Float {
         val titleLower = title.lowercase()
         val queryLower = query.lowercase()
-        val terms = queryLower.split(Regex("\\s+")).filter { it.length > 1 }
+        val terms = queryLower.split(WHITESPACE_SPLIT_REGEX).filter { it.length > 1 }
         if (terms.isEmpty()) return 0f
 
         var score = 0f
@@ -593,7 +606,7 @@ class ScrapingEngine @Inject constructor(
 
     private fun matchesQueryEnhanced(result: SearchResult, query: String): Boolean {
         val combined = "${result.title} ${result.description ?: ""} ${result.url}".lowercase()
-        val terms = query.lowercase().split(Regex("\\s+")).filter { it.length > 2 }
+        val terms = query.lowercase().split(WHITESPACE_SPLIT_REGEX).filter { it.length > 2 }
         if (terms.any { combined.contains(it) }) return true
         
         currentProcessedQuery?.let {
@@ -684,8 +697,7 @@ class ScrapingEngine @Inject constructor(
     // --- Utility Methods ---
 
     private fun detectResultItemSelector(doc: Document): String? {
-        val candidates = listOf(".result", ".item", ".card", "article", ".video-item", ".movie-item")
-        return candidates.map { it to doc.select(it).size }.filter { it.second >= 2 }.maxByOrNull { it.second }?.first
+        return RESULT_ITEM_SELECTOR_CANDIDATES.map { it to doc.select(it).size }.filter { it.second >= 2 }.maxByOrNull { it.second }?.first
     }
 
     private fun extractBestTitle(item: Element): String = item.select("h1, h2, h3, .title, .name, a").firstOrNull()?.text()?.trim() ?: ""
@@ -710,7 +722,7 @@ class ScrapingEngine @Inject constructor(
             ?: element.attr("data-srcset").takeIf { it.isNotBlank() }
         val fromSrcset = srcset
             ?.split(",")
-            ?.map { it.trim().split(Regex("\\s+")).firstOrNull().orEmpty() }
+            ?.map { it.trim().split(WHITESPACE_SPLIT_REGEX).firstOrNull().orEmpty() }
             ?.firstOrNull { it.isNotBlank() && !it.startsWith("data:", ignoreCase = true) }
 
         val raw = listOf(
@@ -732,7 +744,7 @@ class ScrapingEngine @Inject constructor(
     }
     private fun extractBackgroundImageUrl(style: String): String? {
         if (style.isBlank()) return null
-        return Regex("""background(?:-image)?\s*:\s*url\(['"]?([^'")]+)['"]?\)""", RegexOption.IGNORE_CASE)
+        return BACKGROUND_IMAGE_URL_REGEX
             .find(style)
             ?.groupValues
             ?.getOrNull(1)
