@@ -181,9 +181,12 @@ class SiteAnalyzerEngine @Inject constructor(
                 apiAnalysis = apiAnalysis,
                 loadTime = loadTime
             )
-            val enrichedHeaders = fetchedPage.headers.toMutableMap().apply {
-                put(CAPABILITY_REPORT_HEADER, json.encodeToString(capabilityReport))
-            }
+            // The capability report is analysis metadata, not an HTTP header:
+            // it lives in analysisMetadata, and `headers` keeps only the
+            // response headers the site actually sent (spec §3).
+            val analysisMetadataJson = kotlinx.serialization.json.buildJsonObject {
+                put("capabilityReport", kotlinx.serialization.json.JsonPrimitive(json.encodeToString(capabilityReport)))
+            }.toString()
             
             val result = SiteAnalysis(
                 providerId = providerId,
@@ -246,8 +249,9 @@ class SiteAnalyzerEngine @Inject constructor(
                 
                 // Raw data
                 rawHtml = document.html().take(50000), // Limit storage
-                headers = json.encodeToString(enrichedHeaders),
-                cookies = json.encodeToString(fetchedPage.cookies)
+                headers = json.encodeToString(fetchedPage.headers),
+                cookies = json.encodeToString(fetchedPage.cookies),
+                analysisMetadata = analysisMetadataJson
             )
             analysisCache[normalizedKey] = result to System.currentTimeMillis()
             result

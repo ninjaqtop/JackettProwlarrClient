@@ -51,7 +51,7 @@ class AggregatorRepository @Inject constructor(
     private companion object {
         const val TAG = "AggregatorRepository"
         const val PROVIDER_ANALYSIS_TIMEOUT_MS = 60_000L
-        const val RECON_TIMEOUT_MS = 20_000L
+        const val RECON_TIMEOUT_MS = 45_000L
     }
 
     fun clearSearchCache() {
@@ -151,13 +151,18 @@ class AggregatorRepository @Inject constructor(
             // confusing secondary failure — propagate it as-is instead.
             throw e
         } catch (e: Exception) {
+            // Never report success when the config step itself crashed:
+            // record the real reason and surface it like any other failure.
             Log.w(TAG, "Config generation failed for provider=${provider.name}: ${e.message}")
+            val reason = "configuration step failed (${e.javaClass.simpleName}: ${e.message ?: "no detail"})"
+            recordFailureInAnalysis(analysis, listOf(reason), null, scrapingConfigDao.getConfigForProvider(providerId))
+            configFailure = ConfigVerificationException("Provider saved, but $reason", providerId)
         }
 
         // Update provider last analyzed timestamp
         providerDao.updateLastAnalyzed(providerId, System.currentTimeMillis())
 
-        configFailure?.let { throw it }
+        configFailure?.let { throw if (it.providerId == null) ConfigVerificationException(it.message ?: "", providerId) else it }
 
         return analysis
     }
@@ -310,13 +315,12 @@ class AggregatorRepository @Inject constructor(
             )
             if (reOutcome is VerificationOutcome.Verified) {
                 val refreshed = reOutcome.config.copy(timeout = finalTimeoutMs(reOutcome, recon))
-                if (refreshed != existing) {
-                    scrapingConfigDao.insertConfig(refreshed)
-                }
+                // Single-row REPLACE keyed by provider ID: an atomic upsert.
+                scrapingConfigDao.insertConfig(refreshed)
                 if (recon != null && recon.medianResponseMs > 0) {
                     providerDao.updateProviderStats(provider.id, provider.healthScore, recon.medianResponseMs)
                 }
-                recordVerificationInAnalysis(analysis, reOutcome, recon)
+                recordVerificationInAnalysis(analysis, reOutcome.copy(config = refreshed), recon)
                 return
             }
             existingRejectionReasons = (reOutcome as VerificationOutcome.Rejected).reasons
@@ -371,6 +375,7 @@ class AggregatorRepository @Inject constructor(
                     CandidateSource.DISCOVERED_ENDPOINT -> "Discovered endpoint"
                     CandidateSource.JSON_API -> "JSON API endpoint"
                     CandidateSource.EMBEDDED_STATE -> "Embedded state endpoint"
+                    CandidateSource.WORDLIST -> "Wordlist route (verified live)"
                 } + if (candidate.isJson) " (JSON)" else "",
                 isFormRoute = candidate.source == CandidateSource.FORM
             )
@@ -391,11 +396,12 @@ class AggregatorRepository @Inject constructor(
             }
         }
         if (liveCandidates.isEmpty()) {
+            val reasons = staticFailures.ifEmpty {
+                listOf("no candidate search route could be derived from the site's own data (no search form, sitemap route, or live endpoint found)")
+            }
+            recordFailureInAnalysis(analysis, reasons, recon, existing)
             throw ConfigVerificationException(
-                "Provider saved, but no search configuration could be verified: " +
-                    (staticFailures.ifEmpty {
-                        listOf("no candidate search route could be derived from the site's own data (no search form, sitemap route, or live endpoint found)")
-                    }).joinToString("; ")
+                "Provider saved, but no search configuration could be verified: " + reasons.joinToString("; ")
             )
         }
 
@@ -403,19 +409,10 @@ class AggregatorRepository @Inject constructor(
         when (val outcome = searchConfigVerifier.verify(provider, liveCandidates, recon?.probeQuery, paginationHint)) {
             is VerificationOutcome.Verified -> {
                 val finalConfig = outcome.config.copy(timeout = finalTimeoutMs(outcome, recon))
-                if (existing != null && finalConfig.id != existing.id) {
-                    // A proven replacement for a config that failed
-                    // re-verification — the old one is removed only now
-                    // that a replacement has verified, and the swap is
-                    // a single transaction so an interruption can never
-                    // leave the provider with no config at all.
-                    database.withTransaction {
-                        scrapingConfigDao.deleteConfigForProvider(provider.id)
-                        scrapingConfigDao.insertConfig(finalConfig)
-                    }
-                } else {
-                    scrapingConfigDao.insertConfig(finalConfig)
-                }
+                // The row is keyed by provider ID, so this REPLACE is one
+                // atomic upsert: a proven replacement swaps in without a
+                // delete-then-insert window, and only after it verified.
+                scrapingConfigDao.insertConfig(finalConfig)
                 Log.i(
                     TAG,
                     "Verified config saved for provider=${provider.name}: ${outcome.verdict.reason}" +
@@ -424,9 +421,15 @@ class AggregatorRepository @Inject constructor(
                 if (recon != null && recon.medianResponseMs > 0) {
                     providerDao.updateProviderStats(provider.id, provider.healthScore, recon.medianResponseMs)
                 }
-                recordVerificationInAnalysis(analysis, outcome, recon)
+                recordVerificationInAnalysis(analysis, outcome.copy(config = finalConfig), recon)
             }
             is VerificationOutcome.Rejected -> {
+                recordFailureInAnalysis(
+                    analysis,
+                    existingRejectionReasons.map { "existing config: $it" } + staticFailures + outcome.reasons,
+                    recon,
+                    existing
+                )
                 val prefix = if (existingRejectionReasons.isNotEmpty()) {
                     "The existing config failed re-verification (" +
                         existingRejectionReasons.joinToString("; ") +
@@ -478,11 +481,17 @@ class AggregatorRepository @Inject constructor(
                 titleSelector = candidate.jsonTitleField ?: "title",
                 urlSelector = candidate.jsonUrlField ?: "url",
                 descriptionSelector = analysis.descriptionSelector,
-                thumbnailSelector = analysis.thumbnailSelector,
+                thumbnailSelector = candidate.jsonThumbnailField ?: analysis.thumbnailSelector,
                 dateSelector = analysis.dateSelector,
                 ratingSelector = analysis.ratingSelector,
                 postData = candidate.postData,
-                timeout = timeoutMs
+                timeout = timeoutMs,
+                method = if (candidate.postData != null) "POST" else "GET",
+                isJson = true,
+                jsonResultPath = candidate.jsonResultPath,
+                jsonTitleField = candidate.jsonTitleField,
+                jsonUrlField = candidate.jsonUrlField,
+                jsonThumbnailField = candidate.jsonThumbnailField
             )
         } else {
             ScrapingConfig(
@@ -503,9 +512,12 @@ class AggregatorRepository @Inject constructor(
         }
     }
 
-    /** Persist the verification evidence onto the stored SiteAnalysis row
-     *  (same primary key — the DAO replaces), so the verified endpoint,
-     *  probe term, and counts survive with the analysis. */
+    /**
+     * Persist the analysis record (spec §3) onto the stored SiteAnalysis row
+     * (same primary key — the DAO replaces): the full site map, the full saved
+     * config JSON, per-field confidence and the probe evidence, in
+     * analysisMetadata — never in the HTTP `headers` column.
+     */
     private suspend fun recordVerificationInAnalysis(
         analysis: SiteAnalysis,
         outcome: VerificationOutcome.Verified,
@@ -522,29 +534,51 @@ class AggregatorRepository @Inject constructor(
                 put("itemCount", JsonPrimitive(outcome.verdict.itemCount))
                 put("categoryCount", JsonPrimitive(outcome.verdict.categoryCount))
                 put("nonsenseItemCount", JsonPrimitive(outcome.verdict.nonsenseItemCount))
-                put("responseMs", JsonPrimitive(outcome.verdict.responseMs))
-                put("slowestProbeMs", JsonPrimitive(outcome.verdict.slowestProbeMs))
                 put("confidence", JsonPrimitive(outcome.verdict.confidence))
-                put("confidenceDetail", JsonPrimitive(outcome.verdict.confidenceDetail))
                 put("paginationProven", JsonPrimitive(outcome.verdict.paginationProven))
-                put("rendered", JsonPrimitive(outcome.verdict.rendered))
-                put("repaired", JsonPrimitive(outcome.repaired))
-                recon?.probeQuery?.let { put("probeQuery", JsonPrimitive(it)) }
-                recon?.paginationParam?.let { put("paginationParam", JsonPrimitive(it)) }
-                put("paginationPathStyle", JsonPrimitive(recon?.paginationPathStyle ?: false))
-                matched?.jsonResultPath?.let { put("jsonResultPath", JsonPrimitive(it)) }
-                matched?.jsonTitleField?.let { put("jsonTitleField", JsonPrimitive(it)) }
-                matched?.jsonUrlField?.let { put("jsonUrlField", JsonPrimitive(it)) }
             })
         }.toString()
+        val metadata = AnalysisRecord.build(
+            previous = analysis.analysisMetadata,
+            recon = recon,
+            config = outcome.config,
+            verification = AnalysisRecord.verified(outcome, recon?.probeQuery)
+        )
         runCatching {
             siteAnalysisDao.insertAnalysis(
                 analysis.copy(
                     apiEndpoints = endpointsJson,
-                    hasAPI = analysis.hasAPI || (matched?.isJson == true)
+                    hasAPI = analysis.hasAPI || (matched?.isJson == true) || outcome.config.isJson,
+                    analysisMetadata = metadata,
+                    verificationStatus = "VERIFIED",
+                    verificationReason = null
                 )
             )
-        }
+        }.onFailure { if (it is CancellationException) throw it; Log.w(TAG, "could not record analysis: ${it.message}") }
+    }
+
+    /** Record a failed verification with its specific reasons — the provider row stays saved. */
+    private suspend fun recordFailureInAnalysis(
+        analysis: SiteAnalysis,
+        reasons: List<String>,
+        recon: SiteRecon?,
+        keptConfig: ScrapingConfig?
+    ) {
+        val metadata = AnalysisRecord.build(
+            previous = analysis.analysisMetadata,
+            recon = recon,
+            config = keptConfig,
+            verification = AnalysisRecord.failed(reasons, recon?.probeQuery, keptConfig != null)
+        )
+        runCatching {
+            siteAnalysisDao.insertAnalysis(
+                analysis.copy(
+                    analysisMetadata = metadata,
+                    verificationStatus = "FAILED",
+                    verificationReason = reasons.joinToString("; ").take(4_000)
+                )
+            )
+        }.onFailure { if (it is CancellationException) throw it; Log.w(TAG, "could not record analysis: ${it.message}") }
     }
 
     private fun buildSearchRequestTemplate(baseUrl: String, analysis: SiteAnalysis): GeneratedSearchRequest {
@@ -776,4 +810,8 @@ class AggregatorRepository @Inject constructor(
  * existing error state — the provider stays saved, enabled, and
  * visible; only the unverified config is withheld.
  */
-class ConfigVerificationException(message: String) : Exception(message)
+class ConfigVerificationException(
+    message: String,
+    /** The provider that WAS saved (its row stays, with this reason recorded). */
+    val providerId: String? = null
+) : Exception(message)

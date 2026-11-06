@@ -589,7 +589,11 @@ fun AnalysisDetailsSheet(
     onDismiss: () -> Unit
 ) {
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
-    val capabilityReport = remember(analysis.headers) { parseAnalyzerCapabilityReport(analysis.headers) }
+    val capabilityReport = remember(analysis.analysisMetadata, analysis.headers) {
+        parseAnalyzerCapabilityReportFromMetadata(analysis.analysisMetadata)
+            ?: parseAnalyzerCapabilityReport(analysis.headers)
+    }
+    val analyzerRecord = remember(analysis.analysisMetadata) { AnalyzerRecordView.parse(analysis) }
     
     ModalBottomSheet(
         onDismissRequest = onDismiss,
@@ -618,6 +622,8 @@ fun AnalysisDetailsSheet(
                 )
             }
             
+            analyzerRecordItems(analyzerRecord)
+
             // Security Section
             item {
                 AnalysisSection(title = "🔒 Security", color = AccentGreen) {
@@ -766,6 +772,15 @@ private fun formatBytes(bytes: Long): String {
 
 private val analysisJson = Json { ignoreUnknownKeys = true }
 
+private fun parseAnalyzerCapabilityReportFromMetadata(metadata: String): AnalyzerCapabilityReport? = try {
+    val root = analysisJson.parseToJsonElement(metadata) as? kotlinx.serialization.json.JsonObject
+    val raw = (root?.get("capabilityReport") as? kotlinx.serialization.json.JsonPrimitive)?.content
+    raw?.let { analysisJson.decodeFromString<AnalyzerCapabilityReport>(it) }
+} catch (_: Exception) {
+    null
+}
+
+/** Legacy rows (pre-v4) carried the report inside the response-headers JSON. */
 private fun parseAnalyzerCapabilityReport(headers: String): AnalyzerCapabilityReport? {
     return try {
         val headerMap = analysisJson.decodeFromString<Map<String, String>>(headers)
