@@ -135,6 +135,14 @@ class AggregatorRepository @Inject constructor(
         }
         siteAnalysisDao.insertAnalysis(analysis)
 
+        // Provider record: the site's own declared icon (spec §3), when the
+        // page names one. Never invented.
+        if (provider.iconUrl.isNullOrBlank()) {
+            siteIconUrl(analysis)?.let { icon ->
+                runCatching { providerDao.updateProvider(provider.copy(iconUrl = icon)) }
+            }
+        }
+
         // Generate + live-verify the scraping config. The provider itself
         // stays saved either way; a config that cannot be verified is not
         // saved, and the rejection reason is surfaced to the caller so the
@@ -656,6 +664,13 @@ class AggregatorRepository @Inject constructor(
             GeneratedSearchRequest(urlTemplate = action, postData = parts.joinToString("&"))
         }
     }
+
+    private fun siteIconUrl(analysis: SiteAnalysis): String? = analysis.rawHtml
+        ?.takeIf { it.isNotBlank() }
+        ?.let { html -> runCatching { Jsoup.parse(html, analysis.url) }.getOrNull() }
+        ?.select("link[rel*=icon][href]")
+        ?.map { it.absUrl("href") }
+        ?.firstOrNull { it.startsWith("http") }
 
     private fun encodeTemplateField(value: String): String {
         val encoded = URLEncoder.encode(
