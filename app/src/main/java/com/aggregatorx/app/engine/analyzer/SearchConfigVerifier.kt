@@ -9,6 +9,7 @@ import com.aggregatorx.app.engine.scraper.HeadlessBrowserHelper
 import com.aggregatorx.app.engine.scraper.SearchResultFilter
 import com.aggregatorx.app.engine.util.EngineUtils
 import com.aggregatorx.app.engine.validator.ProviderConfigValidator
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
 import kotlinx.serialization.json.Json
@@ -62,7 +63,10 @@ import javax.inject.Singleton
  * reason, because no automation can prove a search it cannot reach.
  *
  * Everything is bounded (per-fetch timeouts, phase budgets) and
- * [verify] never throws: failure is data — a list of specific reasons.
+ * [verify] never throws for a verification outcome: failure is data —
+ * a list of specific reasons. (Coroutine cancellation is the one
+ * exception: it propagates, as it must, instead of being recorded
+ * as a verification error.)
  */
 @Singleton
 class SearchConfigVerifier @Inject constructor() {
@@ -111,6 +115,11 @@ class SearchConfigVerifier @Inject constructor() {
                 }
                 null -> {
                     val e = attempt.exceptionOrNull()
+                    // Cancellation is not a verification outcome: the
+                    // old code recorded it as a "verification error"
+                    // reason and kept probing the remaining candidates
+                    // inside the cancelled call. Propagate it instead.
+                    if (e is CancellationException) throw e
                     reasons += "${candidate.sourceLabel}: verification error (${e?.javaClass?.simpleName ?: "unknown"}: ${e?.message ?: "no detail"})"
                 }
             }
@@ -144,6 +153,7 @@ class SearchConfigVerifier @Inject constructor() {
                     is CandidateAttempt.Failed -> reasons += result.reason
                     null -> {
                         val e = attempt.exceptionOrNull()
+                        if (e is CancellationException) throw e
                         reasons += "${candidate.sourceLabel}: rendered verification error (${e?.javaClass?.simpleName ?: "unknown"}: ${e?.message ?: "no detail"})"
                     }
                 }
@@ -181,7 +191,7 @@ class SearchConfigVerifier @Inject constructor() {
                 realFetched = true
                 realHtml = runCatching {
                     HeadlessBrowserHelper.searchViaHeadlessForm(provider.baseUrl, probeQuery)
-                }.getOrNull()
+                }.getOrElse { e -> if (e is CancellationException) throw e; null }
             }
             return realHtml
         }
@@ -191,7 +201,7 @@ class SearchConfigVerifier @Inject constructor() {
                 nonsenseFetched = true
                 nonsenseHtml = runCatching {
                     HeadlessBrowserHelper.searchViaHeadlessForm(provider.baseUrl, NONSENSE_QUERY)
-                }.getOrNull()
+                }.getOrElse { e -> if (e is CancellationException) throw e; null }
             }
             return nonsenseHtml
         }
