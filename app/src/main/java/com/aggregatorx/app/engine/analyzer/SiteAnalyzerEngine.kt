@@ -1065,6 +1065,16 @@ class SiteAnalyzerEngine @Inject constructor(
         val drmSignals = listOf("widevine", "playready", "fairplay", "encrypted-media", "eme")
             .filter { html.contains(it, ignoreCase = true) }
 
+        // Computed once and reused by the checks below. The document is not
+        // mutated anywhere in this function, so each of these pure scans would
+        // otherwise be repeated with identical results.
+        val searchInputSelector = findSearchInput(document)
+        val capabilityPatterns = detectPatterns(document)
+        val hasResultPattern = capabilityPatterns.any { it.type == PatternType.RESULT_ITEM || it.type == PatternType.RESULT_LIST }
+        val hasPaginationPattern = capabilityPatterns.any { it.type == PatternType.PAGINATION }
+        val externalScripts = document.select("script[src]")
+        val renderBlockingCandidates = document.select("script:not([async]):not([defer]), link[rel=stylesheet]")
+
         return AnalyzerCapabilityReport(
             generatedAt = System.currentTimeMillis(),
             sections = listOf(
@@ -1084,15 +1094,15 @@ class SiteAnalyzerEngine @Inject constructor(
                         capability("Shadow DOM", if (shadowDomSignals) "detected" else "not_detected", "Static signals: attachShadow/shadowRoot/template shadowroot"),
                         capability("iFrame Depth", if (iframeDepth > 0) "detected" else "not_detected", iframeDepth.toString()),
                         capability("Form Fields", if (formFields > 0) "detected" else "not_detected", "$formFields fields, $hiddenInputs hidden"),
-                        capability("Script Sources", if (document.select("script[src]").isNotEmpty()) "detected" else "not_detected", "${document.select("script[src]").size} external scripts")
+                        capability("Script Sources", if (externalScripts.isNotEmpty()) "detected" else "not_detected", "${externalScripts.size} external scripts")
                     )
                 ),
                 AnalyzerCapabilitySection(
                     title = "Pattern Detection",
                     checks = listOf(
-                        capability("Search Forms", if (findSearchInput(document) != null) "detected" else "not_detected", findSearchInput(document) ?: "No search input selector"),
-                        capability("Result Lists", if (detectPatterns(document).any { it.type == PatternType.RESULT_ITEM || it.type == PatternType.RESULT_LIST }) "detected" else "not_detected", "Selector pattern analysis"),
-                        capability("Pagination", if (detectPatterns(document).any { it.type == PatternType.PAGINATION }) "detected" else "not_detected", "Pagination selectors"),
+                        capability("Search Forms", if (searchInputSelector != null) "detected" else "not_detected", searchInputSelector ?: "No search input selector"),
+                        capability("Result Lists", if (hasResultPattern) "detected" else "not_detected", "Selector pattern analysis"),
+                        capability("Pagination", if (hasPaginationPattern) "detected" else "not_detected", "Pagination selectors"),
                         capability("Lazy Load", if (lazyLoadCount > 0) "detected" else "not_detected", "$lazyLoadCount lazy-load elements"),
                         capability("Infinite Scroll", if (hasInfiniteScroll) "detected" else "not_detected", "IntersectionObserver/load-more/static infinite-scroll signals")
                     )
@@ -1122,7 +1132,7 @@ class SiteAnalyzerEngine @Inject constructor(
                         capability("TTFB/Load Time", "active", "${loadTime}ms"),
                         capability("Resource Count", "active", document.select("script, link, img, video, iframe").size.toString()),
                         capability("Page Weight", "active", "${html.length} bytes"),
-                        capability("Render Blocking", if (document.select("script:not([async]):not([defer]), link[rel=stylesheet]").isNotEmpty()) "detected" else "not_detected", "${document.select("script:not([async]):not([defer]), link[rel=stylesheet]").size} candidates"),
+                        capability("Render Blocking", if (renderBlockingCandidates.isNotEmpty()) "detected" else "not_detected", "${renderBlockingCandidates.size} candidates"),
                         capability("CDN Detection", if (network.cdnProvider != "Unknown") "detected" else "not_detected", network.cdnProvider)
                     )
                 ),
