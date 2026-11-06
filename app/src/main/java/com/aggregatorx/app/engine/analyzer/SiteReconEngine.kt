@@ -68,6 +68,8 @@ class SiteReconEngine @Inject constructor(
         val baseHost = runCatching { URL(base).host }.getOrNull().orEmpty()
         val timings = mutableListOf<Long>()
         val startedAt = System.currentTimeMillis()
+        val toolkit = ReconToolkit(base, baseHost, startedAt + RECON_BUDGET_MS)
+        val sitemapsRead = mutableListOf<String>()
 
         fun timedFetch(url: String, timeoutMs: Int, acceptJson: Boolean = false): TimedFetch {
             val t0 = System.currentTimeMillis()
@@ -122,6 +124,7 @@ class SiteReconEngine @Inject constructor(
         var sitemapUrlCount = 0
         for (sitemapUrl in sitemapLocations.distinct().take(MAX_SITEMAP_FILES)) {
             val xml = timedFetch(sitemapUrl, SITEMAP_TIMEOUT_MS).body ?: continue
+            sitemapsRead += sitemapUrl
             val locs = LOC_REGEX.findAll(xml).map { it.groupValues[1].trim() }.toList()
             if (xml.contains("<sitemapindex", ignoreCase = true)) {
                 for (child in locs.filter { it.endsWith(".xml") }.take(4)) {
@@ -142,9 +145,22 @@ class SiteReconEngine @Inject constructor(
             if (urls.size >= MAX_SITEMAP_URLS) break
         }
 
+        toolkit.record(ReconCheck("robots-and-sitemaps", if (sitemapUrlCount > 0) "ok" else "empty",
+            "robots.txt ${if (robots.body != null) "read" else "unavailable"}; ${sitemapsRead.size} sitemap files read, $sitemapUrlCount URLs"))
+
+        // Historical URLs (gau / waybackurls style): the site's own past
+        // URLs carry long-lived search and pagination conventions.
+        val archived = runCatching { toolkit.mineArchive() }.getOrDefault(emptyList())
+        urls += archived.take(MAX_ARCHIVE_URLS)
+
         // ── 2. Homepage: links, anchors, the real search form ─────────
+        // One recorded, triaged fetch of the root gives headers for the
+        // tech fingerprint (and the document when none was handed in).
+        val homeResponse = runCatching { toolkit.fetch(base, HOMEPAGE_TIMEOUT_MS, "homepage") }.getOrNull()
         val homepageDoc: Document? = when {
             !homepageHtml.isNullOrBlank() -> runCatching { Jsoup.parse(homepageHtml, base) }.getOrNull()
+            homeResponse != null && homeResponse.isHttpOk && homeResponse.body.isNotBlank() ->
+                runCatching { homeResponse.parse() }.getOrNull()
             else -> {
                 val t0 = System.currentTimeMillis()
                 val doc = runCatching { cloudflareBypassEngine.fetchJsoupDocument(base, HOMEPAGE_TIMEOUT_MS) }.getOrNull()
@@ -190,6 +206,22 @@ class SiteReconEngine @Inject constructor(
                 .getOrDefault(StateBlobFindings(emptyList(), null))
         }
 
+        // ── 2b. Heavy recon: fingerprint, deep crawl, scripts, params ──
+        val tech = runCatching { toolkit.fingerprint(homeResponse, homepageDoc) }.getOrDefault(emptyList())
+        val crawl = runCatching { toolkit.crawl(homepageDoc) }
+            .getOrDefault(ReconToolkit.CrawlResult(emptyList(), emptySet(), emptyList()))
+        urls += crawl.links
+        val scripts = runCatching { toolkit.scriptTexts(homepageDoc) }.getOrDefault(emptyList())
+        val jsEndpoints = runCatching { toolkit.mineJsEndpoints(scripts) }.getOrDefault(emptyList())
+        runCatching {
+            toolkit.triageEndpoints(jsEndpoints.filter { e ->
+                listOf("/api", "/ajax", "search", ".json", "graphql", "wp-json").any { e.contains(it, ignoreCase = true) }
+            })
+        }
+        val minedParams = runCatching {
+            toolkit.mineParameters(urls, listOfNotNull(homepageDoc) + crawl.docs, scripts)
+        }.getOrDefault(emptyMap())
+
         // ── 3. Existing endpoint recon (JS analysis, CMS/API probes) ──
         val discovered = withTimeoutOrNull(DISCOVERY_TIMEOUT_MS) {
             runCatching { endpointDiscoveryEngine.discoverEndpoints(base) }.getOrNull()
@@ -210,6 +242,12 @@ class SiteReconEngine @Inject constructor(
         // forms, GET + POST variants); each distinct one is a candidate.
         if (homepageDoc != null) {
             runCatching { harvestSearchForms(homepageDoc, base, pagination.param) }
+                .getOrDefault(emptyList())
+                .forEach { candidates += it }
+        }
+        // Forms on crawled inner pages (a dedicated /search page, etc.).
+        for (doc in crawl.docs) {
+            runCatching { harvestSearchForms(doc, base, pagination.param) }
                 .getOrDefault(emptyList())
                 .forEach { candidates += it }
         }
@@ -242,6 +280,12 @@ class SiteReconEngine @Inject constructor(
         // Templates derived from the site's own URL inventory.
         deriveSearchTemplates(sameHostUrls, pagination).forEach {
             candidates += SearchCandidate(urlTemplate = it, source = CandidateSource.SITEMAP_DERIVED)
+        }
+
+        // Wordlist routes (ffuf/dirsearch style) — only live-verified hits.
+        val wordlistHits = runCatching { toolkit.probeWordlist(probeQuery, tech) }.getOrDefault(emptyList())
+        wordlistHits.forEach { hit ->
+            candidates += SearchCandidate(urlTemplate = hit.template, source = CandidateSource.WORDLIST)
         }
 
         // Endpoints named by the page's own scripts and state blobs.
@@ -305,7 +349,9 @@ class SiteReconEngine @Inject constructor(
             mappedUrlCount = sameHostUrls.size,
             fetchTimingsMs = timings.toList(),
             medianResponseMs = median,
-            suggestedTimeoutMs = suggestedTimeout
+            suggestedTimeoutMs = suggestedTimeout,
+            sitemapsRead = sitemapsRead.toList(),
+            reconMap = toolkit.buildMap(tech, crawl, minedParams, jsEndpoints, archived, wordlistHits)
         )
     }
 
@@ -317,7 +363,8 @@ class SiteReconEngine @Inject constructor(
         CandidateSource.JSON_API -> 2
         CandidateSource.EMBEDDED_STATE -> 3
         CandidateSource.DISCOVERED_ENDPOINT -> 4
-        CandidateSource.SITEMAP_DERIVED -> 5
+        CandidateSource.WORDLIST -> 5
+        CandidateSource.SITEMAP_DERIVED -> 6
     }
 
     /** All distinct search forms on the page (GET and POST variants). */
@@ -826,6 +873,9 @@ class SiteReconEngine @Inject constructor(
         private const val MAX_SCRIPT_CANDIDATES = 4
         private const val MAX_FEED_LINKS = 50
         private const val MAX_JSON_PROBES = 3
+        /** Whole-recon time budget (the repository's outer timeout is a backstop above it). */
+        private const val RECON_BUDGET_MS = 32_000L
+        private const val MAX_ARCHIVE_URLS = 400
 
         private val SCRIPT_URL_LITERAL_REGEX =
             Regex("""['"`](/(?:api|ajax|search|wp-json)[^'"`\s]*?)['"`]""", RegexOption.IGNORE_CASE)
@@ -887,7 +937,11 @@ data class SiteRecon(
     val fetchTimingsMs: List<Long>,
     val medianResponseMs: Long,
     /** Timeout to record on the saved config, derived from measured timing. */
-    val suggestedTimeoutMs: Int
+    val suggestedTimeoutMs: Int,
+    /** Sitemap files actually read (robots-declared and conventional). */
+    val sitemapsRead: List<String> = emptyList(),
+    /** Heavy-recon evidence: fingerprint, crawl, params, JS endpoints, archive, wordlist, triage, checks. */
+    val reconMap: ReconMap = ReconMap()
 )
 
 /**
@@ -908,4 +962,4 @@ data class SearchCandidate(
     val jsonThumbnailField: String? = null
 )
 
-enum class CandidateSource { FORM, OPENSEARCH, SITEMAP_DERIVED, DISCOVERED_ENDPOINT, JSON_API, EMBEDDED_STATE }
+enum class CandidateSource { FORM, OPENSEARCH, SITEMAP_DERIVED, DISCOVERED_ENDPOINT, JSON_API, EMBEDDED_STATE, WORDLIST }
