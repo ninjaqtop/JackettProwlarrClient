@@ -3,6 +3,7 @@ package com.aggregatorx.app.data.repository
 import com.aggregatorx.app.data.database.*
 import com.aggregatorx.app.data.model.*
 import com.aggregatorx.app.engine.analyzer.SiteAnalyzerEngine
+import com.aggregatorx.app.engine.analyzer.SiteMapConfigAnalyzer
 import com.aggregatorx.app.engine.nlp.NaturalLanguageQueryProcessor
 import com.aggregatorx.app.engine.ranking.RankingEngine
 import com.aggregatorx.app.engine.scraper.ScrapingEngine
@@ -10,6 +11,10 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.withTimeout
+import kotlinx.serialization.encodeToString
+import kotlinx.serialization.json.Json
+import org.json.JSONArray
+import org.json.JSONObject
 import org.jsoup.Jsoup
 import java.net.URL
 import java.net.URLEncoder
@@ -32,368 +37,230 @@ class AggregatorRepository @Inject constructor(
 ) {
     private companion object {
         const val PROVIDER_ANALYSIS_TIMEOUT_MS = 60_000L
+        const val SITE_MAP_HEADER = "AggregatorX-Site-Map"
+        const val PROVIDER_CONFIG_HEADER = "AggregatorX-Provider-Config"
+        val json = Json { ignoreUnknownKeys = true; prettyPrint = true; encodeDefaults = true }
     }
 
-    fun clearSearchCache() {
-        scrapingEngine.clearCache()
-    }
-    // Providers
+    fun clearSearchCache() = scrapingEngine.clearCache()
     fun getAllProviders(): Flow<List<Provider>> = providerDao.getAllProviders()
     fun getEnabledProviders(): Flow<List<Provider>> = providerDao.getEnabledProviders()
     suspend fun getEnabledProvidersSnapshot(): List<Provider> = providerDao.getEnabledProvidersSync()
-    
     suspend fun getProviderById(id: String): Provider? = providerDao.getProviderById(id)
-    
+
     suspend fun addProvider(url: String, name: String? = null): Provider {
         val normalizedUrl = normalizeUrl(url)
         val baseUrl = extractBaseUrl(normalizedUrl)
-        
-        val existingProvider = providerDao.getProviderByUrl(normalizedUrl)
-            ?: providerDao.getProviderByBaseUrl(baseUrl)
-        if (existingProvider != null) {
-            val updated = existingProvider.copy(
-                url = normalizedUrl,
-                baseUrl = baseUrl,
-                isEnabled = true,
-                name = name ?: existingProvider.name
-            )
+        val existing = providerDao.getProviderByUrl(normalizedUrl) ?: providerDao.getProviderByBaseUrl(baseUrl)
+        if (existing != null) {
+            val updated = existing.copy(url = normalizedUrl, baseUrl = baseUrl, isEnabled = true, name = name ?: existing.name)
             providerDao.updateProvider(updated)
             clearSearchCache()
             return updated
         }
-        
         val provider = Provider(
-            id = UUID.randomUUID().toString(),
-            name = name ?: extractSiteName(normalizedUrl),
-            url = normalizedUrl,
-            baseUrl = baseUrl,
-            isEnabled = true,
-            category = detectCategory(normalizedUrl)
+            id = UUID.randomUUID().toString(), name = name ?: extractSiteName(normalizedUrl),
+            url = normalizedUrl, baseUrl = baseUrl, isEnabled = true, category = detectCategory(normalizedUrl)
         )
-        
         providerDao.insertProvider(provider)
         clearSearchCache()
         return provider
     }
-    
-    suspend fun updateProvider(provider: Provider) {
-        providerDao.updateProvider(provider)
-    }
-    
+
+    suspend fun updateProvider(provider: Provider) = providerDao.updateProvider(provider)
+
     suspend fun deleteProvider(providerId: String) {
         providerDao.deleteProviderById(providerId)
         siteAnalysisDao.deleteAnalysesForProvider(providerId)
         scrapingConfigDao.deleteConfigForProvider(providerId)
     }
-    
-    suspend fun setProviderEnabled(providerId: String, enabled: Boolean) {
-        providerDao.setProviderEnabled(providerId, enabled)
-    }
-    
-    // Site Analysis
+
+    suspend fun setProviderEnabled(providerId: String, enabled: Boolean) = providerDao.setProviderEnabled(providerId, enabled)
+
     suspend fun analyzeProvider(providerId: String): SiteAnalysis {
-        val provider = providerDao.getProviderById(providerId)
-            ?: throw IllegalArgumentException("Provider not found")
-        
-        val analysis = runCatching {
-            withTimeout(PROVIDER_ANALYSIS_TIMEOUT_MS) {
-                siteAnalyzerEngine.analyzeSite(provider.url, providerId)
-            }
+        val provider = providerDao.getProviderById(providerId) ?: throw IllegalArgumentException("Provider not found")
+        val rawAnalysis = runCatching {
+            withTimeout(PROVIDER_ANALYSIS_TIMEOUT_MS) { siteAnalyzerEngine.analyzeSite(provider.url, providerId) }
         }.getOrElse {
             if (it is CancellationException && it !is TimeoutCancellationException) throw it
             SiteAnalysis(
-                providerId = providerId,
-                url = provider.url,
-                analyzedAt = System.currentTimeMillis(),
+                providerId = providerId, url = provider.url, analyzedAt = System.currentTimeMillis(),
                 hasSSL = provider.url.startsWith("https://", ignoreCase = true),
-                scrapingStrategy = ScrapingStrategy.HYBRID,
-                requiresJavaScript = true,
-                rawHtml = null,
-                headers = "{}",
-                cookies = "[]"
+                scrapingStrategy = ScrapingStrategy.HYBRID, requiresJavaScript = true,
+                rawHtml = null, headers = "{}", cookies = "[]"
             )
         }
+
+        val mapping = SiteMapConfigAnalyzer.analyze(rawAnalysis.rawHtml.orEmpty(), rawAnalysis.url.ifBlank { provider.url })
+        val config = buildScrapingConfig(provider, rawAnalysis, mapping)
+        val enrichedHeaders = enrichAnalyzerJson(rawAnalysis.headers, mapping, config)
+        val analysis = rawAnalysis.copy(headers = enrichedHeaders)
+
+        // Keep both persisted records linked to the same provider; analysis JSON also
+        // carries a readable/exportable copy for the Settings analysis screen.
         siteAnalysisDao.insertAnalysis(analysis)
-        
-        // Generate scraping config from analysis. If selector generation fails,
-        // the provider still remains saved and searchable through generic fallback.
-        runCatching { generateScrapingConfig(provider, analysis) }
-        
-        // Update provider last analyzed timestamp
+        scrapingConfigDao.deleteConfigForProvider(providerId)
+        scrapingConfigDao.insertConfig(config)
         providerDao.updateLastAnalyzed(providerId, System.currentTimeMillis())
-        
         return analysis
     }
-    
-    suspend fun analyzeNewUrl(url: String): Pair<Provider, SiteAnalysis> {
-        val provider = addProvider(url)
-        val analysis = analyzeProvider(provider.id)
-        return Pair(provider, analysis)
-    }
-    
-    suspend fun refreshAllProviders(): List<Pair<Provider, Result<SiteAnalysis>>> {
-        val providers = providerDao.getEnabledProvidersSync()
-        return providers.map { provider ->
-            try {
-                val analysis = analyzeProvider(provider.id)
-                Pair(provider, Result.success(analysis))
-            } catch (e: Exception) {
-                Pair(provider, Result.failure(e))
-            }
-        }
-    }
-    
-    suspend fun getLatestAnalysis(providerId: String): SiteAnalysis? {
-        return siteAnalysisDao.getLatestAnalysis(providerId)
-    }
-    
-    fun searchAllProviders(query: String, pages: Map<String, Int> = emptyMap()): Flow<ProviderSearchResults> {
-        // Always bypass cache from the UI search path so newly analyzed providers and
-        // explicit page requests are reflected immediately.
-        return scrapingEngine.searchAllProviders(query, pages, false)
-    }
 
-    suspend fun searchProviderPage(providerId: String, query: String, pageOffset: Int): ProviderSearchResults? {
-        val provider = providerDao.getProviderById(providerId) ?: return null
-        return scrapingEngine.searchProviderSmart(provider, query, pageOffset)
-    }
-    
-    suspend fun aggregateSearchResults(
-        query: String,
-        providerResults: List<ProviderSearchResults>
-    ): AggregatedSearchResults {
-        // Save to search history
-        searchHistoryDao.insertSearch(SearchHistoryEntry(
-            query = query,
-            resultCount = providerResults.sumOf { it.results.size },
-            providersSearched = providerResults.size,
-            successfulProviders = providerResults.count { it.success }
-        ))
-
-        // Inject learned user preferences into the ranking engine
-        // so they influence Top Results scoring only.
-        val likedUrls = likedResultDao.getAllLikedUrls().toSet()
-        val profile = learnedProfileDao.getProfile()
-        if (profile != null) {
-            rankingEngine.setUserPreferences(
-                keywords = profile.preferredKeywordsMap(),
-                providers = profile.preferredProvidersMap(),
-                qualities = profile.preferredQualitiesMap(),
-                liked = likedUrls
-            )
-        } else {
-            rankingEngine.setUserPreferences(liked = likedUrls)
-        }
-
-        // Pass NLP-processed query to ranking engine for semantic scoring
-        val processedQuery = nlpProcessor.processQuery(query)
-        rankingEngine.setProcessedQuery(processedQuery)
-
-        return rankingEngine.rankAndAggregate(query, providerResults)
-    }
-    
-    // Search History
-    fun getRecentSearches(): Flow<List<SearchHistoryEntry>> = searchHistoryDao.getRecentSearches()
-    
-    suspend fun clearSearchHistory() {
-        searchHistoryDao.clearHistory()
-    }
-    
-    // Helper methods
-    private suspend fun generateScrapingConfig(provider: Provider, analysis: SiteAnalysis) {
-        val searchUrlTemplate = buildSearchUrlTemplate(provider.baseUrl, analysis)
-        val config = ScrapingConfig(
+    private fun buildScrapingConfig(
+        provider: Provider,
+        analysis: SiteAnalysis,
+        mapping: SiteMapConfigAnalyzer.SiteMapConfig
+    ): ScrapingConfig {
+        val template = mapping.searchUrlTemplate ?: buildSearchUrlTemplate(provider.baseUrl, analysis)
+        return ScrapingConfig(
             providerId = provider.id,
-            searchUrlTemplate = searchUrlTemplate,
-            resultSelector = analysis.resultItemSelector ?: ".item, .result, article",
-            titleSelector = analysis.titleSelector ?: "h2, .title, a",
-            urlSelector = "a[href]",
+            searchUrlTemplate = template,
+            resultSelector = mapping.resultSelector ?: analysis.resultItemSelector ?: ".item, .result, article",
+            titleSelector = mapping.titleSelector ?: analysis.titleSelector ?: "h2, .title, a",
+            urlSelector = mapping.linkSelector ?: "a[href]",
             descriptionSelector = analysis.descriptionSelector,
-            thumbnailSelector = analysis.thumbnailSelector,
+            thumbnailSelector = mapping.thumbnailSelector ?: analysis.thumbnailSelector,
             dateSelector = analysis.dateSelector,
-            ratingSelector = analysis.ratingSelector
+            ratingSelector = analysis.ratingSelector,
+            headers = analysis.headers.ifBlank { "{}" },
+            cookies = analysis.cookies.ifBlank { "[]" },
+            userAgent = com.aggregatorx.app.engine.util.EngineUtils.DEFAULT_USER_AGENT,
+            timeout = 12_000,
+            retryCount = 1
         )
-        scrapingConfigDao.deleteConfigForProvider(provider.id)
-        scrapingConfigDao.insertConfig(config)
     }
-    
-    private fun buildSearchUrlTemplate(baseUrl: String, analysis: SiteAnalysis): String {
-        val analyzedDocument = analysis.rawHtml
-            ?.takeIf { it.isNotBlank() }
-            ?.let { runCatching { Jsoup.parse(it, analysis.url) }.getOrNull() }
 
-        val form = analyzedDocument?.let { document ->
-            analysis.searchFormSelector
-                ?.let { selector -> runCatching { document.selectFirst(selector) }.getOrNull() }
-                ?: document.selectFirst(
-                    "form:has(input[type=search]), form:has(input[name=q]), " +
-                        "form:has(input[name=query]), form:has(input[name=search]), form:has(input[name=s])"
-                )
+    private fun enrichAnalyzerJson(
+        headers: String,
+        mapping: SiteMapConfigAnalyzer.SiteMapConfig,
+        config: ScrapingConfig
+    ): String {
+        val root = runCatching { JSONObject(headers) }.getOrElse { JSONObject() }
+        val report = runCatching { JSONObject(root.optString(SiteAnalyzerEngine.CAPABILITY_REPORT_HEADER, "{}")) }
+            .getOrElse { JSONObject() }
+        val sections = report.optJSONArray("sections") ?: JSONArray().also { report.put("sections", it) }
+        val checks = JSONArray()
+        fun check(name: String, value: String, status: String = if (value.isBlank()) "not_detected" else "detected") {
+            checks.put(JSONObject().put("name", name).put("status", status).put("detail", value))
         }
+        check("Search route", mapping.searchUrlTemplate.orEmpty(), if (mapping.searchUrlTemplate.isNullOrBlank()) "not_detected" else "detected")
+        check("Search form selector", mapping.searchFormSelector.orEmpty())
+        check("Query input selector", mapping.queryInputSelector.orEmpty())
+        check("Result card selector", mapping.resultSelector.orEmpty())
+        check("Result title selector", mapping.titleSelector.orEmpty())
+        check("Result link selector", mapping.linkSelector.orEmpty())
+        check("Thumbnail selector", mapping.thumbnailSelector.orEmpty())
+        check("Mapping confidence", "${(mapping.confidence * 100).toInt()}%")
+        check("Saved provider config", "Room ScrapingConfig saved; timeout=${config.timeout}ms, retries=${config.retryCount}")
+        sections.put(JSONObject().put("title", "Saved Site Mapping & Provider Config").put("checks", checks))
+        report.put("generatedAt", System.currentTimeMillis())
+        root.put(SiteAnalyzerEngine.CAPABILITY_REPORT_HEADER, report.toString())
+        root.put(SITE_MAP_HEADER, SiteMapConfigAnalyzer.encode(mapping))
+        root.put(PROVIDER_CONFIG_HEADER, json.encodeToString(config))
+        return root.toString()
+    }
 
+    private fun buildSearchUrlTemplate(baseUrl: String, analysis: SiteAnalysis): String {
+        val doc = analysis.rawHtml?.takeIf { it.isNotBlank() }?.let { runCatching { Jsoup.parse(it, analysis.url) }.getOrNull() }
+        val form = doc?.let { document ->
+            analysis.searchFormSelector?.let { selector -> runCatching { document.selectFirst(selector) }.getOrNull() }
+                ?: document.selectFirst("form:has(input[type=search]), form:has(input[name=q]), form:has(input[name=query]), form:has(input[name=search]), form:has(input[name=s])")
+        }
         if (form != null && !form.attr("method").equals("post", ignoreCase = true)) {
             val action = form.absUrl("action").ifBlank { analysis.url.ifBlank { baseUrl } }
-            val queryInput = form.select(
-                "input[type=search], input[name=q], input[name=query], input[name=search], " +
-                    "input[name=s], input[name=keyword], input[name=term]"
-            ).firstOrNull()
-            val queryName = queryInput?.attr("name")?.takeIf { it.isNotBlank() } ?: "q"
-            val fixedFields = form.select("input[name]")
-                .filter { input ->
-                    input !== queryInput &&
-                        input.attr("type").lowercase() in setOf("hidden", "submit") &&
-                        input.attr("value").isNotBlank()
-                }
-                .joinToString("&") { input ->
-                    "${URLEncoder.encode(input.attr("name"), "UTF-8")}" +
-                        "=${URLEncoder.encode(input.attr("value"), "UTF-8")}"
-                }
-            val separator = if (action.contains('?')) "&" else "?"
-            return buildString {
-                append(action)
-                append(separator)
-                if (fixedFields.isNotBlank()) {
-                    append(fixedFields)
-                    append('&')
-                }
-                append(URLEncoder.encode(queryName, "UTF-8"))
-                append("={query}&page={page}")
-            }
+            val input = form.select("input[type=search], input[name=q], input[name=query], input[name=search], input[name=s], input[name=keyword], input[name=term]").firstOrNull()
+            val queryName = input?.attr("name")?.takeIf { it.isNotBlank() } ?: "q"
+            val fixed = form.select("input[name]").filter { it !== input && it.attr("type").lowercase() in setOf("hidden", "submit") && it.attr("value").isNotBlank() }
+                .joinToString("&") { "${URLEncoder.encode(it.attr("name"), "UTF-8")}=${URLEncoder.encode(it.attr("value"), "UTF-8")}" }
+            return action + (if (action.contains('?')) "&" else "?") +
+                (if (fixed.isBlank()) "" else "$fixed&") + "${URLEncoder.encode(queryName, "UTF-8")}={query}&page={page}"
         }
-
         return "$baseUrl/search?q={query}&page={page}"
     }
-    
-    private fun normalizeUrl(url: String): String {
-        var normalized = url.trim()
-        if (!normalized.startsWith("http://") && !normalized.startsWith("https://")) {
-            normalized = "https://$normalized"
-        }
-        return normalized.trimEnd('/')
-    }
-    
-    private fun extractBaseUrl(url: String): String {
-        return try {
-            val u = URL(url)
-            "${u.protocol}://${u.host}"
-        } catch (e: Exception) {
-            url
-        }
-    }
-    
-    private fun extractSiteName(url: String): String {
-        return try {
-            val u = URL(url)
-            val host = u.host.removePrefix("www.")
-            host.split(".").first().replaceFirstChar { it.uppercase() }
-        } catch (e: Exception) {
-            "Unknown"
-        }
-    }
-    
-    private fun detectCategory(url: String): ProviderCategory {
-        val urlLower = url.lowercase()
-        return when {
-            urlLower.contains("torrent") || urlLower.contains("1337") || 
-            urlLower.contains("rarbg") || urlLower.contains("pirate") -> ProviderCategory.TORRENT
-            
-            urlLower.contains("stream") || urlLower.contains("movie") || 
-            urlLower.contains("watch") || urlLower.contains("video") -> ProviderCategory.STREAMING
-            
-            urlLower.contains("news") || urlLower.contains("blog") -> ProviderCategory.NEWS
-            
-            urlLower.contains("api") -> ProviderCategory.API_BASED
-            
-            else -> ProviderCategory.GENERAL
-        }
+
+    suspend fun analyzeNewUrl(url: String): Pair<Provider, SiteAnalysis> {
+        val provider = addProvider(url)
+        return provider to analyzeProvider(provider.id)
     }
 
-    // ── Like / preference learning ─────────────────────────────────────
+    suspend fun refreshAllProviders(): List<Pair<Provider, Result<SiteAnalysis>>> = providerDao.getEnabledProvidersSync().map { provider ->
+        try { provider to Result.success(analyzeProvider(provider.id)) }
+        catch (e: Exception) { provider to Result.failure(e) }
+    }
+
+    suspend fun getLatestAnalysis(providerId: String): SiteAnalysis? = siteAnalysisDao.getLatestAnalysis(providerId)
+
+    fun searchAllProviders(query: String, pages: Map<String, Int> = emptyMap()): Flow<ProviderSearchResults> =
+        scrapingEngine.searchAllProviders(query, pages, false)
+
+    suspend fun searchProviderPage(providerId: String, query: String, pageOffset: Int): ProviderSearchResults? =
+        providerDao.getProviderById(providerId)?.let { scrapingEngine.searchProviderSmart(it, query, pageOffset) }
+
+    suspend fun aggregateSearchResults(query: String, providerResults: List<ProviderSearchResults>): AggregatedSearchResults {
+        searchHistoryDao.insertSearch(SearchHistoryEntry(
+            query = query, resultCount = providerResults.sumOf { it.results.size },
+            providersSearched = providerResults.size, successfulProviders = providerResults.count { it.success }
+        ))
+        val likedUrls = likedResultDao.getAllLikedUrls().toSet()
+        val profile = learnedProfileDao.getProfile()
+        if (profile != null) rankingEngine.setUserPreferences(
+            keywords = profile.preferredKeywordsMap(), providers = profile.preferredProvidersMap(),
+            qualities = profile.preferredQualitiesMap(), liked = likedUrls
+        ) else rankingEngine.setUserPreferences(liked = likedUrls)
+        rankingEngine.setProcessedQuery(nlpProcessor.processQuery(query))
+        return rankingEngine.rankAndAggregate(query, providerResults)
+    }
+
+    fun getRecentSearches(): Flow<List<SearchHistoryEntry>> = searchHistoryDao.getRecentSearches()
+    suspend fun clearSearchHistory() = searchHistoryDao.clearHistory()
 
     suspend fun toggleLike(result: SearchResult): Boolean {
         val existing = likedResultDao.getLikedByUrl(result.url)
         return if (existing != null) {
-            likedResultDao.removeLikeByUrl(result.url)
-            rebuildLearnedProfile()
-            false
+            likedResultDao.removeLikeByUrl(result.url); rebuildLearnedProfile(); false
         } else {
-            val titleKeywords = result.title.lowercase()
-                .split(Regex("\\W+"))
-                .filter { it.length > 2 }
-                .distinct()
-                .joinToString(",")
-
-            likedResultDao.insertLike(
-                LikedResult(
-                    title = result.title,
-                    url = result.url,
-                    providerId = result.providerId,
-                    providerName = result.providerName,
-                    category = result.category.orEmpty(),
-                    quality = result.quality.orEmpty(),
-                    thumbnailUrl = result.thumbnailUrl,
-                    description = result.description,
-                    seeders = result.seeders,
-                    rating = result.rating,
-                    titleKeywords = titleKeywords
-                )
-            )
-            rebuildLearnedProfile()
-            true
+            val keywords = result.title.lowercase().split(Regex("\\W+")).filter { it.length > 2 }.distinct().joinToString(",")
+            likedResultDao.insertLike(LikedResult(
+                title = result.title, url = result.url, providerId = result.providerId, providerName = result.providerName,
+                category = result.category.orEmpty(), quality = result.quality.orEmpty(), thumbnailUrl = result.thumbnailUrl,
+                description = result.description, seeders = result.seeders, rating = result.rating, titleKeywords = keywords
+            ))
+            rebuildLearnedProfile(); true
         }
     }
 
-    suspend fun getAllLikedUrls(): Set<String> =
-        likedResultDao.getAllLikedUrls().toSet()
-
-    fun getAllLikedResults(): Flow<List<LikedResult>> =
-        likedResultDao.getAllLikedResults()
+    suspend fun getAllLikedUrls(): Set<String> = likedResultDao.getAllLikedUrls().toSet()
+    fun getAllLikedResults(): Flow<List<LikedResult>> = likedResultDao.getAllLikedResults()
 
     private suspend fun rebuildLearnedProfile() {
         val likes = likedResultDao.getAllLikedResults().first()
-        if (likes.isEmpty()) {
-            learnedProfileDao.saveProfile(LearnedUserProfile())
-            return
+        if (likes.isEmpty()) { learnedProfileDao.saveProfile(LearnedUserProfile()); return }
+        fun weights(values: List<String>): String {
+            val counts = values.filter { it.isNotBlank() }.groupingBy { it }.eachCount()
+            val max = counts.values.maxOrNull()?.toFloat() ?: 1f
+            return counts.entries.joinToString(";") { "${it.key}:${it.value / max}" }
         }
-
-        val keywordCounts = mutableMapOf<String, Int>()
-        likes.forEach { like ->
-            like.titleKeywords.split(",").filter { it.isNotBlank() }.forEach { kw ->
-                keywordCounts[kw] = (keywordCounts[kw] ?: 0) + 1
-            }
-        }
-        val maxKwCount = keywordCounts.values.maxOrNull()?.toFloat() ?: 1f
-        val keywordWeights = keywordCounts.mapValues { (_, count) ->
-            count.toFloat() / maxKwCount
-        }
-
-        val providerCounts = likes.groupingBy { it.providerId }.eachCount()
-        val maxProvCount = providerCounts.values.maxOrNull()?.toFloat() ?: 1f
-        val providerWeights = providerCounts.mapValues { (_, count) ->
-            count.toFloat() / maxProvCount
-        }
-
-        val qualityCounts = likes.filter { !it.quality.isNullOrBlank() }
-            .groupingBy { it.quality!!.lowercase() }.eachCount()
-        val maxQCount = qualityCounts.values.maxOrNull()?.toFloat() ?: 1f
-        val qualityWeights = qualityCounts.mapValues { (_, count) ->
-            count.toFloat() / maxQCount
-        }
-
-        val categoryCounts = likes.filter { !it.category.isNullOrBlank() }
-            .groupingBy { it.category!!.lowercase() }.eachCount()
-        val maxCatCount = categoryCounts.values.maxOrNull()?.toFloat() ?: 1f
-        val categoryWeights = categoryCounts.mapValues { (_, count) ->
-            count.toFloat() / maxCatCount
-        }
-
         val profile = LearnedUserProfile(
-            preferredKeywords = keywordWeights.entries.joinToString(";") { "${it.key}:${it.value}" },
-            preferredProviders = providerWeights.entries.joinToString(";") { "${it.key}:${it.value}" },
-            preferredCategories = categoryWeights.entries.joinToString(";") { "${it.key}:${it.value}" },
-            preferredQualities = qualityWeights.entries.joinToString(";") { "${it.key}:${it.value}" },
+            preferredKeywords = weights(likes.flatMap { it.titleKeywords.split(",") }),
+            preferredProviders = weights(likes.map { it.providerId }),
+            preferredCategories = weights(likes.mapNotNull { it.category?.lowercase() }),
+            preferredQualities = weights(likes.mapNotNull { it.quality?.lowercase() }),
             totalLikes = likes.size
         )
         learnedProfileDao.saveProfile(profile)
+    }
+
+    private fun normalizeUrl(url: String): String {
+        var value = url.trim()
+        if (!value.startsWith("http://") && !value.startsWith("https://")) value = "https://$value"
+        return value.trimEnd('/')
+    }
+    private fun extractBaseUrl(url: String): String = try { URL(url).let { "${it.protocol}://${it.host}" } } catch (_: Exception) { url }
+    private fun extractSiteName(url: String): String = try { URL(url).host.removePrefix("www.").substringBefore('.').replaceFirstChar { it.uppercase() } } catch (_: Exception) { "Unknown" }
+    private fun detectCategory(url: String): ProviderCategory = when {
+        listOf("torrent", "1337", "rarbg", "pirate").any(url.lowercase()::contains) -> ProviderCategory.TORRENT
+        listOf("stream", "movie", "watch", "video").any(url.lowercase()::contains) -> ProviderCategory.STREAMING
+        listOf("news", "blog").any(url.lowercase()::contains) -> ProviderCategory.NEWS
+        "api" in url.lowercase() -> ProviderCategory.API_BASED
+        else -> ProviderCategory.GENERAL
     }
 }
