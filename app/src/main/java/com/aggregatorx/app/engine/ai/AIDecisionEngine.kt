@@ -88,6 +88,10 @@ class AIDecisionEngine @Inject constructor() {
         
         // Max failure records to keep per domain
         private const val MAX_FAILURE_RECORDS = 50
+
+        // Shared whitespace-split pattern for the tokenizers below (was compiled
+        // per call; Regex is immutable and only read, so sharing is equivalent).
+        private val WHITESPACE_SPLIT_REGEX = Regex("\\s+")
         
         // Intelligence growth rate
         private const val INTELLIGENCE_GROWTH_RATE = 0.02f
@@ -587,7 +591,7 @@ class AIDecisionEngine @Inject constructor() {
     
     private fun tokenizeQuery(query: String): List<String> {
         return query.lowercase()
-            .split(Regex("\\s+"))
+            .split(WHITESPACE_SPLIT_REGEX)
             .filter { it.length > 1 }
             .map { it.trim(',', '.', '!', '?', '"', '\'', '(', ')') }
             .filter { it.isNotEmpty() && it !in STOP_WORDS }
@@ -598,7 +602,7 @@ class AIDecisionEngine @Inject constructor() {
      */
     private fun tokenizeQuerySmart(query: String): List<String> {
         val words = query.lowercase()
-            .split(Regex("\\s+"))
+            .split(WHITESPACE_SPLIT_REGEX)
             .map { it.trim(',', '.', '!', '?', '"', '\'', '(', ')') }
             .filter { it.length > 1 && it.isNotEmpty() }
         
@@ -617,7 +621,7 @@ class AIDecisionEngine @Inject constructor() {
      */
     fun expandQuery(query: String): List<String> {
         val queryLower = query.lowercase().trim()
-        val words = queryLower.split(Regex("\\s+")).filter { it.isNotEmpty() }
+        val words = queryLower.split(WHITESPACE_SPLIT_REGEX).filter { it.isNotEmpty() }
         val variants = mutableListOf(queryLower)
         
         // Add synonym expansions for each significant word
@@ -640,7 +644,7 @@ class AIDecisionEngine @Inject constructor() {
      */
     fun decomposeQueryFallback(query: String): List<String> {
         val words = query.lowercase()
-            .split(Regex("\\s+"))
+            .split(WHITESPACE_SPLIT_REGEX)
             .map { it.trim(',', '.', '!', '?', '"', '\'') }
             .filter { it.length > 2 && it !in STOP_WORDS }
             .distinctBy { it }
@@ -701,7 +705,7 @@ class AIDecisionEngine @Inject constructor() {
     
     private fun matchesCategoryForQuery(category: ProviderCategory, query: String): Boolean {
         val queryLower = query.lowercase()
-        val queryWords = queryLower.split(Regex("\\s+")).toSet()
+        val queryWords = queryLower.split(WHITESPACE_SPLIT_REGEX).toSet()
         return when (category) {
             ProviderCategory.STREAMING -> 
                 (CATEGORY_KEYWORDS["streaming"] ?: emptySet()).any { kw ->

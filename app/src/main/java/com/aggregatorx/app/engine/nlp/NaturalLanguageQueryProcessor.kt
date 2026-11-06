@@ -143,9 +143,9 @@ class NaturalLanguageQueryProcessor @Inject constructor() {
         }
 
         // Remove excessive punctuation but keep structural punctuation
-        s = s.replace(Regex("[!]{2,}"), "!")
-            .replace(Regex("[?]{2,}"), "?")
-            .replace(Regex("[.]{3,}"), "...")
+        s = s.replace(EXCESS_EXCLAMATION_REGEX, "!")
+            .replace(EXCESS_QUESTION_REGEX, "?")
+            .replace(EXCESS_PERIOD_REGEX, "...")
 
         return s
     }
@@ -155,7 +155,7 @@ class NaturalLanguageQueryProcessor @Inject constructor() {
     // ═══════════════════════════════════════════════════════════════════
 
     private fun tokenize(input: String): List<String> {
-        return input.split(Regex("[\\s,;:!?]+"))
+        return input.split(TOKEN_SPLIT_REGEX)
             .map { it.trim('.', '"', '\'', '(', ')', '[', ']') }
             .filter { it.isNotEmpty() }
     }
@@ -749,6 +749,13 @@ class NaturalLanguageQueryProcessor @Inject constructor() {
 
     companion object {
         private const val MAX_SEARCH_QUERIES = 20
+
+        // Pre-compiled normalization/tokenization patterns (were rebuilt per call;
+        // Regex instances are immutable and only read, so sharing is equivalent).
+        private val EXCESS_EXCLAMATION_REGEX = Regex("[!]{2,}")
+        private val EXCESS_QUESTION_REGEX = Regex("[?]{2,}")
+        private val EXCESS_PERIOD_REGEX = Regex("[.]{3,}")
+        private val TOKEN_SPLIT_REGEX = Regex("[\\s,;:!?]+")
 
         // ── Stop words ──────────────────────────────────────────────
         private val STOP_WORDS = setOf(
