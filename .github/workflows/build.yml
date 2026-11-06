@@ -54,6 +54,11 @@ jobs:
           ANDROID_HOME: /usr/local/lib/android/sdk
           ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
 
+      - name: Verify native TLS pair is packaged loadably
+        run: |
+          python3 scripts/native_pair_check.py app/src/main/jniLibs/arm64-v8a
+          python3 scripts/native_pair_check.py --apk app/build/outputs/apk/debug/app-debug.apk
+
       - name: Rename and stage APK
         run: |
           mkdir -p artifacts
