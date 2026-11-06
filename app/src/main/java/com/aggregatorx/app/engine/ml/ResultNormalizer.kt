@@ -2,18 +2,21 @@ package com.aggregatorx.app.engine.ml
 
 import com.aggregatorx.app.data.memory.ProviderMemoryStore
 import com.aggregatorx.app.data.model.SearchResult
+import com.aggregatorx.app.engine.scraper.SearchResultFilter
 import com.aggregatorx.app.engine.util.EngineUtils
 import kotlinx.coroutines.CoroutineScope
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.SupervisorJob
-import kotlinx.coroutines.flow.first
 import kotlinx.coroutines.launch
-import kotlinx.serialization.decodeFromString
-import kotlinx.serialization.encodeToString
 import kotlinx.serialization.json.Json
-import kotlinx.serialization.json.jsonArray
+import kotlinx.serialization.json.JsonArray
+import kotlinx.serialization.json.JsonElement
+import kotlinx.serialization.json.JsonObject
+import kotlinx.serialization.json.JsonPrimitive
 import kotlinx.serialization.json.jsonObject
 import kotlinx.serialization.json.jsonPrimitive
+import java.net.URI
+import java.net.URLDecoder
 
 object ResultNormalizer {
     private val json = Json { encodeDefaults = true; ignoreUnknownKeys = true }
@@ -21,20 +24,13 @@ object ResultNormalizer {
 
     suspend fun normalize(providerId: String, providerBaseUrl: String, results: List<SearchResult>): List<SearchResult> {
         val categoryMappings = loadCategoryMappings(providerId)
-        val normalized = results
+        return results
             .mapNotNull { result -> normalizeLocal(providerId, providerBaseUrl, result, categoryMappings) }
+            .filter { it.title.length >= 3 }
+            .filterNot { isGenericCategoryTitle(it) }
+            .filterNot { isDurationOnlyTitle(it) }
             .distinctBy { it.url }
             .take(50)
-
-        if (normalized.isNotEmpty()) {
-            scope.launch {
-                runCatching {
-                    ProviderMemoryStore.updateProviderSchema(providerId, json.encodeToString(normalized.take(5)), 0.86f)
-                }
-            }
-            learnInBackground(providerId, providerBaseUrl, normalized)
-        }
-        return normalized
     }
 
     private suspend fun loadCategoryMappings(providerId: String): Map<String, String> {
@@ -58,6 +54,17 @@ object ResultNormalizer {
         val normalizedUrl = EngineUtils.normalizeUrl(result.url, providerBaseUrl)
         if (normalizedUrl.isBlank() || normalizedUrl.contains("javascript:", ignoreCase = true)) return null
 
+        val resolvedTitle = if (isDurationOnlyTitle(result) || isGenericCategoryTitle(result)) {
+            extractTitleFromUrl(normalizedUrl) ?: return null
+        } else {
+            title
+        }
+
+        if (resolvedTitle.length < 3 ||
+            SearchResultFilter.isLikelyDuration(resolvedTitle) ||
+            SearchResultFilter.isLikelyCategory(resolvedTitle)
+        ) return null
+
         if (normalizedUrl != result.url) {
             scope.launch {
                 runCatching { ProviderMemoryStore.saveCorrection(providerId, "url", result.url, normalizedUrl, 0.92f) }
@@ -68,112 +75,131 @@ object ResultNormalizer {
             ?.takeIf { it.isNotBlank() && !it.startsWith("data:", ignoreCase = true) }
             ?.let { EngineUtils.normalizeUrl(it, providerBaseUrl) }
 
-        val correctedCategory = result.category?.let { categoryMappings[it] ?: it }
+        val mappedCategory = result.category?.let { categoryMappings[it] ?: it }
+        val correctedCategory = mappedCategory?.takeIf { !SearchResultFilter.isLikelyCategory(it) }
         return result.copy(
-            title = title,
+            title = resolvedTitle,
             url = normalizedUrl,
             thumbnailUrl = normalizedThumb,
             category = correctedCategory
         )
     }
 
-    private fun learnInBackground(providerId: String, providerBaseUrl: String, results: List<SearchResult>) {
-        scope.launch {
-            val rawJson = json.encodeToString(results)
-            runCatching { ProviderMemoryStore.getProviderContext(providerId) }
-            runCatching { AnalysisHelper.checkFreshness(rawJson, "[]").first() }
-            runCatching { AnalysisHelper.analyzePagination(rawJson, providerId).first() }
-            runCatching { AnalysisHelper.diffResults(rawJson, "[]", providerId).first() }
-            results.take(3).forEach { result ->
-                runCatching { repairResult(providerId, providerBaseUrl, result) }
-                runCatching { fixCategory(providerId, result) }
-            }
-        }
+    private fun isDurationOnlyTitle(result: SearchResult): Boolean {
+        return SearchResultFilter.isLikelyDuration(result.title)
     }
 
-    private suspend fun repairResult(providerId: String, providerBaseUrl: String, result: SearchResult): SearchResult {
-        val localUrl = EngineUtils.normalizeUrl(result.url, providerBaseUrl)
-        if (localUrl != result.url) {
-            runCatching { ProviderMemoryStore.saveCorrection(providerId, "url", result.url, localUrl, 0.92f) }
-        }
-        val locallyRepaired = result.copy(
-            url = localUrl,
-            thumbnailUrl = result.thumbnailUrl?.let { EngineUtils.normalizeUrl(it, providerBaseUrl) }
+    private fun isGenericCategoryTitle(result: SearchResult): Boolean {
+        if (SearchResultFilter.isLikelyCategory(result.title)) return true
+        val categoryUrlPatterns = listOf(
+            "/genre/", "/category/", "/browse/", "/filter/", "/tags/",
+            "/type/", "/sort/", "/order/", "?genre=", "?category=",
+            "?type=", "/all-", "/list/genre", "/movies/genre"
         )
+        return categoryUrlPatterns.any { result.url.lowercase().contains(it) }
+    }
 
-        val response = runCatching {
-            AnalysisHelper.repairUrls(json.encodeToString(locallyRepaired), providerId).first()
-        }.getOrNull() ?: return locallyRepaired
+    private fun extractTitleFromUrl(url: String): String? {
         return runCatching {
-            val root = json.parseToJsonElement(response.json).jsonObject
-            val repaired = root["repaired_result"] ?: return@runCatching locallyRepaired
-            json.decodeFromString<SearchResult>(repaired.toString())
-        }.getOrDefault(locallyRepaired)
-    }
+            val rawPath = URI(url).rawPath ?: ""
+            val trimmedPath = rawPath.trimEnd('/')
+            if (trimmedPath.isBlank()) return@runCatching null
 
-    private suspend fun fixCategory(providerId: String, result: SearchResult): SearchResult {
-        val response = runCatching {
-            AnalysisHelper.fixCategory(json.encodeToString(result), providerId).first()
-        }.getOrNull() ?: return result
-        val root = runCatching { json.parseToJsonElement(response.json).jsonObject }.getOrNull() ?: return result
-        val corrected = root["corrected_category"]?.jsonPrimitive?.content.orEmpty()
-        val confidence = root["confidence"]?.jsonPrimitive?.content?.toFloatOrNull() ?: 0f
-        return if (corrected.isNotBlank() && confidence >= 0.8f && corrected != result.category) {
-            runCatching { ProviderMemoryStore.saveCorrection(providerId, "category", result.category.orEmpty(), corrected, confidence) }
-            result.copy(category = corrected)
-        } else {
-            result
-        }
-    }
+            val genericSegments = setOf(
+                "watch", "video", "videos", "movie", "movies", "detail", "details",
+                "view", "play", "embed", "download", "item", "result", "search",
+                "index", "home", "page", "channel", "category", "genre"
+            )
+            // PORTING-UNCERTAIN: the jadx loop over the reversed segments is duplicated/
+            // mangled; interpreted as firstOrNull with this predicate (see porting report).
+            val candidate = trimmedPath.split('/').asReversed().firstOrNull { segment ->
+                val cleaned = Regex("(?i)\\.(html?|php|aspx?)$")
+                    .replace(URLDecoder.decode(segment, "UTF-8"), "")
+                    .trim()
+                cleaned.isNotBlank() && cleaned.lowercase() !in genericSegments
+            } ?: return@runCatching null
 
-    private suspend fun retryRepair(providerId: String, providerBaseUrl: String, result: SearchResult): SearchResult? {
-        val retry = repairResult(providerId, providerBaseUrl, result)
-        return if (retry.url.isNotBlank() && retry.title.isNotBlank()) retry else null
+            val title = URLDecoder.decode(candidate, "UTF-8")
+                .replace(Regex("(?i)\\.(html?|php|aspx?)$"), "")
+                .replace(Regex("[-_]+"), " ")
+                .replace(Regex("\\s+"), " ")
+                .trim()
+
+            val validTitle = if (title.length >= 3 &&
+                title.any { it.isLetter() } &&
+                !SearchResultFilter.isLikelyDuration(title) &&
+                !SearchResultFilter.isLikelyCategory(title)
+            ) title else null
+
+            validTitle?.replaceFirstChar { if (it.isLowerCase()) it.titlecase() else it.toString() }
+        }.getOrNull()
     }
 
     suspend fun normalizeResponse(providerId: String, providerBaseUrl: String, rawResponse: String): List<SearchResult> {
-        val parsed = runCatching {
-            AnalysisHelper.analyzeResults(rawResponse, providerId).first()
-        }.getOrNull() ?: return emptyList()
-        val results = runCatching {
-            json.parseToJsonElement(parsed.json)
-                .jsonObject["results"]
-                ?.jsonArray
-                ?.mapIndexedNotNull { index, item ->
-                    val obj = item.jsonObject
-                    val title = obj["title"]?.jsonPrimitive?.content.orEmpty()
-                    val url = obj["url"]?.jsonPrimitive?.content ?: obj["link"]?.jsonPrimitive?.content ?: ""
-                    if (title.isBlank() || url.isBlank()) null else SearchResult(
-                        providerId = providerId,
-                        providerName = providerId,
-                        title = title,
-                        url = url,
-                        category = obj["category"]?.jsonPrimitive?.content,
-                        thumbnailUrl = obj["thumbnail"]?.jsonPrimitive?.content,
-                        description = obj["description"]?.jsonPrimitive?.content,
-                        relevanceScore = ((obj["confidence"]?.jsonPrimitive?.content?.toFloatOrNull() ?: 0.81f) * 100f) - index
-                    )
-                }
-                .orEmpty()
-        }.getOrDefault(emptyList())
+        val results = try {
+            extractResultsFromJson(rawResponse, providerId, providerBaseUrl)
+        } catch (e: Exception) {
+            emptyList()
+        }
         return normalize(providerId, providerBaseUrl, results)
     }
 
+    private fun extractResultsFromJson(rawResponse: String, providerId: String, baseUrl: String): List<SearchResult> {
+        return try {
+            val root = json.parseToJsonElement(rawResponse)
+            val results = mutableListOf<SearchResult>()
+
+            fun JsonObject.stringValue(vararg keys: String): String? {
+                return keys.firstNotNullOfOrNull { key -> (this[key] as? JsonPrimitive)?.content }
+            }
+
+            fun processElement(element: JsonElement, depth: Int = 0) {
+                if (depth > 10) return
+                if (element is JsonArray) {
+                    element.forEach { processElement(it, depth + 1) }
+                    return
+                }
+                if (element !is JsonObject) return
+
+                val title = element.stringValue("title") ?: ""
+                val rawUrl = element.stringValue("url", "link", "href")
+                if (title.isNotBlank() && !rawUrl.isNullOrBlank()) {
+                    val normalizedUrl = EngineUtils.normalizeUrl(rawUrl, baseUrl)
+                    if (!normalizedUrl.startsWith("http")) return
+                    results.add(
+                        SearchResult(
+                            providerId = providerId,
+                            providerName = providerId,
+                            title = title,
+                            url = normalizedUrl,
+                            description = element.stringValue("description"),
+                            thumbnailUrl = element.stringValue("thumbnail", "image"),
+                            category = element.stringValue("category"),
+                            duration = element.stringValue("duration"),
+                            quality = element.stringValue("quality"),
+                            relevanceScore = (element.stringValue("confidence")?.toFloatOrNull() ?: 0.81f) * 100f
+                        )
+                    )
+                }
+                element.values.forEach { processElement(it, depth + 1) }
+            }
+
+            processElement(root)
+            results.distinctBy { it.url }
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
     suspend fun isFresh(providerId: String, newResults: List<SearchResult>, oldResults: List<SearchResult>): Boolean {
-        val response = runCatching {
-            AnalysisHelper.checkFreshness(json.encodeToString(newResults), json.encodeToString(oldResults)).first()
-        }.getOrNull() ?: return true
-        val root = runCatching { json.parseToJsonElement(response.json).jsonObject }.getOrNull()
-        return root?.get("is_fresh")?.jsonPrimitive?.content?.toBooleanStrictOrNull() ?: true
+        if (newResults.isEmpty() && oldResults.isEmpty()) return false
+        if (newResults.isEmpty() || oldResults.isEmpty()) return true
+        val newUrls = newResults.map { it.url }.toSet()
+        val oldUrls = oldResults.map { it.url }.toSet()
+        return (newUrls - oldUrls).size.toFloat() / maxOf(newUrls.size, 1) >= 0.5f
     }
 
     suspend fun diffFresh(providerId: String, newResults: List<SearchResult>, oldResults: List<SearchResult>): Boolean {
-        val response = runCatching {
-            AnalysisHelper.diffResults(json.encodeToString(newResults), json.encodeToString(oldResults), providerId).first()
-        }.getOrNull() ?: return true
-        val root = runCatching { json.parseToJsonElement(response.json).jsonObject }.getOrNull()
-        return root?.get("is_fresh")?.jsonPrimitive?.content?.toBooleanStrictOrNull()
-            ?: root?.get("freshness_score")?.jsonPrimitive?.content?.toFloatOrNull()?.let { it >= 0.8f }
-            ?: true
+        return isFresh(providerId, newResults, oldResults)
     }
 }

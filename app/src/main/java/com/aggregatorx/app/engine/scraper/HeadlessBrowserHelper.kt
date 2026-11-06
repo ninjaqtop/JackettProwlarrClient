@@ -2,6 +2,7 @@ package com.aggregatorx.app.engine.scraper
 
 import android.annotation.SuppressLint
 import android.content.Context
+import android.os.Looper
 import android.util.Log
 import android.webkit.CookieManager
 import android.webkit.WebChromeClient
@@ -11,19 +12,21 @@ import android.webkit.WebViewClient
 import com.aggregatorx.app.engine.network.TlsFingerprintEngine
 import com.aggregatorx.app.engine.util.EngineUtils
 import kotlinx.coroutines.Dispatchers
-import kotlinx.coroutines.runBlocking
 import kotlinx.coroutines.suspendCancellableCoroutine
 import kotlinx.coroutines.withContext
 import kotlinx.coroutines.sync.Mutex
 import kotlinx.coroutines.sync.withLock
 import okhttp3.FormBody
+import okhttp3.HttpUrl.Companion.toHttpUrlOrNull
 import okhttp3.OkHttpClient
 import okhttp3.Request
 import org.json.JSONArray
 import org.jsoup.Jsoup
 import org.jsoup.nodes.Document
+import java.net.URI
 import java.net.URLEncoder
 import java.util.concurrent.TimeUnit
+import java.util.concurrent.atomic.AtomicBoolean
 import kotlin.coroutines.resume
 
 object HeadlessBrowserHelper {
@@ -44,6 +47,13 @@ object HeadlessBrowserHelper {
             .build()
     }
 
+    /** Result of a real search-form submission: the response page and where it landed. */
+    data class SearchFormPage(
+        val html: String,
+        val finalUrl: String,
+        val statusCode: Int
+    )
+
     fun configure(context: Context) {
         appContext = context.applicationContext
         try {
@@ -56,13 +66,19 @@ object HeadlessBrowserHelper {
     // CORE FIX: SAFE WEBVIEW CLEANUP ON MAIN THREAD
     // ───────────────────────────────────────────────────────────────────────────
 
-    private suspend fun safeDestroy(webView: WebView?) {
-        withContext(Dispatchers.Main) {
+    private fun safeDestroy(webView: WebView?) {
+        if (webView == null) return
+        val destroy = {
             try {
-                webView?.stopLoading()
-                webView?.loadUrl("about:blank")
-                webView?.destroy()
+                webView.stopLoading()
+                webView.loadUrl("about:blank")
+                webView.destroy()
             } catch (_: Exception) {}
+        }
+        if (Looper.myLooper() == Looper.getMainLooper()) {
+            destroy()
+        } else {
+            webView.post { destroy() }
         }
     }
 
@@ -91,7 +107,8 @@ object HeadlessBrowserHelper {
     private suspend fun fetchRenderedPageContent(
         url: String,
         waitSelector: String?,
-        timeout: Int
+        timeout: Int,
+        headers: Map<String, String>
     ): String? = renderMutex.withLock {
 
         val context = appContext ?: return null
@@ -99,18 +116,18 @@ object HeadlessBrowserHelper {
         withContext(Dispatchers.Main.immediate) {
             suspendCancellableCoroutine { cont ->
 
-                var completed = false
+                val completed = AtomicBoolean(false)
                 var webView: WebView? = null
 
-                suspend fun finish(value: String?) {
-                    if (completed) return
-                    completed = true
-                    safeDestroy(webView)
-                    if (cont.isActive) cont.resume(value)
+                fun finish(value: String?) {
+                    if (completed.compareAndSet(false, true)) {
+                        safeDestroy(webView)
+                        if (cont.isActive) cont.resume(value)
+                    }
                 }
 
                 cont.invokeOnCancellation {
-                    runBlocking {
+                    if (completed.compareAndSet(false, true)) {
                         safeDestroy(webView)
                     }
                 }
@@ -139,21 +156,27 @@ object HeadlessBrowserHelper {
                                 injectFingerprintEvasion(view)
                                 removeBrowserObstructions(view)
                                 waitForSelectorThenCapture(view, waitSelector, timeout / 3) { html ->
-                                    runBlocking { finish(html) }
+                                    finish(html)
                                 }
                             }, 800L)
                         }
                     }
 
-                    activeWebView.loadUrl(url, browserHeaders(url))
+                    val mergedHeaders = browserHeaders(url).toMutableMap()
+                    for ((key, value) in headers) {
+                        val existing = mergedHeaders.keys.firstOrNull { it.equals(key, ignoreCase = true) }
+                        if (existing != null) mergedHeaders.remove(existing)
+                        mergedHeaders[key] = value
+                    }
+                    activeWebView.loadUrl(url, mergedHeaders)
 
                     activeWebView.postDelayed({
-                        runBlocking { finish(null) }
+                        finish(null)
                     }, timeout.toLong())
 
                 } catch (e: Exception) {
                     Log.w(TAG, "WebView render failed: ${e.message}")
-                    runBlocking { finish(null) }
+                    finish(null)
                 }
             }
         }
@@ -165,8 +188,9 @@ object HeadlessBrowserHelper {
     suspend fun fetchPageContentWithShadowAndAdSkip(
         url: String,
         waitSelector: String? = null,
-        timeout: Int = 20000
-    ): String? = fetchRenderedPageContent(url, waitSelector, timeout)
+        timeout: Int = 20000,
+        headers: Map<String, String> = emptyMap()
+    ): String? = fetchRenderedPageContent(url, waitSelector, timeout, headers)
 
     /**
      * Discover search API endpoints via headless browser by probing common patterns
@@ -177,7 +201,7 @@ object HeadlessBrowserHelper {
     ): List<String> = withContext(Dispatchers.IO) {
         val discovered = mutableListOf<String>()
         val encoded = URLEncoder.encode(sampleQuery, "UTF-8")
-        
+
         val patterns = listOf(
             "/api/search?q=$encoded",
             "/api/v1/search?q=$encoded",
@@ -185,7 +209,7 @@ object HeadlessBrowserHelper {
             "/search?q=$encoded",
             "/ajax/search?q=$encoded"
         )
-        
+
         for (pattern in patterns) {
             try {
                 val url = "$baseUrl$pattern"
@@ -198,14 +222,14 @@ object HeadlessBrowserHelper {
                 }
             } catch (_: Exception) {}
         }
-        
+
         discovered
     }
 
     /**
      * Fetch page content from a URL
      */
-    suspend fun fetchPageContent(url: String, timeout: Int = 20000): String? = 
+    suspend fun fetchPageContent(url: String, timeout: Int = 20000): String? =
         fetchPageContentWithShadowAndAdSkip(url, null, timeout)
 
     /**
@@ -214,53 +238,147 @@ object HeadlessBrowserHelper {
     suspend fun searchViaHeadlessForm(
         baseUrl: String,
         query: String
-    ): String? = withContext(Dispatchers.IO) {
+    ): String? = submitSearchForm(baseUrl, query)?.html
+
+    /**
+     * Find the site's own search form on its rendered homepage, fill it with the
+     * query exactly as the site's form defines it (hidden fields included), and
+     * submit it the way a browser would. Returns the response page, or null when
+     * the site has no usable form or the submission fails.
+     */
+    suspend fun submitSearchForm(
+        baseUrl: String,
+        query: String,
+        headers: Map<String, String> = emptyMap(),
+        renderTimeout: Int = 15000,
+        requestTimeout: Int = 10000
+    ): SearchFormPage? = withContext(Dispatchers.IO) {
         try {
-            val pageContent = fetchPageContentWithShadowAndAdSkip(baseUrl, "form, [role='search']", 15000)
-            if (pageContent.isNullOrEmpty()) return@withContext null
-            
+            val pageContent = fetchPageContentWithShadowAndAdSkip(
+                baseUrl,
+                "form, [role='search']",
+                renderTimeout,
+                headers
+            ) ?: return@withContext null
+
             val doc = Jsoup.parse(pageContent, baseUrl)
-            val form = doc.selectFirst("form[method=get], form[method=post], [role='search'] form") ?: return@withContext null
-            
-            val action = form.absUrl("action").ifEmpty { baseUrl }
-            val method = form.attr("method").ifEmpty { "get" }
-            
-            // Find the search input field
-            val searchInput = form.selectFirst("input[type=text], input[type=search], input[name*=q], input[name*=query], input[name*=search]")
+            val form = doc.selectFirst("form[method=get], form[method=post], [role='search'] form")
                 ?: return@withContext null
-            
-            val inputName = searchInput.attr("name")
-            if (inputName.isEmpty()) return@withContext null
-            
-            // Build search URL
-            val searchUrl = if (method.equals("post", ignoreCase = true)) {
-                // For POST, construct URL and make the request
-                try {
-                    val formBody = FormBody.Builder()
-                        .add(inputName, query)
-                        .build()
-                    
-                    val request = Request.Builder()
-                        .url(action)
-                        .post(formBody)
-                        .header("Referer", baseUrl)
-                        .build()
-                    
-                    client.newCall(request).execute().use { response ->
-                        response.body?.string()
-                    }
-                } catch (_: Exception) { null }
-            } else {
-                // For GET, construct URL
-                "$action?${inputName}=${URLEncoder.encode(query, "UTF-8")}"
+
+            val action = form.absUrl("action").ifBlank { baseUrl }
+            val method = form.attr("method").ifBlank { "get" }
+
+            // Find the search input field
+            val searchInput = form.selectFirst(
+                "input[type=text], input[type=search], input[name*=q], input[name*=query], input[name*=search]"
+            ) ?: return@withContext null
+
+            val inputName = searchInput.attr("name").ifBlank {
+                searchInput.id().ifBlank { "q" }
             }
-            
-            searchUrl
+
+            // Collect every field the form would send, with the query typed into
+            // the search input.
+            val fields = mutableListOf<Pair<String, String>>()
+            for (field in form.select("input[name], select[name], textarea[name]")) {
+                if (field.hasAttr("disabled")) continue
+                val rawName = field.attr("name").trim()
+                val name = when {
+                    rawName.isNotBlank() -> rawName
+                    field == searchInput -> inputName
+                    else -> continue
+                }
+                when (field.tagName().lowercase()) {
+                    "textarea" -> fields += name to field.text()
+                    "select" -> {
+                        val options = field.select("option")
+                        val chosen = options.filter { it.hasAttr("selected") }
+                            .ifEmpty { options.take(1) }
+                        chosen.forEach { option ->
+                            fields += name to option.attr("value").ifBlank { option.text() }
+                        }
+                    }
+                    "input" -> {
+                        val type = field.attr("type").lowercase().ifBlank { "text" }
+                        if (type in setOf("button", "reset", "submit", "image", "file")) continue
+                        if (type in setOf("checkbox", "radio") && !field.hasAttr("checked")) continue
+                        val value = if (field == searchInput) query else field.attr("value")
+                        fields += name to value
+                    }
+                }
+            }
+            if (fields.none { it.first == inputName }) {
+                fields += inputName to query
+            }
+
+            val builder = Request.Builder()
+                .url(action)
+                .header("Referer", baseUrl)
+
+            // Configured headers (cookies, user agent) only go to the site's own
+            // origin; a form posting elsewhere only gets the generic ones.
+            val effectiveHeaders = if (haveSameOrigin(baseUrl, action)) {
+                headers
+            } else {
+                headers.filterKeys {
+                    it.equals("User-Agent", ignoreCase = true) ||
+                        it.equals("Accept", ignoreCase = true) ||
+                        it.equals("Accept-Language", ignoreCase = true)
+                }
+            }
+            for ((key, value) in effectiveHeaders) {
+                if (key.isBlank() || value.isBlank()) continue
+                if (key.equals("Host", ignoreCase = true) ||
+                    key.equals("Content-Length", ignoreCase = true)
+                ) continue
+                builder.header(key, value)
+            }
+
+            if (method.equals("post", ignoreCase = true)) {
+                val formBody = FormBody.Builder().apply {
+                    fields.forEach { (name, value) -> add(name, value) }
+                }.build()
+                builder.post(formBody)
+            } else {
+                val httpUrl = action.toHttpUrlOrNull() ?: return@withContext null
+                val urlBuilder = httpUrl.newBuilder()
+                for ((name, values) in fields.groupBy { it.first }) {
+                    urlBuilder.removeAllQueryParameters(name)
+                    values.forEach { urlBuilder.addQueryParameter(name, it.second) }
+                }
+                builder.url(urlBuilder.build()).get()
+            }
+
+            try {
+                client.newBuilder()
+                    .callTimeout(requestTimeout.toLong(), TimeUnit.MILLISECONDS)
+                    .build()
+                    .newCall(builder.build())
+                    .execute().use { response ->
+                        if (!response.isSuccessful) return@withContext null
+                        val body = response.body?.string() ?: return@withContext null
+                        if (body.isBlank()) return@withContext null
+                        SearchFormPage(body, response.request.url.toString(), response.code)
+                    }
+            } catch (e: Exception) {
+                Log.w(TAG, "Form submission failed: ${e.message}")
+                null
+            }
         } catch (e: Exception) {
             Log.w(TAG, "Form submission failed: ${e.message}")
             null
         }
     }
+
+    fun haveSameOrigin(first: String, second: String): Boolean = runCatching {
+        fun origin(value: String): Triple<String, String, Int> {
+            val uri = URI(value)
+            val scheme = uri.scheme.lowercase()
+            val port = uri.port.takeIf { it >= 0 } ?: if (scheme == "https") 443 else 80
+            return Triple(scheme, uri.host.lowercase(), port)
+        }
+        origin(first) == origin(second)
+    }.getOrDefault(false)
 
     /**
      * Extract video URLs from a page via headless browser
@@ -272,20 +390,20 @@ object HeadlessBrowserHelper {
                 "video, source, [data-video-url], [data-src*='video']",
                 15000
             ) ?: return@withContext emptyList()
-            
+
             val doc = Jsoup.parse(content, pageUrl)
             val videoUrls = mutableListOf<String>()
-            
+
             // Extract from <video> and <source> tags
             doc.select("video > source").forEach { source ->
                 source.attr("src").takeIf { it.isNotEmpty() }?.let { videoUrls.add(it) }
             }
-            
+
             // Extract from data attributes
             doc.select("[data-video-url]").forEach { elem ->
                 elem.attr("data-video-url").takeIf { it.isNotEmpty() }?.let { videoUrls.add(it) }
             }
-            
+
             // Sort by quality preference (1080p > 720p > other)
             videoUrls.sortedByDescending { url ->
                 when {
@@ -312,13 +430,13 @@ object HeadlessBrowserHelper {
         try {
             val content = fetchPageContentWithShadowAndAdSkip(baseUrl, "[role='tab'], .tab", timeout)
             if (content.isNullOrEmpty()) return@withContext null
-            
+
             val doc = Jsoup.parse(content, baseUrl)
-            
+
             // Try to find and click tabs that might have search/results
             val tabs = doc.select("[role='tab'], .tab, .nav-tab")
             if (tabs.isEmpty()) return@withContext content
-            
+
             // Return the first tab content as fallback
             content
         } catch (e: Exception) {
@@ -332,7 +450,7 @@ object HeadlessBrowserHelper {
      * Note: This is a stub that returns a simple wrapper since full Playwright
      * is not available on Android. This is best-effort.
      */
-    suspend fun createAntiDetectionPage(): AntiDetectionPage = 
+    suspend fun createAntiDetectionPage(): AntiDetectionPage =
         AntiDetectionPage(this)
 
     // ──────────────────────────────────────────────────────────────────────────
@@ -448,15 +566,15 @@ object HeadlessBrowserHelper {
  */
 class AntiDetectionPage(private val helper: HeadlessBrowserHelper) {
     private var currentUrl: String = ""
-    
+
     suspend fun navigate(url: String) {
         currentUrl = url
     }
-    
+
     suspend fun waitForLoadState() {
         // WebView already waits in fetchPageContentWithShadowAndAdSkip
     }
-    
+
     suspend fun evaluate(jsCode: String): Any? {
         return try {
             val content = helper.fetchPageContentWithShadowAndAdSkip(currentUrl, timeout = 10000)
@@ -467,7 +585,7 @@ class AntiDetectionPage(private val helper: HeadlessBrowserHelper) {
             null
         }
     }
-    
+
     suspend fun close() {
         // No resources to clean up for stub
     }

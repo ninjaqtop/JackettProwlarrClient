@@ -570,7 +570,7 @@ class SmartNavigationEngine @Inject constructor() {
      * (handles both search results and category listings)
      * v2: handles lazy-load images, data attributes, broader selectors
      */
-    fun extractContentLinks(document: Document, baseUrl: String): List<ContentLink> {
+    fun extractContentLinks(document: Document, baseUrl: String, query: String? = null): List<ContentLink> {
         val links = mutableListOf<ContentLink>()
         val seen = mutableSetOf<String>()
 
@@ -603,7 +603,7 @@ class SmartNavigationEngine @Inject constructor() {
                 if (fullUrl in seen || !isContentUrl(fullUrl)) return@forEach
                 seen.add(fullUrl)
 
-                val title = extractItemTitle(item)
+                val title = extractItemTitle(item, query)
                 val thumbnail = extractItemThumbnail(item, baseUrl)
                 val duration = extractItemDuration(item)
 
@@ -624,7 +624,15 @@ class SmartNavigationEngine @Inject constructor() {
                 val href = a.attr("href")
                 val fullUrl = normalizeUrl(href, baseUrl)
                 if (fullUrl in seen || !isContentUrl(fullUrl)) return@forEach
-                val text = a.text().trim()
+                val text = listOf(
+                    a.attr("data-title"),
+                    a.attr("title"),
+                    a.attr("aria-label"),
+                    a.selectFirst("img[alt]")?.attr("alt") ?: "",
+                    a.text()
+                ).firstOrNull {
+                    it.trim().length >= 3 && !SearchResultFilter.isLikelyDuration(it) && !SearchResultFilter.isLikelyCategory(it)
+                }?.trim() ?: ""
                 if (text.length < 3) return@forEach
                 seen.add(fullUrl)
                 val thumbnail = a.select("img").firstOrNull()?.let { img ->
@@ -643,21 +651,47 @@ class SmartNavigationEngine @Inject constructor() {
     /**
      * Extract title from item
      */
-    private fun extractItemTitle(item: Element): String {
+    private fun extractItemTitle(item: Element, query: String? = null): String {
         val titleSelectors = listOf(
-            "h1", "h2", "h3", "h4", ".title", ".name",
-            "[class*='title']", "a[title]", ".video-title"
+            "[itemprop=name]", "[data-title]", ".video-title", ".movie-title",
+            ".item-title", ".entry-title", "h2", "h3", "h4", ".title", ".name",
+            "[class*='title']", "a[title]", "a", "img[alt]"
         )
-        
+
+        val rawCandidates = mutableListOf<String>()
         for (selector in titleSelectors) {
-            val text = item.select(selector).firstOrNull()?.text()?.trim()
-            if (!text.isNullOrEmpty() && text.length > 2) {
-                return text
+            val elements = runCatching { item.select(selector).take(10) }.getOrDefault(emptyList())
+            for (element in elements) {
+                rawCandidates.addAll(
+                    listOf(
+                        element.attr("data-title"),
+                        element.attr("title"),
+                        element.attr("aria-label"),
+                        element.attr("alt"),
+                        element.text()
+                    )
+                )
             }
         }
-        
-        // Fallback to link text
-        return item.select("a").firstOrNull()?.text()?.trim() ?: ""
+
+        val candidates = rawCandidates
+            .map { it.replace(Regex("\\s+"), " ").trim() }
+            .filter { it.length >= 3 && !SearchResultFilter.isLikelyDuration(it) && !SearchResultFilter.isLikelyCategory(it) }
+            .distinct()
+        if (candidates.isEmpty()) return ""
+
+        val queryWords = (query ?: "")
+            .lowercase()
+            .map { ch -> if (ch.isLetterOrDigit()) ch else ' ' }
+            .joinToString("")
+            .split(Regex("\\s+"))
+            .filter { it.length >= 2 }
+
+        return candidates.maxByOrNull { candidate ->
+            val lower = candidate.lowercase()
+            val matches = queryWords.count { word -> lower.contains(word) }
+            matches * 40 + minOf(candidate.length, 80) / 10
+        } ?: ""
     }
     
     /**

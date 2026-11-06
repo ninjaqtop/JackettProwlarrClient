@@ -1,11 +1,13 @@
 package com.aggregatorx.app.data.repository
 
+import android.util.Log
 import com.aggregatorx.app.data.database.*
 import com.aggregatorx.app.data.model.*
 import com.aggregatorx.app.engine.analyzer.SiteAnalyzerEngine
 import com.aggregatorx.app.engine.nlp.NaturalLanguageQueryProcessor
 import com.aggregatorx.app.engine.ranking.RankingEngine
 import com.aggregatorx.app.engine.scraper.ScrapingEngine
+import com.aggregatorx.app.engine.validator.ProviderConfigValidator
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.*
@@ -31,6 +33,7 @@ class AggregatorRepository @Inject constructor(
     private val nlpProcessor: NaturalLanguageQueryProcessor
 ) {
     private companion object {
+        const val TAG = "AggregatorRepository"
         const val PROVIDER_ANALYSIS_TIMEOUT_MS = 60_000L
     }
 
@@ -200,24 +203,47 @@ class AggregatorRepository @Inject constructor(
     }
     
     // Helper methods
+    private data class GeneratedSearchRequest(
+        val urlTemplate: String,
+        val postData: String? = null
+    )
+
     private suspend fun generateScrapingConfig(provider: Provider, analysis: SiteAnalysis) {
-        val searchUrlTemplate = buildSearchUrlTemplate(provider.baseUrl, analysis)
+        if (scrapingConfigDao.getConfigForProvider(provider.id) != null) return
+
+        val resultSelector = analysis.resultItemSelector?.takeIf { it.isNotBlank() } ?: return
+        val titleSelector = analysis.titleSelector?.takeIf { it.isNotBlank() } ?: return
+
+        val searchRequest = buildSearchRequestTemplate(provider.baseUrl, analysis)
         val config = ScrapingConfig(
             providerId = provider.id,
-            searchUrlTemplate = searchUrlTemplate,
-            resultSelector = analysis.resultItemSelector ?: ".item, .result, article",
-            titleSelector = analysis.titleSelector ?: "h2, .title, a",
+            searchUrlTemplate = searchRequest.urlTemplate,
+            resultSelector = resultSelector,
+            titleSelector = titleSelector,
             urlSelector = "a[href]",
             descriptionSelector = analysis.descriptionSelector,
             thumbnailSelector = analysis.thumbnailSelector,
             dateSelector = analysis.dateSelector,
-            ratingSelector = analysis.ratingSelector
+            ratingSelector = analysis.ratingSelector,
+            postData = searchRequest.postData
         )
-        scrapingConfigDao.deleteConfigForProvider(provider.id)
-        scrapingConfigDao.insertConfig(config)
+
+        val validation = ProviderConfigValidator.validateScrapingConfig(config, provider.baseUrl, analysis.rawHtml)
+        val hasUnverifiableSelectors = validation.warnings.any { warning ->
+            warning.startsWith("Result selector did not match") ||
+                warning.startsWith("The selectors did not map") ||
+                warning.startsWith("Some sample items are missing")
+        }
+        if (validation.isValid && !hasUnverifiableSelectors) {
+            scrapingConfigDao.insertConfig(config)
+        } else if (hasUnverifiableSelectors) {
+            Log.i(TAG, "Skipping unverified auto-generated result selectors for provider=${provider.name}")
+        }
     }
-    
-    private fun buildSearchUrlTemplate(baseUrl: String, analysis: SiteAnalysis): String {
+
+    private fun buildSearchRequestTemplate(baseUrl: String, analysis: SiteAnalysis): GeneratedSearchRequest {
+        val defaultTemplate = "${baseUrl.trimEnd('/')}/search?q={query}&page={page}"
+
         val analyzedDocument = analysis.rawHtml
             ?.takeIf { it.isNotBlank() }
             ?.let { runCatching { Jsoup.parse(it, analysis.url) }.getOrNull() }
@@ -227,41 +253,80 @@ class AggregatorRepository @Inject constructor(
                 ?.let { selector -> runCatching { document.selectFirst(selector) }.getOrNull() }
                 ?: document.selectFirst(
                     "form:has(input[type=search]), form:has(input[name=q]), " +
-                        "form:has(input[name=query]), form:has(input[name=search]), form:has(input[name=s])"
+                        "form:has(input[name=query]), form:has(input[name=search]), form:has(input[name=s]), " +
+                        "form:has(input[name=keyword]), form:has(input[name=term])"
                 )
+        } ?: return GeneratedSearchRequest(defaultTemplate)
+
+        val action = form.absUrl("action").ifBlank { analysis.url.ifBlank { baseUrl } }
+        if (!action.startsWith("http", ignoreCase = true)) {
+            return GeneratedSearchRequest(defaultTemplate)
         }
 
-        if (form != null && !form.attr("method").equals("post", ignoreCase = true)) {
-            val action = form.absUrl("action").ifBlank { analysis.url.ifBlank { baseUrl } }
-            val queryInput = form.select(
-                "input[type=search], input[name=q], input[name=query], input[name=search], " +
-                    "input[name=s], input[name=keyword], input[name=term]"
-            ).firstOrNull()
-            val queryName = queryInput?.attr("name")?.takeIf { it.isNotBlank() } ?: "q"
-            val fixedFields = form.select("input[name]")
-                .filter { input ->
-                    input !== queryInput &&
-                        input.attr("type").lowercase() in setOf("hidden", "submit") &&
-                        input.attr("value").isNotBlank()
-                }
-                .joinToString("&") { input ->
-                    "${URLEncoder.encode(input.attr("name"), "UTF-8")}" +
-                        "=${URLEncoder.encode(input.attr("value"), "UTF-8")}"
-                }
-            val separator = if (action.contains('?')) "&" else "?"
-            return buildString {
-                append(action)
-                append(separator)
-                if (fixedFields.isNotBlank()) {
-                    append(fixedFields)
-                    append('&')
-                }
-                append(URLEncoder.encode(queryName, "UTF-8"))
-                append("={query}&page={page}")
+        val fields = form.select("input[name], select[name], textarea[name]")
+        val pairs = fields.mapNotNull { element ->
+            val name = element.attr("name").trim()
+            if (name.isBlank()) return@mapNotNull null
+            val tag = element.tagName().lowercase()
+            val type = element.attr("type").lowercase()
+            if (tag == "input" && type in setOf("submit", "button", "image", "file", "password")) {
+                return@mapNotNull null
             }
+            if (tag == "input" && type in setOf("checkbox", "radio") && !element.hasAttr("checked")) {
+                return@mapNotNull null
+            }
+            val isQueryField = name.equals("q", ignoreCase = true) ||
+                name.equals("query", ignoreCase = true) ||
+                name.equals("search", ignoreCase = true) ||
+                name.equals("s", ignoreCase = true) ||
+                name.equals("keyword", ignoreCase = true) ||
+                name.equals("term", ignoreCase = true) ||
+                type == "search" ||
+                element.attr("placeholder").contains("search", ignoreCase = true)
+            val isPageField = name.equals("page", ignoreCase = true) ||
+                name.equals("paged", ignoreCase = true) ||
+                name.equals("p", ignoreCase = true) ||
+                name.equals("page_num", ignoreCase = true)
+            val value = when {
+                isQueryField -> "{query}"
+                isPageField -> "{page}"
+                tag == "select" -> element.selectFirst("option[selected]")?.attr("value")
+                    ?: element.selectFirst("option")?.attr("value")
+                    ?: ""
+                tag == "textarea" -> element.text()
+                else -> element.attr("value")
+            }
+            if (value.isNotBlank() || isQueryField || isPageField) name to value else null
+        }.distinctBy { it.first }
+
+        val queryName = pairs.firstOrNull { it.second == "{query}" }?.first ?: "q"
+        val parts = pairs
+            .filter { it.first != queryName }
+            .map { (fieldName, fieldValue) -> "${encodeTemplateField(fieldName)}=${encodeTemplateField(fieldValue)}" }
+            .toMutableList()
+        parts.add("${encodeTemplateField(queryName)}={query}")
+        if (pairs.none { it.second == "{page}" }) {
+            parts.add("page={page}")
         }
 
-        return "$baseUrl/search?q={query}&page={page}"
+        return if (!form.attr("method").equals("post", ignoreCase = true)) {
+            val separator = if (action.contains('?')) "&" else "?"
+            GeneratedSearchRequest(action + separator + parts.joinToString("&"))
+        } else {
+            GeneratedSearchRequest(urlTemplate = action, postData = parts.joinToString("&"))
+        }
+    }
+
+    private fun encodeTemplateField(value: String): String {
+        val encoded = URLEncoder.encode(
+            value
+                .replace("{query}", "__AGGREGATOR_QUERY_TOKEN__")
+                .replace("{page}", "__AGGREGATOR_PAGE_TOKEN__"),
+            "UTF-8"
+        )
+        return encoded
+            .replace("__AGGREGATOR_QUERY_TOKEN__", "{query}")
+            .replace("__AGGREGATOR_PAGE_TOKEN__", "{page}")
     }
     
     private fun normalizeUrl(url: String): String {
