@@ -16,6 +16,7 @@ import com.aggregatorx.app.engine.nlp.NaturalLanguageQueryProcessor
 import com.aggregatorx.app.engine.ranking.RankingEngine
 import com.aggregatorx.app.engine.scraper.ScrapingEngine
 import com.aggregatorx.app.engine.validator.ProviderConfigValidator
+import androidx.room.withTransaction
 import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.*
@@ -44,7 +45,8 @@ class AggregatorRepository @Inject constructor(
     private val rankingEngine: RankingEngine,
     private val nlpProcessor: NaturalLanguageQueryProcessor,
     private val siteReconEngine: SiteReconEngine,
-    private val searchConfigVerifier: SearchConfigVerifier
+    private val searchConfigVerifier: SearchConfigVerifier,
+    private val database: AggregatorDatabase
 ) {
     private companion object {
         const val TAG = "AggregatorRepository"
@@ -137,16 +139,25 @@ class AggregatorRepository @Inject constructor(
         // stays saved either way; a config that cannot be verified is not
         // saved, and the rejection reason is surfaced to the caller so the
         // Analyzer UI shows the specific failure instead of a silent pass.
-        val configFailure = runCatching { generateScrapingConfig(provider, analysis) }
-            .exceptionOrNull()
-        if (configFailure != null && configFailure !is ConfigVerificationException) {
-            Log.w(TAG, "Config generation failed for provider=${provider.name}: ${configFailure.message}")
+        var configFailure: ConfigVerificationException? = null
+        try {
+            generateScrapingConfig(provider, analysis)
+        } catch (e: ConfigVerificationException) {
+            configFailure = e
+        } catch (e: CancellationException) {
+            // Cancellation is not a config outcome. The previous
+            // runCatching swallowed it here and execution continued into
+            // further writes on the cancelled scope, surfacing as a
+            // confusing secondary failure — propagate it as-is instead.
+            throw e
+        } catch (e: Exception) {
+            Log.w(TAG, "Config generation failed for provider=${provider.name}: ${e.message}")
         }
 
         // Update provider last analyzed timestamp
         providerDao.updateLastAnalyzed(providerId, System.currentTimeMillis())
 
-        if (configFailure is ConfigVerificationException) throw configFailure
+        configFailure?.let { throw it }
 
         return analysis
     }
@@ -259,7 +270,16 @@ class AggregatorRepository @Inject constructor(
         // throws out). This runs on re-analyze too — a site that changed
         // gets re-mapped, not just re-trusted.
         val recon = withTimeoutOrNull(RECON_TIMEOUT_MS) {
-            runCatching { siteReconEngine.mapSite(provider.baseUrl, analysis.rawHtml) }.getOrNull()
+            try {
+                siteReconEngine.mapSite(provider.baseUrl, analysis.rawHtml)
+            } catch (e: CancellationException) {
+                // The 20 s budget's own timeout is converted to null by
+                // withTimeoutOrNull as before; an outer cancellation
+                // propagates instead of being swallowed by a catch-all.
+                throw e
+            } catch (e: Exception) {
+                null
+            }
         }
         val configTimeout = recon?.suggestedTimeoutMs ?: 30_000
         val paginationHint = PaginationHint(
@@ -385,10 +405,17 @@ class AggregatorRepository @Inject constructor(
                 val finalConfig = outcome.config.copy(timeout = finalTimeoutMs(outcome, recon))
                 if (existing != null && finalConfig.id != existing.id) {
                     // A proven replacement for a config that failed
-                    // re-verification — only now is the old one removed.
-                    scrapingConfigDao.deleteConfigForProvider(provider.id)
+                    // re-verification — the old one is removed only now
+                    // that a replacement has verified, and the swap is
+                    // a single transaction so an interruption can never
+                    // leave the provider with no config at all.
+                    database.withTransaction {
+                        scrapingConfigDao.deleteConfigForProvider(provider.id)
+                        scrapingConfigDao.insertConfig(finalConfig)
+                    }
+                } else {
+                    scrapingConfigDao.insertConfig(finalConfig)
                 }
-                scrapingConfigDao.insertConfig(finalConfig)
                 Log.i(
                     TAG,
                     "Verified config saved for provider=${provider.name}: ${outcome.verdict.reason}" +
