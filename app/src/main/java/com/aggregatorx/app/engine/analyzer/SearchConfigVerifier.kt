@@ -2,9 +2,10 @@ package com.aggregatorx.app.engine.analyzer
 
 import com.aggregatorx.app.data.model.Provider
 import com.aggregatorx.app.data.model.ScrapingConfig
+import com.aggregatorx.app.engine.ml.DeterministicAnalysisHelper
 import com.aggregatorx.app.engine.network.TlsClient
 import com.aggregatorx.app.engine.network.TlsRequest
-import com.aggregatorx.app.engine.network.TlsResponse
+import com.aggregatorx.app.engine.scraper.HeadlessBrowserHelper
 import com.aggregatorx.app.engine.scraper.SearchResultFilter
 import com.aggregatorx.app.engine.util.EngineUtils
 import com.aggregatorx.app.engine.validator.ProviderConfigValidator
@@ -24,33 +25,44 @@ import javax.inject.Singleton
 
 /**
  * Live verification for candidate scraping configs — the gate a config
- * must pass before it is saved for a new provider.
+ * must pass before it is saved for a provider, on first add AND on
+ * re-analyze (an existing config is re-proven the same way, and only
+ * replaced when a better candidate proves itself).
  *
  * A config is only trusted when the site's OWN search proves it:
  *
  *  1. A real probe query (a content term taken from the site's own
  *     inventory by [SiteReconEngine]) is run through the candidate's
- *     search route. What comes back is extracted with the candidate's
- *     selectors (or the JSON field paths it derived) and classified:
- *     item/detail results vs category/listing links. Categories
- *     dominating — or too few items — means the route or selectors are
- *     wrong, not that the site has nothing.
- *  2. When the candidate's selectors extract nothing from the live
- *     probe page, one repair is attempted: selectors re-derived from
- *     that very page (via [ProviderConfigValidator.suggestSelectors]),
- *     plus a JSON-LD pass (the runtime engine reads JSON-LD too, so a
- *     page whose results live in embedded JSON still verifies).
+ *     search route. What comes back is extracted the way the runtime
+ *     will extract it and classified: item/detail results vs
+ *     category/listing links. Categories dominating — or too few
+ *     items — means the route or selectors are wrong.
+ *  2. Selector repair: when the candidate's selectors extract nothing
+ *     from the live probe page, the page's suggested selectors are
+ *     tried (up to three), each scored by the same item-vs-category
+ *     classification, and the best is kept. JSON-LD payloads count too.
  *  3. The negative control: the same route is run with the nonsense
  *     query [NONSENSE_QUERY]. A route that "finds" items for nonsense
- *     is not exercising the site's search at all — it is ignored-query
- *     junk (a homepage or listing in disguise) and is rejected.
+ *     is not exercising the site's search at all and is rejected.
+ *  4. Rendered verification: when raw HTTP sees only an app shell
+ *     (JS-heavy site), the best near-miss candidate is re-probed
+ *     through the app's headless browser — including submitting the
+ *     site's real search form the way a user would — and must pass
+ *     the same classification and nonsense control there.
+ *  5. Per-field confidence: route, extraction (selectors / JSON
+ *     paths), and pagination are each scored from live evidence
+ *     (pagination must be *seen* — a next-page link or payload field
+ *     matching the template's mechanism — to score fully; a proven
+ *     pagination parameter can even repair the template's). Only a
+ *     candidate at or above [MIN_AUTOSAVE_CONFIDENCE] auto-saves;
+ *     weaker evidence is reported, never silently saved.
  *
- * The first candidate that passes wins. If none do, the caller gets
- * every candidate's specific failure reason — never a silent save of
- * an unverified config, and never a silent drop either.
+ * Access walls are named, not hidden: a login redirect, an HTTP
+ * 401/403, or an anti-bot challenge page produces that specific
+ * reason, because no automation can prove a search it cannot reach.
  *
- * Everything is bounded: each probe fetch has a short timeout and the
- * whole verification has a total budget. [verify] never throws.
+ * Everything is bounded (per-fetch timeouts, phase budgets) and
+ * [verify] never throws: failure is data — a list of specific reasons.
  */
 @Singleton
 class SearchConfigVerifier @Inject constructor() {
@@ -58,7 +70,8 @@ class SearchConfigVerifier @Inject constructor() {
     suspend fun verify(
         provider: Provider,
         candidates: List<VerifierCandidate>,
-        probeQuery: String?
+        probeQuery: String?,
+        paginationHint: PaginationHint = PaginationHint()
     ): VerificationOutcome = withContext(Dispatchers.IO) {
         if (probeQuery.isNullOrBlank()) {
             return@withContext VerificationOutcome.Rejected(
@@ -72,86 +85,210 @@ class SearchConfigVerifier @Inject constructor() {
         }
 
         val reasons = mutableListOf<String>()
-        val startedAt = System.currentTimeMillis()
+        val nearMisses = mutableListOf<NearMiss>()
+        var anyHttpResponse = false
+        val rawStartedAt = System.currentTimeMillis()
+
+        // ── Phase 1: raw HTTP probes ──────────────────────────────────
         for ((index, candidate) in candidates.withIndex()) {
-            if (System.currentTimeMillis() - startedAt > TOTAL_BUDGET_MS) {
+            if (System.currentTimeMillis() - rawStartedAt > RAW_BUDGET_MS) {
                 for (remaining in candidates.drop(index)) {
                     reasons += "${remaining.sourceLabel}: verification time budget exhausted before this route could be probed"
                 }
                 break
             }
-            val attempt = runCatching { verifyCandidate(provider, candidate, probeQuery) }
+            val attempt = runCatching { verifyCandidateRaw(provider, candidate, probeQuery, paginationHint) }
             when (val result = attempt.getOrNull()) {
                 is CandidateAttempt.Passed -> return@withContext VerificationOutcome.Verified(
                     config = result.config,
                     verdict = result.verdict,
                     repaired = result.repaired
                 )
-                is CandidateAttempt.Failed -> reasons += result.reason
+                is CandidateAttempt.Failed -> {
+                    reasons += result.reason
+                    result.nearMiss?.let { nearMisses += it }
+                    if (result.gotHttpResponse) anyHttpResponse = true
+                }
                 null -> {
                     val e = attempt.exceptionOrNull()
                     reasons += "${candidate.sourceLabel}: verification error (${e?.javaClass?.simpleName ?: "unknown"}: ${e?.message ?: "no detail"})"
                 }
             }
         }
+
+        // ── Phase 2: rendered probes for JS-heavy sites ───────────────
+        // Only when raw HTTP actually reached the site (a dead site
+        // gains nothing from a browser) and nothing has verified yet.
+        if (anyHttpResponse && nearMisses.isNotEmpty()) {
+            val renderedCandidates = nearMisses
+                .sortedWith(
+                    compareByDescending<NearMiss> { it.candidate.isFormRoute }
+                        .thenByDescending { it.items - it.categories }
+                )
+                .map { it.candidate }
+                .distinct()
+                .take(MAX_RENDERED_CANDIDATES)
+            val renderStartedAt = System.currentTimeMillis()
+            val formHtmlCache = FormHtmlCache(provider)
+            for (candidate in renderedCandidates) {
+                if (System.currentTimeMillis() - renderStartedAt > RENDER_BUDGET_MS) break
+                val attempt = runCatching {
+                    verifyCandidateRendered(provider, candidate, probeQuery, paginationHint, formHtmlCache)
+                }
+                when (val result = attempt.getOrNull()) {
+                    is CandidateAttempt.Passed -> return@withContext VerificationOutcome.Verified(
+                        config = result.config,
+                        verdict = result.verdict,
+                        repaired = result.repaired
+                    )
+                    is CandidateAttempt.Failed -> reasons += result.reason
+                    null -> {
+                        val e = attempt.exceptionOrNull()
+                        reasons += "${candidate.sourceLabel}: rendered verification error (${e?.javaClass?.simpleName ?: "unknown"}: ${e?.message ?: "no detail"})"
+                    }
+                }
+            }
+        }
+
         VerificationOutcome.Rejected(reasons)
     }
 
+    private data class NearMiss(
+        val candidate: VerifierCandidate,
+        val items: Int,
+        val categories: Int
+    )
+
     private sealed class CandidateAttempt {
         data class Passed(val config: ScrapingConfig, val verdict: ProbeVerdict, val repaired: Boolean) : CandidateAttempt()
-        data class Failed(val reason: String) : CandidateAttempt()
+        data class Failed(
+            val reason: String,
+            val nearMiss: NearMiss? = null,
+            val gotHttpResponse: Boolean = false
+        ) : CandidateAttempt()
     }
 
-    private fun verifyCandidate(
+    /** Lazily fetches (once per verify call) the headless form-submission
+     *  pages for the real probe and the nonsense control. */
+    private class FormHtmlCache(private val provider: Provider) {
+        private var realFetched = false
+        private var realHtml: String? = null
+        private var nonsenseFetched = false
+        private var nonsenseHtml: String? = null
+
+        suspend fun real(probeQuery: String): String? {
+            if (!realFetched) {
+                realFetched = true
+                realHtml = runCatching {
+                    HeadlessBrowserHelper.searchViaHeadlessForm(provider.baseUrl, probeQuery)
+                }.getOrNull()
+            }
+            return realHtml
+        }
+
+        suspend fun nonsense(): String? {
+            if (!nonsenseFetched) {
+                nonsenseFetched = true
+                nonsenseHtml = runCatching {
+                    HeadlessBrowserHelper.searchViaHeadlessForm(provider.baseUrl, NONSENSE_QUERY)
+                }.getOrNull()
+            }
+            return nonsenseHtml
+        }
+    }
+
+    // ─── Phase 1: raw candidate verification ──────────────────────────
+
+    private fun verifyCandidateRaw(
         provider: Provider,
         candidate: VerifierCandidate,
-        probeQuery: String
+        probeQuery: String,
+        hint: PaginationHint
     ): CandidateAttempt {
         val label = candidate.sourceLabel
         val config = candidate.config
+        var slowest = 0L
 
         val probe = buildRequest(provider, config, probeQuery)
         val t0 = System.currentTimeMillis()
         val response = TlsClient.execute(probe)
         val responseMs = System.currentTimeMillis() - t0
+        slowest = maxOf(slowest, responseMs)
+
+        val wall = detectAccessWall(response.statusCode, response.finalUrl, response.body)
         if (response.error != null || response.statusCode !in 200..399) {
             return CandidateAttempt.Failed(
-                "$label: probe search failed (${response.error ?: "HTTP ${response.statusCode}"})"
+                "$label: probe search failed (${wall ?: response.error ?: "HTTP ${response.statusCode}"})",
+                // A wall (403/challenge) is exactly what the rendered
+                // phase exists for — keep the candidate eligible for it.
+                nearMiss = if (wall != null) NearMiss(candidate, 0, 0) else null,
+                gotHttpResponse = response.statusCode > 0
             )
         }
 
-        val extraction = extractPairs(response, provider, config, allowRepair = true)
+        val extraction = extractFromBody(response.body, response.finalUrl, provider, config, hint, allowRepair = true)
         val (items, categories) = classify(extraction.pairs)
-        val effectiveConfig = extraction.effectiveConfig
+        var effectiveConfig = extraction.effectiveConfig
+        var repaired = extraction.repaired
 
-        if (items < MIN_ITEMS) {
+        // A proven pagination parameter on the live page repairs the
+        // template's page parameter when they disagree.
+        extraction.provenPaginationParam?.let { provenParam ->
+            repairPaginationParam(effectiveConfig, provenParam)?.let { fixed ->
+                effectiveConfig = fixed
+                repaired = true
+            }
+        }
+
+        if (extraction.pairs.isEmpty() && wall != null) {
             return CandidateAttempt.Failed(
-                if (categories > 0 && categories >= items) {
-                    "$label: probe results were mostly category/listing links ($categories categories vs $items items) — this route does not lead to results"
-                } else {
-                    "$label: probe search returned only $items item results (need at least $MIN_ITEMS) — the route or its selectors do not match the site's results page"
-                }
+                "$label: $wall — raw HTTP could not prove the search; the rendered check decides",
+                nearMiss = NearMiss(candidate, 0, 0),
+                gotHttpResponse = true
             )
         }
-        if (items <= categories) {
+        if (items < MIN_ITEMS || items <= categories) {
             return CandidateAttempt.Failed(
-                "$label: probe results were mostly category/listing links ($categories categories vs $items items) — this route does not lead to results"
+                reason = countsFailureReason(label, items, categories),
+                nearMiss = NearMiss(candidate, items, categories),
+                gotHttpResponse = true
             )
         }
 
         // Negative control: the site's own search must find ~nothing for nonsense.
+        val nonsenseStart = System.currentTimeMillis()
         val nonsenseResponse = TlsClient.execute(buildRequest(provider, effectiveConfig, NONSENSE_QUERY))
+        slowest = maxOf(slowest, System.currentTimeMillis() - nonsenseStart)
         if (nonsenseResponse.error != null || nonsenseResponse.statusCode !in 200..399) {
             return CandidateAttempt.Failed(
-                "$label: nonsense control could not be completed (${nonsenseResponse.error ?: "HTTP ${nonsenseResponse.statusCode}"}) — the route did not survive verification"
+                "$label: nonsense control could not be completed (${nonsenseResponse.error ?: "HTTP ${nonsenseResponse.statusCode}"}) — the route did not survive verification",
+                gotHttpResponse = true
             )
         }
-        val nonsenseExtraction = extractPairs(nonsenseResponse, provider, effectiveConfig, allowRepair = false)
+        val nonsenseExtraction = extractFromBody(
+            nonsenseResponse.body, nonsenseResponse.finalUrl, provider, effectiveConfig, hint, allowRepair = false
+        )
         val (nonsenseItems, _) = classify(nonsenseExtraction.pairs)
-        val nonsensePass = nonsenseItems == 0 || (nonsenseItems <= 1 && nonsenseItems < items)
-        if (!nonsensePass) {
+        if (!nonsensePasses(nonsenseItems, items)) {
             return CandidateAttempt.Failed(
-                "$label: the site's search ignores the query — a nonsense search returned $nonsenseItems items (real search: $items), so this route is not the site's real search"
+                "$label: the site's search ignores the query — a nonsense search returned $nonsenseItems items (real search: $items), so this route is not the site's real search",
+                gotHttpResponse = true
+            )
+        }
+
+        val confidence = computeConfidence(
+            routeScore = 1.0f,
+            items = items,
+            categories = categories,
+            paginationProven = extraction.paginationProven,
+            hint = hint
+        )
+        if (confidence.overall < MIN_AUTOSAVE_CONFIDENCE) {
+            return CandidateAttempt.Failed(
+                "$label: results verified live but the evidence is too weak to auto-save " +
+                    "(confidence ${formatScore(confidence.overall)} — ${confidence.detail}); " +
+                    "the route was left unsaved rather than guessed",
+                gotHttpResponse = true
             )
         }
 
@@ -162,15 +299,243 @@ class SearchConfigVerifier @Inject constructor() {
             categoryCount = categories,
             nonsenseItemCount = nonsenseItems,
             responseMs = responseMs,
+            slowestProbeMs = slowest,
             passed = true,
+            rendered = false,
+            paginationProven = extraction.paginationProven,
+            confidence = confidence.overall,
+            confidenceDetail = confidence.detail,
             reason = "Verified live: $items item results, $categories category links, " +
-                "nonsense control returned $nonsenseItems"
+                "nonsense control returned $nonsenseItems, confidence ${formatScore(confidence.overall)}"
         )
+        return CandidateAttempt.Passed(effectiveConfig, verdict, repaired)
+    }
+
+    // ─── Phase 2: rendered candidate verification ─────────────────────
+
+    private suspend fun verifyCandidateRendered(
+        provider: Provider,
+        candidate: VerifierCandidate,
+        probeQuery: String,
+        hint: PaginationHint,
+        formHtmlCache: FormHtmlCache
+    ): CandidateAttempt {
+        val label = candidate.sourceLabel
+        val config = candidate.config
+        var slowest = 0L
+
+        // Source A: submit the site's real form in the headless browser.
+        if (candidate.isFormRoute) {
+            val formStart = System.currentTimeMillis()
+            val formHtml = formHtmlCache.real(probeQuery)
+            slowest = maxOf(slowest, System.currentTimeMillis() - formStart)
+            if (formHtml != null) {
+                val extraction = extractFromBody(formHtml, provider.baseUrl, provider, config, hint, allowRepair = true)
+                val (items, categories) = classify(extraction.pairs)
+                if (items >= MIN_ITEMS && items > categories) {
+                    val nonsenseStart = System.currentTimeMillis()
+                    val nonsenseHtml = formHtmlCache.nonsense()
+                    slowest = maxOf(slowest, System.currentTimeMillis() - nonsenseStart)
+                    val nonsenseItems = if (nonsenseHtml != null) {
+                        classify(
+                            extractFromBody(nonsenseHtml, provider.baseUrl, provider, extraction.effectiveConfig, hint, allowRepair = false).pairs
+                        ).first
+                    } else -1
+                    if (nonsenseItems >= 0 && !nonsensePasses(nonsenseItems, items)) {
+                        return CandidateAttempt.Failed(
+                            "$label: rendered form search ignores the query — a nonsense search returned $nonsenseItems items (real search: $items)",
+                            gotHttpResponse = true
+                        )
+                    }
+                    val confidence = computeConfidence(
+                        routeScore = 0.9f,
+                        items = items,
+                        categories = categories,
+                        paginationProven = extraction.paginationProven,
+                        hint = hint
+                    )
+                    if (confidence.overall < MIN_AUTOSAVE_CONFIDENCE) {
+                        return CandidateAttempt.Failed(
+                            "$label: rendered form search verified but the evidence is too weak to auto-save " +
+                                "(confidence ${formatScore(confidence.overall)} — ${confidence.detail})",
+                            gotHttpResponse = true
+                        )
+                    }
+                    return CandidateAttempt.Passed(
+                        config = extraction.effectiveConfig,
+                        verdict = ProbeVerdict(
+                            sourceLabel = label,
+                            probedUrl = provider.baseUrl,
+                            itemCount = items,
+                            categoryCount = categories,
+                            nonsenseItemCount = maxOf(nonsenseItems, 0),
+                            responseMs = slowest,
+                            slowestProbeMs = slowest,
+                            passed = true,
+                            rendered = true,
+                            paginationProven = extraction.paginationProven,
+                            confidence = confidence.overall,
+                            confidenceDetail = confidence.detail,
+                            reason = "Verified in the headless browser via the site's own form: " +
+                                "$items item results, $categories category links, " +
+                                (if (nonsenseItems >= 0) "nonsense control returned $nonsenseItems"
+                                else "nonsense form control inconclusive (no page returned)") +
+                                ", confidence ${formatScore(confidence.overall)}"
+                        ),
+                        repaired = extraction.repaired
+                    )
+                }
+            }
+        }
+
+        // Source B: render the candidate's own probe URL.
+        val probeUrl = buildRequest(provider, config, probeQuery).url
+        val renderStart = System.currentTimeMillis()
+        val renderedHtml = runCatching {
+            HeadlessBrowserHelper.fetchPageContent(probeUrl, RENDER_TIMEOUT_MS)
+        }.getOrNull()
+        slowest = maxOf(slowest, System.currentTimeMillis() - renderStart)
+        if (renderedHtml == null) {
+            return CandidateAttempt.Failed(
+                "$label: the page could not be rendered in the headless browser either",
+                gotHttpResponse = true
+            )
+        }
+        val extraction = extractFromBody(renderedHtml, probeUrl, provider, config, hint, allowRepair = true)
+        val (items, categories) = classify(extraction.pairs)
+        if (items < MIN_ITEMS || items <= categories) {
+            return CandidateAttempt.Failed(
+                "$label: even after rendering, the probe found $items items and $categories category links — the content is not reachable as search results",
+                gotHttpResponse = true
+            )
+        }
+        // Nonsense control over raw HTTP: a JS app's raw route still has
+        // to stay silent for nonsense; if it echoes the same items, the
+        // "results" were the app's shell content, not search output.
+        val nonsenseResponse = TlsClient.execute(buildRequest(provider, extraction.effectiveConfig, NONSENSE_QUERY))
+        val nonsenseItems = if (nonsenseResponse.error == null && nonsenseResponse.statusCode in 200..399) {
+            classify(
+                extractFromBody(nonsenseResponse.body, nonsenseResponse.finalUrl, provider, extraction.effectiveConfig, hint, allowRepair = false).pairs
+            ).first
+        } else -1
+        if (nonsenseItems >= 0 && !nonsensePasses(nonsenseItems, items)) {
+            return CandidateAttempt.Failed(
+                "$label: rendered results failed the nonsense control (raw route returned $nonsenseItems items for nonsense vs $items rendered for the probe)",
+                gotHttpResponse = true
+            )
+        }
+        val confidence = computeConfidence(
+            routeScore = 0.8f,
+            items = items,
+            categories = categories,
+            paginationProven = extraction.paginationProven,
+            hint = hint
+        )
+        if (confidence.overall < MIN_AUTOSAVE_CONFIDENCE) {
+            return CandidateAttempt.Failed(
+                "$label: rendered search verified but the evidence is too weak to auto-save " +
+                    "(confidence ${formatScore(confidence.overall)} — ${confidence.detail})",
+                gotHttpResponse = true
+            )
+        }
         return CandidateAttempt.Passed(
-            config = effectiveConfig,
-            verdict = verdict,
+            config = extraction.effectiveConfig,
+            verdict = ProbeVerdict(
+                sourceLabel = label,
+                probedUrl = probeUrl,
+                itemCount = items,
+                categoryCount = categories,
+                nonsenseItemCount = maxOf(nonsenseItems, 0),
+                responseMs = slowest,
+                slowestProbeMs = slowest,
+                passed = true,
+                rendered = true,
+                paginationProven = extraction.paginationProven,
+                confidence = confidence.overall,
+                confidenceDetail = confidence.detail,
+                reason = "Verified after headless rendering: $items item results, $categories category links, " +
+                    (if (nonsenseItems >= 0) "nonsense control returned $nonsenseItems"
+                    else "nonsense control inconclusive over raw HTTP") +
+                    ", confidence ${formatScore(confidence.overall)}"
+            ),
             repaired = extraction.repaired
         )
+    }
+
+    // ─── Confidence ───────────────────────────────────────────────────
+
+    private data class Confidence(val overall: Float, val detail: String)
+
+    /**
+     * Per-field confidence from live evidence. Route = the probe (and
+     * its nonsense control) behaved like a real search. Extraction =
+     * how item-dominated the classified results were. Pagination =
+     * fully scored only when a next-page mechanism matching the
+     * template was actually seen; inventory evidence alone scores
+     * partially; nothing seen scores low.
+     */
+    private fun computeConfidence(
+        routeScore: Float,
+        items: Int,
+        categories: Int,
+        paginationProven: Boolean,
+        hint: PaginationHint
+    ): Confidence {
+        val total = (items + categories).coerceAtLeast(1)
+        val share = items.toFloat() / total
+        var extractionScore = when {
+            share >= 0.9f -> 1.0f
+            share >= 0.75f -> 0.85f
+            share >= 0.6f -> 0.7f
+            else -> 0.5f
+        }
+        if (items >= 10) extractionScore = minOf(1.0f, extractionScore + 0.05f)
+        val paginationScore = when {
+            paginationProven -> 1.0f
+            hint.inventoryEvidence -> 0.6f
+            else -> 0.3f
+        }
+        val overall = routeScore * 0.35f + extractionScore * 0.40f + paginationScore * 0.25f
+        val detail = "route=${formatScore(routeScore)}, extraction=${formatScore(extractionScore)} " +
+            "(item share ${formatScore(share)}), pagination=${formatScore(paginationScore)}" +
+            if (paginationProven) " (proven on the probe page)" else " (not proven on the probe page)"
+        return Confidence(overall, detail)
+    }
+
+    private fun formatScore(value: Float): String = String.format(java.util.Locale.US, "%.2f", value)
+
+    private fun countsFailureReason(label: String, items: Int, categories: Int): String =
+        if (categories > 0 && categories >= items) {
+            "$label: probe results were mostly category/listing links ($categories categories vs $items items) — this route does not lead to results"
+        } else {
+            "$label: probe search returned only $items item results (need at least $MIN_ITEMS) — the route or its selectors do not match the site's results page"
+        }
+
+    private fun nonsensePasses(nonsenseItems: Int, realItems: Int): Boolean =
+        nonsenseItems == 0 || (nonsenseItems <= 1 && nonsenseItems < realItems)
+
+    /** Name the wall when the site refuses to be probed, so the user
+     *  hears "login wall / anti-bot challenge" instead of a bare failure. */
+    private fun detectAccessWall(statusCode: Int, finalUrl: String, body: String): String? {
+        if (statusCode == 401 || statusCode == 403) {
+            return "the site refused the probe (HTTP $statusCode — login wall or anti-bot protection)"
+        }
+        val path = runCatching { java.net.URL(finalUrl).path.lowercase() }.getOrDefault("")
+        if (path.contains("/login") || path.contains("/signin") || path.contains("/sign-in") || path.contains("/auth/")) {
+            return "the probe landed on a login page — the search is behind a login wall"
+        }
+        val lower = body.lowercase()
+        if (body.length < 30_000 && (
+                lower.contains("just a moment") ||
+                    lower.contains("checking your browser") ||
+                    lower.contains("verify you are human") ||
+                    lower.contains("are you a robot") ||
+                    (lower.contains("cloudflare") && lower.contains("challenge"))
+                )
+        ) {
+            return "the site answered with an anti-bot challenge instead of search results"
+        }
+        return null
     }
 
     // ─── Request building ─────────────────────────────────────────────
@@ -204,66 +569,107 @@ class SearchConfigVerifier @Inject constructor() {
         }
     }
 
+    /** Swap the template's page-parameter name for the one the live
+     *  page provably uses (its own next-page link). Returns null when
+     *  the template has no {page} parameter or already uses it. */
+    private fun repairPaginationParam(config: ScrapingConfig, provenParam: String): ScrapingConfig? {
+        val match = PAGE_PARAM_REGEX.find(config.searchUrlTemplate) ?: return null
+        val currentParam = match.groupValues[1]
+        if (currentParam.equals(provenParam, ignoreCase = true)) return null
+        val fixed = config.searchUrlTemplate.replace("$currentParam={page}", "$provenParam={page}")
+        return if (fixed != config.searchUrlTemplate) config.copy(searchUrlTemplate = fixed) else null
+    }
+
     // ─── Extraction ───────────────────────────────────────────────────
 
     private data class Extraction(
         val pairs: List<Pair<String, String>>,
         val effectiveConfig: ScrapingConfig,
-        val repaired: Boolean
+        val repaired: Boolean,
+        val paginationProven: Boolean = false,
+        val provenPaginationParam: String? = null
     )
 
-    private fun extractPairs(
-        response: TlsResponse,
+    private fun extractFromBody(
+        body: String,
+        finalUrl: String,
         provider: Provider,
         config: ScrapingConfig,
+        hint: PaginationHint,
         allowRepair: Boolean
     ): Extraction {
-        val body = response.body
-        val pageBase = response.finalUrl.ifBlank { provider.baseUrl }
+        val pageBase = finalUrl.ifBlank { provider.baseUrl }
         val trimmed = body.trimStart()
 
-        // JSON route: the payload itself is the results.
+        // JSON route: the payload itself is the results. Extraction is
+        // the analysis pipeline's own (DeterministicAnalysisHelper),
+        // with the broader key walker as a fallback.
         if (trimmed.startsWith("{") || trimmed.startsWith("[")) {
             val root = runCatching { json.parseToJsonElement(body) }.getOrNull()
             if (root != null) {
-                return Extraction(extractJsonPairs(root, provider.baseUrl), config, repaired = false)
+                val helperPairs = runCatching {
+                    DeterministicAnalysisHelper.extractResultsFromJson(body, provider.id)
+                }.getOrDefault(emptyList()).map { it.title to it.url }
+                val pairs = if (helperPairs.isNotEmpty()) {
+                    helperPairs.distinctBy { it.second }
+                } else {
+                    extractJsonPairs(root, provider.baseUrl)
+                }
+                return Extraction(
+                    pairs = pairs,
+                    effectiveConfig = config,
+                    repaired = false,
+                    paginationProven = jsonPaginationProven(root)
+                )
             }
         }
 
         val doc = runCatching { Jsoup.parse(body, pageBase) }.getOrNull()
             ?: return Extraction(emptyList(), config, repaired = false)
+        val pagination = detectHtmlPagination(doc, hint)
 
         val bySelectors = extractHtmlPairs(doc, config.resultSelector, config.titleSelector, config.urlSelector)
-        if (bySelectors.isNotEmpty()) return Extraction(bySelectors, config, repaired = false)
+        if (bySelectors.isNotEmpty()) {
+            return Extraction(bySelectors, config, false, pagination.first, pagination.second)
+        }
 
         // The runtime reads JSON-LD too — a page whose results live in
         // embedded JSON verifies with the candidate's config as-is.
         val byJsonLd = extractJsonLdPairs(doc, provider.baseUrl)
-        if (byJsonLd.isNotEmpty()) return Extraction(byJsonLd, config, repaired = false)
+        if (byJsonLd.isNotEmpty()) {
+            return Extraction(byJsonLd, config, false, pagination.first, pagination.second)
+        }
 
         if (allowRepair) {
-            val topSuggestion = runCatching {
-                ProviderConfigValidator.suggestSelectors(body, provider.baseUrl)
-                    .resultSelectors.firstOrNull()
-            }.getOrNull()
-            if (topSuggestion != null) {
-                val repairedPairs = extractHtmlPairs(
-                    doc,
-                    topSuggestion.selector,
-                    REPAIR_TITLE_SELECTOR,
-                    REPAIR_URL_SELECTOR
-                )
-                if (repairedPairs.isNotEmpty()) {
-                    val repairedConfig = config.copy(
-                        resultSelector = topSuggestion.selector,
-                        titleSelector = REPAIR_TITLE_SELECTOR,
-                        urlSelector = REPAIR_URL_SELECTOR
-                    )
-                    return Extraction(repairedPairs, repairedConfig, repaired = true)
+            // Rank the page's own suggested selectors by live
+            // item-vs-category classification and keep the best.
+            val suggestions = runCatching {
+                ProviderConfigValidator.suggestSelectors(body, provider.baseUrl).resultSelectors
+            }.getOrDefault(emptyList())
+            var bestPairs: List<Pair<String, String>> = emptyList()
+            var bestSelector: String? = null
+            var bestScore = Int.MIN_VALUE
+            for (suggestion in suggestions.take(MAX_REPAIR_SELECTORS)) {
+                val pairs = extractHtmlPairs(doc, suggestion.selector, REPAIR_TITLE_SELECTOR, REPAIR_URL_SELECTOR)
+                if (pairs.isEmpty()) continue
+                val (sItems, sCategories) = classify(pairs)
+                val score = (sItems - sCategories) * 100 + sItems
+                if (score > bestScore) {
+                    bestScore = score
+                    bestPairs = pairs
+                    bestSelector = suggestion.selector
                 }
             }
+            if (bestSelector != null) {
+                val repairedConfig = config.copy(
+                    resultSelector = bestSelector,
+                    titleSelector = REPAIR_TITLE_SELECTOR,
+                    urlSelector = REPAIR_URL_SELECTOR
+                )
+                return Extraction(bestPairs, repairedConfig, true, pagination.first, pagination.second)
+            }
         }
-        return Extraction(emptyList(), config, repaired = false)
+        return Extraction(emptyList(), config, false, pagination.first, pagination.second)
     }
 
     private fun extractHtmlPairs(
@@ -326,7 +732,72 @@ class SearchConfigVerifier @Inject constructor() {
         return null
     }
 
-    // ─── JSON extraction (mirrors ScrapingEngine's key conventions) ───
+    // ─── Pagination proof ─────────────────────────────────────────────
+
+    /** A next-page mechanism is "proven" when the live page links to
+     *  page 2 in the template's own style (its page parameter or
+     *  /page/2 paths), or exposes a rel="next" link. Returns
+     *  (proven, provenParamNameIfAny). */
+    private fun detectHtmlPagination(
+        doc: org.jsoup.nodes.Document,
+        hint: PaginationHint
+    ): Pair<Boolean, String?> {
+        var provenParam: String? = null
+        var proven = false
+        for (anchor in doc.select("a[href]")) {
+            val href = anchor.absUrl("href").ifBlank { anchor.attr("href") }
+            if (href.isBlank()) continue
+            if (href.contains("/page/2") || href.contains("/page=2")) {
+                proven = true
+                if (hint.pathStyle) provenParam = provenParam ?: hint.param
+            }
+            val paramMatch = PAGE2_PARAM_REGEX.find(href)
+            if (paramMatch != null) {
+                proven = true
+                provenParam = paramMatch.groupValues[1].lowercase()
+            }
+            if (anchor.attr("rel").equals("next", ignoreCase = true)) {
+                proven = true
+            }
+        }
+        // Even without a page-2 link, the hinted parameter appearing on
+        // the page's own links at any value is partial evidence — the
+        // caller still needs the =2 form for parameter repair, so only
+        // the proven flag is raised via rel=next / /page/2 above.
+        return proven to provenParam
+    }
+
+    private fun jsonPaginationProven(root: JsonElement): Boolean {
+        var found = false
+        fun walk(element: JsonElement, depth: Int) {
+            if (depth > 6 || found) return
+            when (element) {
+                is JsonObject -> {
+                    for ((key, value) in element) {
+                        val k = key.lowercase()
+                        if (k in setOf("next", "next_page", "nextpage", "next_url") &&
+                            value is JsonPrimitive && !value.contentOrNull.isNullOrBlank()
+                        ) {
+                            found = true
+                        }
+                        if (k in setOf("total_pages", "totalpages", "last_page", "page_count") &&
+                            value is JsonPrimitive && (value.contentOrNull?.toIntOrNull() ?: 0) > 1
+                        ) {
+                            found = true
+                        }
+                        walk(value, depth + 1)
+                    }
+                }
+                is JsonArray -> element.forEach { walk(it, depth + 1) }
+                else -> Unit
+            }
+        }
+        walk(root, 0)
+        return found
+    }
+
+    // ─── JSON extraction (fallback walker; key conventions mirror
+    //     ScrapingEngine.extractResultsFromJson) ───────────────────────
 
     private fun extractJsonPairs(root: JsonElement, baseUrl: String): List<Pair<String, String>> {
         val objects = mutableListOf<JsonObject>()
@@ -359,8 +830,6 @@ class SearchConfigVerifier @Inject constructor() {
         val pairs = mutableListOf<Pair<String, String>>()
         for (script in doc.select("script[type=application/ld+json]")) {
             val root = runCatching { json.parseToJsonElement(script.data()) }.getOrNull() ?: continue
-            // JSON-LD uses name/url keys; the shared walker covers them,
-            // including ItemList → itemListElement and @graph nesting.
             pairs += extractJsonPairs(root, baseUrl)
         }
         return pairs.distinctBy { it.second }
@@ -400,9 +869,14 @@ class SearchConfigVerifier @Inject constructor() {
 
     companion object {
         const val NONSENSE_QUERY = "zqxv123nonexistent"
+        const val MIN_AUTOSAVE_CONFIDENCE = 0.7f
         private const val PROBE_TIMEOUT_MS = 8_000
-        private const val TOTAL_BUDGET_MS = 40_000L
+        private const val RENDER_TIMEOUT_MS = 15_000
+        private const val RAW_BUDGET_MS = 40_000L
+        private const val RENDER_BUDGET_MS = 60_000L
         private const val MIN_ITEMS = 3
+        private const val MAX_REPAIR_SELECTORS = 3
+        private const val MAX_RENDERED_CANDIDATES = 2
 
         private const val TITLE_FALLBACK_SELECTOR = "h1, h2, h3, h4, .title, .name, [class*='title'], a"
         private const val REPAIR_TITLE_SELECTOR = "a, h1, h2, h3, h4, .title, [class*='title']"
@@ -410,6 +884,8 @@ class SearchConfigVerifier @Inject constructor() {
 
         private val DURATION_REGEX = Regex("^\\d{1,2}:\\d{2}(:\\d{2})?$")
         private val MINUTES_REGEX = Regex("^\\d{1,3}\\s*(min|minutes?|hours?)$", RegexOption.IGNORE_CASE)
+        private val PAGE_PARAM_REGEX = Regex("[?&](page|paged|p)=\\{page\\}", RegexOption.IGNORE_CASE)
+        private val PAGE2_PARAM_REGEX = Regex("[?&](page|paged|p)=2(?:&|$)", RegexOption.IGNORE_CASE)
         private val CATEGORY_SEGMENTS = setOf("category", "categories", "genre", "genres", "tag", "tags")
 
         private val TITLE_KEYS = listOf("title", "name", "headline", "label")
@@ -422,7 +898,19 @@ class SearchConfigVerifier @Inject constructor() {
 /** A candidate config plus where it came from, for failure reporting. */
 data class VerifierCandidate(
     val config: ScrapingConfig,
-    val sourceLabel: String
+    val sourceLabel: String,
+    /** True when this route is (or was derived from) the site's own
+     *  search form — the rendered phase may then submit that form in
+     *  the headless browser. */
+    val isFormRoute: Boolean = false
+)
+
+/** What recon learned about the site's pagination, used to score (and
+ *  repair) a candidate's pagination against live probe evidence. */
+data class PaginationHint(
+    val param: String? = null,
+    val pathStyle: Boolean = false,
+    val inventoryEvidence: Boolean = false
 )
 
 sealed class VerificationOutcome {
@@ -437,7 +925,7 @@ sealed class VerificationOutcome {
     ) : VerificationOutcome()
 }
 
-/** The evidence from one candidate's live probe. */
+/** The evidence from one candidate's live verification. */
 data class ProbeVerdict(
     val sourceLabel: String,
     val probedUrl: String,
@@ -445,6 +933,11 @@ data class ProbeVerdict(
     val categoryCount: Int,
     val nonsenseItemCount: Int,
     val responseMs: Long,
+    val slowestProbeMs: Long,
     val passed: Boolean,
+    val rendered: Boolean,
+    val paginationProven: Boolean,
+    val confidence: Float,
+    val confidenceDetail: String,
     val reason: String
 )
