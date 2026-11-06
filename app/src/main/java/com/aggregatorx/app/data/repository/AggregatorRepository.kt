@@ -112,6 +112,10 @@ class AggregatorRepository @Inject constructor(
     ): ScrapingConfig {
         val template = mapping.searchUrlTemplate ?: buildSearchUrlTemplate(provider.baseUrl, analysis)
         return ScrapingConfig(
+            // Key the row by provider ID: the entity PK is the provider's ID, so the
+            // REPLACE insert in analyzeProvider is a true per-provider upsert (the
+            // preceding deleteConfigForProvider also clears any legacy random-ID rows).
+            id = provider.id,
             providerId = provider.id,
             searchUrlTemplate = template,
             resultSelector = mapping.resultSelector ?: analysis.resultItemSelector ?: ".item, .result, article",
