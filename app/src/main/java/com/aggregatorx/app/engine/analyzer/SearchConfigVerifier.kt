@@ -8,6 +8,7 @@ import com.aggregatorx.app.engine.ml.DeterministicAnalysisHelper
 import com.aggregatorx.app.engine.network.TlsClient
 import com.aggregatorx.app.engine.network.TlsRequest
 import com.aggregatorx.app.engine.scraper.HeadlessBrowserHelper
+import com.aggregatorx.app.engine.scraper.ResultClassification
 import com.aggregatorx.app.engine.scraper.SearchResultFilter
 import com.aggregatorx.app.engine.util.EngineUtils
 import com.aggregatorx.app.engine.validator.ProviderConfigValidator
@@ -283,17 +284,35 @@ class SearchConfigVerifier @Inject constructor() {
         val (nonsenseItems, _) = classify(nonsenseExtraction.pairs)
         if (!nonsensePasses(nonsenseItems, items)) {
             return CandidateAttempt.Failed(
-                "$label: the site's search ignores the query — a nonsense search returned $nonsenseItems items (real search: $items), so this route is not the site's real search",
+                "$label: the site's search ignores the query — a nonsense search (\"$NONSENSE_QUERY\") returned " +
+                    "$nonsenseItems items (real search: $items), i.e. it answers nonsense with filler/popular items, " +
+                    "so this route is not the site's real search",
                 gotHttpResponse = true
             )
         }
+
+        // Live page-2 proof: fetch the real next page via the discovered
+        // mechanism. Pagination is only recorded when page 2 actually
+        // returns new item results — never assumed from a link alone.
+        val firstPageUrls = extraction.pairs.map { it.second }.toSet()
+        val page2 = provePage2(provider, effectiveConfig, probeQuery, firstPageUrls, response.body, response.finalUrl, hint)
+        slowest = maxOf(slowest, page2.elapsedMs)
+        effectiveConfig = page2.config
 
         val confidence = computeConfidence(
             routeScore = 1.0f,
             items = items,
             categories = categories,
-            paginationProven = extraction.paginationProven,
-            hint = hint
+            paginationProven = page2.proven,
+            hint = hint,
+            paginationSeen = extraction.paginationProven
+        )
+        val checks = listOf(
+            VerificationCheck("route-responds", true, "HTTP ${response.statusCode} in ${responseMs} ms from ${probe.url.take(160)}"),
+            VerificationCheck("results-parse", items >= MIN_ITEMS, "$items item results for the probe \"$probeQuery\" (need >= $MIN_ITEMS)"),
+            VerificationCheck("items-outnumber-categories", items > categories, "$items items vs $categories category/listing links"),
+            VerificationCheck("nonsense-control-empty", true, "\"$NONSENSE_QUERY\" returned $nonsenseItems items"),
+            VerificationCheck("page-2-exists", page2.proven, page2.detail)
         )
         if (confidence.overall < MIN_AUTOSAVE_CONFIDENCE) {
             return CandidateAttempt.Failed(
@@ -303,6 +322,7 @@ class SearchConfigVerifier @Inject constructor() {
                 gotHttpResponse = true
             )
         }
+        effectiveConfig = finalizeConfig(effectiveConfig, extraction.pairs, page2, confidence.overall)
 
         val verdict = ProbeVerdict(
             sourceLabel = label,
@@ -314,11 +334,18 @@ class SearchConfigVerifier @Inject constructor() {
             slowestProbeMs = slowest,
             passed = true,
             rendered = false,
-            paginationProven = extraction.paginationProven,
+            paginationProven = page2.proven,
             confidence = confidence.overall,
             confidenceDetail = confidence.detail,
             reason = "Verified live: $items item results, $categories category links, " +
-                "nonsense control returned $nonsenseItems, confidence ${formatScore(confidence.overall)}"
+                "nonsense control returned $nonsenseItems, " +
+                (if (page2.proven) "page 2 proven live (${page2.newItems} new items)" else "pagination not proven") +
+                ", confidence ${formatScore(confidence.overall)}",
+            checks = checks,
+            fieldConfidence = confidence.fields,
+            page2Url = page2.url,
+            page2NewItems = page2.newItems,
+            paginationRule = effectiveConfig.paginationRule
         )
         return CandidateAttempt.Passed(effectiveConfig, verdict, repaired)
     }
@@ -373,8 +400,10 @@ class SearchConfigVerifier @Inject constructor() {
                             gotHttpResponse = true
                         )
                     }
+                    val renderedPage2 = Page2Proof(false, extraction.effectiveConfig, null, 0,
+                        "page 2 not fetched for a rendered form search (pagination left unrecorded)", 0L)
                     return CandidateAttempt.Passed(
-                        config = extraction.effectiveConfig,
+                        config = finalizeConfig(extraction.effectiveConfig, extraction.pairs, renderedPage2, confidence.overall),
                         verdict = ProbeVerdict(
                             sourceLabel = label,
                             probedUrl = provider.baseUrl,
@@ -392,7 +421,16 @@ class SearchConfigVerifier @Inject constructor() {
                                 "$items item results, $categories category links, " +
                                 (if (nonsenseItems >= 0) "nonsense control returned $nonsenseItems"
                                 else "nonsense form control inconclusive (no page returned)") +
-                                ", confidence ${formatScore(confidence.overall)}"
+                                ", confidence ${formatScore(confidence.overall)}",
+                            checks = listOf(
+                                VerificationCheck("route-responds", true, "site's own form submitted in the headless browser"),
+                                VerificationCheck("results-parse", true, "$items item results"),
+                                VerificationCheck("items-outnumber-categories", true, "$items items vs $categories categories"),
+                                VerificationCheck("nonsense-control-empty", nonsenseItems >= 0,
+                                    if (nonsenseItems >= 0) "returned $nonsenseItems items" else "inconclusive: no page returned"),
+                                VerificationCheck("page-2-exists", false, renderedPage2.detail)
+                            ),
+                            fieldConfidence = confidence.fields
                         ),
                         repaired = extraction.repaired
                     )
@@ -450,8 +488,10 @@ class SearchConfigVerifier @Inject constructor() {
                 gotHttpResponse = true
             )
         }
+        val renderedPage2 = Page2Proof(false, extraction.effectiveConfig, null, 0,
+            "page 2 not fetched for a rendered-only route (pagination left unrecorded)", 0L)
         return CandidateAttempt.Passed(
-            config = extraction.effectiveConfig,
+            config = finalizeConfig(extraction.effectiveConfig, extraction.pairs, renderedPage2, confidence.overall),
             verdict = ProbeVerdict(
                 sourceLabel = label,
                 probedUrl = probeUrl,
@@ -468,7 +508,16 @@ class SearchConfigVerifier @Inject constructor() {
                 reason = "Verified after headless rendering: $items item results, $categories category links, " +
                     (if (nonsenseItems >= 0) "nonsense control returned $nonsenseItems"
                     else "nonsense control inconclusive over raw HTTP") +
-                    ", confidence ${formatScore(confidence.overall)}"
+                    ", confidence ${formatScore(confidence.overall)}",
+                checks = listOf(
+                    VerificationCheck("route-responds", true, "rendered $probeUrl in the headless browser"),
+                    VerificationCheck("results-parse", true, "$items item results"),
+                    VerificationCheck("items-outnumber-categories", true, "$items items vs $categories categories"),
+                    VerificationCheck("nonsense-control-empty", nonsenseItems >= 0,
+                        if (nonsenseItems >= 0) "raw route returned $nonsenseItems items" else "inconclusive over raw HTTP"),
+                    VerificationCheck("page-2-exists", false, renderedPage2.detail)
+                ),
+                fieldConfidence = confidence.fields
             ),
             repaired = extraction.repaired
         )
@@ -476,7 +525,7 @@ class SearchConfigVerifier @Inject constructor() {
 
     // ─── Confidence ───────────────────────────────────────────────────
 
-    private data class Confidence(val overall: Float, val detail: String)
+    private data class Confidence(val overall: Float, val detail: String, val fields: Map<String, Float> = emptyMap())
 
     /**
      * Per-field confidence from live evidence. Route = the probe (and
@@ -491,7 +540,8 @@ class SearchConfigVerifier @Inject constructor() {
         items: Int,
         categories: Int,
         paginationProven: Boolean,
-        hint: PaginationHint
+        hint: PaginationHint,
+        paginationSeen: Boolean = false
     ): Confidence {
         val total = (items + categories).coerceAtLeast(1)
         val share = items.toFloat() / total
@@ -502,16 +552,24 @@ class SearchConfigVerifier @Inject constructor() {
             else -> 0.5f
         }
         if (items >= 10) extractionScore = minOf(1.0f, extractionScore + 0.05f)
+        // Pagination scores fully only when page 2 was fetched live and
+        // returned new items; a next-page link merely seen on the page is
+        // partial evidence; inventory hints less; nothing, least.
         val paginationScore = when {
             paginationProven -> 1.0f
-            hint.inventoryEvidence -> 0.6f
+            paginationSeen -> 0.5f
+            hint.inventoryEvidence -> 0.4f
             else -> 0.3f
         }
         val overall = routeScore * 0.35f + extractionScore * 0.40f + paginationScore * 0.25f
         val detail = "route=${formatScore(routeScore)}, extraction=${formatScore(extractionScore)} " +
             "(item share ${formatScore(share)}), pagination=${formatScore(paginationScore)}" +
-            if (paginationProven) " (proven on the probe page)" else " (not proven on the probe page)"
-        return Confidence(overall, detail)
+            if (paginationProven) " (page 2 fetched live)" else if (paginationSeen) " (next-page link seen, page 2 not proven)" else " (not proven)"
+        return Confidence(
+            overall,
+            detail,
+            mapOf("route" to routeScore, "extraction" to extractionScore, "pagination" to paginationScore, "overall" to overall)
+        )
     }
 
     private fun formatScore(value: Float): String = String.format(java.util.Locale.US, "%.2f", value)
@@ -552,12 +610,12 @@ class SearchConfigVerifier @Inject constructor() {
 
     // ─── Request building ─────────────────────────────────────────────
 
-    private fun buildRequest(provider: Provider, config: ScrapingConfig, query: String): TlsRequest {
+    private fun buildRequest(provider: Provider, config: ScrapingConfig, query: String, page: Int = 1): TlsRequest {
         val encoded = URLEncoder.encode(query, "UTF-8")
         fun fill(template: String): String = template
             .replace("{baseUrl}", provider.baseUrl)
             .replace("{query}", encoded)
-            .replace("{page}", "1")
+            .replace("{page}", page.toString())
 
         val url = fill(config.searchUrlTemplate)
         val postData = config.postData
@@ -873,10 +931,153 @@ class SearchConfigVerifier @Inject constructor() {
         return (pairs.size - categories) to categories
     }
 
-    private fun isCategoryLikeUrl(url: String): Boolean {
-        val path = runCatching { java.net.URL(url).path }.getOrNull() ?: return false
-        val segments = path.lowercase().split('/').filter { it.isNotBlank() }
-        return segments.any { it in CATEGORY_SEGMENTS }
+    private fun isCategoryLikeUrl(url: String): Boolean = ResultClassification.isCategoryLikeUrl(url)
+
+    private fun isCategoryPair(title: String, url: String): Boolean =
+        SearchResultFilter.isLikelyCategory(title) ||
+            SearchResultFilter.isLikelyDuration(title) ||
+            isCategoryLikeUrl(url)
+
+    // ─── Live page-2 proof ────────────────────────────────────────────
+
+    private data class Page2Proof(
+        val proven: Boolean,
+        val config: ScrapingConfig,
+        val url: String?,
+        val newItems: Int,
+        val detail: String,
+        val elapsedMs: Long
+    )
+
+    /**
+     * Fetch the site's real page 2 for the probe query through the discovered
+     * mechanism: the template's own {page} token, or — when the template has
+     * none — a template derived from the live results page's own next-page
+     * link. Proven only when page 2 returns item results not on page 1.
+     */
+    private fun provePage2(
+        provider: Provider,
+        config: ScrapingConfig,
+        probeQuery: String,
+        firstPageUrls: Set<String>,
+        firstBody: String,
+        firstFinalUrl: String,
+        hint: PaginationHint
+    ): Page2Proof {
+        val started = System.currentTimeMillis()
+        val attempts = mutableListOf<ScrapingConfig>()
+        val hasToken = config.searchUrlTemplate.contains("{page}") || config.postData?.contains("{page}") == true
+        if (hasToken) attempts += config
+        if (config.postData == null) {
+            deriveTemplateFromNextLink(firstBody, firstFinalUrl, probeQuery)
+                ?.takeIf { it != config.searchUrlTemplate }
+                ?.let { attempts += config.copy(searchUrlTemplate = it) }
+        }
+        if (attempts.isEmpty()) {
+            return Page2Proof(false, config.copy(paginationRule = null), null, 0,
+                "no page-2 mechanism on the live results page (no {page} parameter and no next-page link carrying the query)",
+                System.currentTimeMillis() - started)
+        }
+        val failures = mutableListOf<String>()
+        for (candidate in attempts) {
+            val request = buildRequest(provider, candidate, probeQuery, page = candidate.paginationStart + 1)
+            val response = HttpTransport.executeTls(request)
+            if (response.error != null || response.statusCode !in 200..399) {
+                failures += "page-2 fetch ${request.url.take(140)} failed (${response.error ?: "HTTP ${response.statusCode}"})"
+                continue
+            }
+            val pairs = extractFromBody(response.body, response.finalUrl, provider, candidate, hint, allowRepair = false).pairs
+            val newItems = pairs.count { (title, url) -> url !in firstPageUrls && !isCategoryPair(title, url) }
+            if (newItems >= 1) {
+                val rule = derivePaginationRule(candidate)
+                return Page2Proof(
+                    true,
+                    candidate.copy(paginationRule = rule),
+                    request.url,
+                    newItems,
+                    "page 2 fetched live (${request.url.take(160)}): $newItems new item results; rule ${rule ?: "template {page}"}",
+                    System.currentTimeMillis() - started
+                )
+            }
+            failures += "page-2 fetch ${request.url.take(140)} returned no new item results (${pairs.size} links, all on page 1 or categories)"
+        }
+        return Page2Proof(false, config.copy(paginationRule = null), null, 0,
+            failures.joinToString("; "), System.currentTimeMillis() - started)
+    }
+
+    /** Turn the live page's own next-page link into a {query}/{page} template. */
+    private fun deriveTemplateFromNextLink(body: String, finalUrl: String, probeQuery: String): String? {
+        val doc = runCatching { Jsoup.parse(body, finalUrl) }.getOrNull() ?: return null
+        val encodedForms = listOf(
+            URLEncoder.encode(probeQuery, "UTF-8"),
+            URLEncoder.encode(probeQuery, "UTF-8").replace("+", "%20"),
+            probeQuery.replace(" ", "-"),
+            probeQuery
+        ).distinct()
+        val anchors = doc.select("a[rel=next][href], link[rel=next][href]") + doc.select("a[href]")
+        for (anchor in anchors) {
+            val href = anchor.absUrl("href")
+            if (href.isBlank()) continue
+            val pageMatch = NEXT_PARAM_REGEX.find(href)
+            val pathMatch = NEXT_PATH_REGEX.find(href)
+            if (pageMatch == null && pathMatch == null) continue
+            val form = encodedForms.firstOrNull { href.contains(it, ignoreCase = true) } ?: continue
+            var template = href.replace(form, "{query}", ignoreCase = true)
+            template = if (pageMatch != null) {
+                template.replace(NEXT_PARAM_REGEX) { m -> "${m.groupValues[1]}${m.groupValues[2]}={page}${m.groupValues[4]}" }
+            } else {
+                template.replace(NEXT_PATH_REGEX) { m -> "${m.groupValues[1]}{page}${m.groupValues[2]}" }
+            }
+            if (template.contains("{query}") && template.contains("{page}")) return template
+        }
+        return null
+    }
+
+    /** "param:<name>" for a query/body parameter, "path:<path pattern>" for /page/N/ style. */
+    private fun derivePaginationRule(config: ScrapingConfig): String? {
+        PAGE_TOKEN_PARAM_REGEX.find(config.searchUrlTemplate)?.let { return "param:${it.groupValues[1]}" }
+        config.postData?.let { body -> PAGE_TOKEN_BODY_REGEX.find(body)?.let { return "param:${it.groupValues[1]}" } }
+        val path = config.searchUrlTemplate.substringBefore('?')
+        if (path.contains("{page}")) return "path:" + path.substringAfter("://").substringAfter('/', "")
+            .let { "/$it" }
+        return null
+    }
+
+    /**
+     * Stamp the verified config with everything search needs (spec §3): HTTP
+     * method, real query parameter, hidden/fixed parameters, the demonstrated
+     * pagination rule, learned classification data and the verification state.
+     */
+    private fun finalizeConfig(
+        config: ScrapingConfig,
+        pairs: List<Pair<String, String>>,
+        page2: Page2Proof,
+        confidence: Float
+    ): ScrapingConfig {
+        val isPost = config.postData != null
+        val paramSource = if (isPost) config.postData.orEmpty() else config.searchUrlTemplate.substringAfter('?', "")
+        val params = paramSource.split('&').mapNotNull { part ->
+            val name = part.substringBefore('=').takeIf { it.isNotBlank() && part.contains('=') } ?: return@mapNotNull null
+            runCatching { java.net.URLDecoder.decode(name, "UTF-8") }.getOrDefault(name) to part.substringAfter('=')
+        }
+        val queryParam = params.firstOrNull { it.second.contains("{query}") }?.first
+        val hidden = params.filter { !it.second.contains("{query}") && !it.second.contains("{page}") }
+        val hiddenJson = kotlinx.serialization.json.buildJsonObject {
+            hidden.forEach { (k, v) ->
+                put(k, JsonPrimitive(runCatching { java.net.URLDecoder.decode(v, "UTF-8") }.getOrDefault(v)))
+            }
+        }.toString()
+        val classification = ResultClassification.learn(pairs) { title, url -> isCategoryPair(title, url) }
+        return config.copy(
+            method = if (isPost) "POST" else "GET",
+            queryParam = queryParam ?: config.queryParam,
+            hiddenParams = hiddenJson,
+            paginationRule = if (page2.proven) page2.config.paginationRule else null,
+            classificationData = ResultClassification.encode(classification),
+            verified = true,
+            verifiedAt = System.currentTimeMillis(),
+            confidence = confidence
+        )
     }
 
     companion object {
@@ -898,7 +1099,10 @@ class SearchConfigVerifier @Inject constructor() {
         private val MINUTES_REGEX = Regex("^\\d{1,3}\\s*(min|minutes?|hours?)$", RegexOption.IGNORE_CASE)
         private val PAGE_PARAM_REGEX = Regex("[?&](page|paged|p)=\\{page\\}", RegexOption.IGNORE_CASE)
         private val PAGE2_PARAM_REGEX = Regex("[?&](page|paged|p)=2(?:&|$)", RegexOption.IGNORE_CASE)
-        private val CATEGORY_SEGMENTS = setOf("category", "categories", "genre", "genres", "tag", "tags")
+        private val NEXT_PARAM_REGEX = Regex("([?&])(page|paged|p|pg|pagenum|page_num)=(2)(&|$|#)", RegexOption.IGNORE_CASE)
+        private val NEXT_PATH_REGEX = Regex("(/page/)2(/|$|\\?)", RegexOption.IGNORE_CASE)
+        private val PAGE_TOKEN_PARAM_REGEX = Regex("[?&]([^=&?#]+)=\\{page\\}")
+        private val PAGE_TOKEN_BODY_REGEX = Regex("(?:^|&)([^=&]+)=\\{page\\}")
 
         private val TITLE_KEYS = listOf("title", "name", "headline", "label")
         private val URL_KEYS = listOf("url", "link", "href", "permalink", "webpage_url", "canonicalUrl")
@@ -951,5 +1155,20 @@ data class ProbeVerdict(
     val paginationProven: Boolean,
     val confidence: Float,
     val confidenceDetail: String,
-    val reason: String
+    val reason: String,
+    /** Discrete, repeatable checks (Nuclei-template style) with pass/fail and evidence. */
+    val checks: List<VerificationCheck> = emptyList(),
+    /** Per-field confidence: route, extraction, pagination, overall. */
+    val fieldConfidence: Map<String, Float> = emptyMap(),
+    /** The live page-2 URL fetched as pagination proof, if any. */
+    val page2Url: String? = null,
+    val page2NewItems: Int = 0,
+    val paginationRule: String? = null
+)
+
+/** One discrete verification step and its recorded evidence. */
+data class VerificationCheck(
+    val id: String,
+    val passed: Boolean,
+    val evidence: String
 )
