@@ -137,10 +137,9 @@ class SiteAnalyzerEngine @Inject constructor(
         val startTime = System.currentTimeMillis()
 
         try {
-            // Normalize URL
-            val normalizedUrl = normalizeUrl(url)
-            val baseUrl = extractBaseUrl(normalizedUrl)
-            
+            // Normalize URL (identical to the cache key computed above)
+            val normalizedUrl = normalizedKey
+
             // Fetch the page with modern browser headers, then fall back to
             // rendered content so JS-heavy sites can still be analyzed.
             val fetchedPage = fetchAnalyzerPage(normalizedUrl)
@@ -159,7 +158,10 @@ class SiteAnalyzerEngine @Inject constructor(
                 }
             } else null
             val activeHtml = renderedHtml ?: fetchedPage.html
-            val document = Jsoup.parse(activeHtml, normalizedUrl)
+            // Without a rendered fallback, activeHtml is the exact string already
+            // parsed into fetchedDocument — reuse that Document instead of parsing
+            // the same HTML a second time.
+            val document = if (renderedHtml != null) Jsoup.parse(activeHtml, normalizedUrl) else fetchedDocument
             val loadTime = System.currentTimeMillis() - startTime
             
             // Perform all analyses
