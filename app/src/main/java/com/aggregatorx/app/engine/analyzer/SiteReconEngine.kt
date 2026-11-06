@@ -104,12 +104,25 @@ class SiteReconEngine @Inject constructor(
         }
         sitemapLocations += DEFAULT_SITEMAP_PATHS.map { "$base$it" }
 
+        // Crawl-rule paths are also the site's own route data: a Disallow
+        // for "/search/" or "/?s=" reveals the search route's shape.
+        robots.body?.let { text ->
+            text.lineSequence()
+                .map { it.trim() }
+                .filter {
+                    it.lowercase().startsWith("disallow:") || it.lowercase().startsWith("allow:")
+                }
+                .map { it.substringAfter(':').trim() }
+                .filter { it.startsWith("/") && !it.contains('*') && !it.endsWith("$") }
+                .forEach { path -> urls += "$base$path" }
+        }
+
         var sitemapUrlCount = 0
         for (sitemapUrl in sitemapLocations.distinct().take(MAX_SITEMAP_FILES)) {
             val xml = timedFetch(sitemapUrl, SITEMAP_TIMEOUT_MS).body ?: continue
             val locs = LOC_REGEX.findAll(xml).map { it.groupValues[1].trim() }.toList()
             if (xml.contains("<sitemapindex", ignoreCase = true)) {
-                for (child in locs.filter { it.endsWith(".xml") }.take(2)) {
+                for (child in locs.filter { it.endsWith(".xml") }.take(4)) {
                     val childXml = timedFetch(child, SITEMAP_TIMEOUT_MS).body ?: continue
                     val childLocs = LOC_REGEX.findAll(childXml).map { it.groupValues[1].trim() }.toList()
                     sitemapUrlCount += childLocs.size
@@ -134,6 +147,10 @@ class SiteReconEngine @Inject constructor(
             }
         }
         val anchorTexts = mutableListOf<String>()
+        var openSearchCandidate: SearchCandidate? = null
+        var wpJsonBase: String? = null
+        var scriptCandidates: List<SearchCandidate> = emptyList()
+        var stateFindings = StateBlobFindings(emptyList(), null)
         if (homepageDoc != null) {
             runCatching {
                 homepageDoc.select("a[href]").forEach { link ->
@@ -143,6 +160,28 @@ class SiteReconEngine @Inject constructor(
                     if (text.length >= 4) anchorTexts += text
                 }
             }
+            // Feed entries are real content URLs — they enrich the
+            // inventory (probe terms, item shapes) before derivation.
+            runCatching { harvestFeedLinks(homepageDoc, base) { url, t -> timedFetch(url, t) } }
+                .getOrDefault(emptyList())
+                .forEach { urls += it }
+            // OpenSearch description: the site literally publishes its
+            // search template there.
+            openSearchCandidate = runCatching {
+                parseOpenSearch(homepageDoc, base) { url, t -> timedFetch(url, t) }
+            }.getOrNull()
+            // WordPress REST root advertised by the page itself.
+            wpJsonBase = runCatching {
+                val href = homepageDoc.selectFirst("link[rel='https://api.w.org/']")?.attr("href")
+                href?.takeIf { it.startsWith("http") }
+            }.getOrNull()
+            // Endpoints named by the page's own scripts (inline + src
+            // files) and by its embedded state blobs.
+            scriptCandidates = runCatching {
+                mineScriptEndpoints(homepageDoc, base, baseHost) { url, t -> timedFetch(url, t) }
+            }.getOrDefault(emptyList())
+            stateFindings = runCatching { parseStateBlobs(homepageDoc) }
+                .getOrDefault(StateBlobFindings(emptyList(), null))
         }
 
         // ── 3. Existing endpoint recon (JS analysis, CMS/API probes) ──
@@ -160,11 +199,24 @@ class SiteReconEngine @Inject constructor(
         // ── Candidates ─────────────────────────────────────────────────
         val candidates = mutableListOf<SearchCandidate>()
 
-        // The site's real search form — highest trust, ranked first.
+        // The site's real search forms — highest trust, ranked first.
+        // Sites often carry several (header + dedicated search page
+        // forms, GET + POST variants); each distinct one is a candidate.
         if (homepageDoc != null) {
-            runCatching { harvestSearchForm(homepageDoc, base, pagination.param) }
-                .getOrNull()
-                ?.let { candidates += it }
+            runCatching { harvestSearchForms(homepageDoc, base, pagination.param) }
+                .getOrDefault(emptyList())
+                .forEach { candidates += it }
+        }
+
+        // The site's own published OpenSearch template.
+        openSearchCandidate?.let { candidates += it }
+
+        // WordPress REST search collection under the advertised root.
+        wpJsonBase?.let { wpBase ->
+            candidates += SearchCandidate(
+                urlTemplate = wpBase.trimEnd('/') + "/wp/v2/search?search={query}&per_page=20&page={page}",
+                source = CandidateSource.JSON_API
+            )
         }
 
         // Endpoints the discovery engine already verified live.
@@ -186,6 +238,12 @@ class SiteReconEngine @Inject constructor(
             candidates += SearchCandidate(urlTemplate = it, source = CandidateSource.SITEMAP_DERIVED)
         }
 
+        // Endpoints named by the page's own scripts and state blobs.
+        candidates += scriptCandidates
+        stateFindings.endpoints.forEach { endpoint ->
+            candidates += SearchCandidate(urlTemplate = endpoint, source = CandidateSource.EMBEDDED_STATE)
+        }
+
         // ── 4. JSON endpoint detection: probe and derive field paths ──
         val elapsed = System.currentTimeMillis() - startedAt
         if (probeQuery != null && elapsed < JSON_PROBE_DEADLINE_MS) {
@@ -194,12 +252,14 @@ class SiteReconEngine @Inject constructor(
                 val looksJson = candidate.urlTemplate.contains("/api/", ignoreCase = true) ||
                     candidate.urlTemplate.contains("wp-json", ignoreCase = true) ||
                     candidate.urlTemplate.contains("/ajax/", ignoreCase = true) ||
-                    candidate.urlTemplate.substringBefore('?').endsWith(".json", ignoreCase = true)
+                    candidate.urlTemplate.substringBefore('?').endsWith(".json", ignoreCase = true) ||
+                    candidate.source == CandidateSource.JSON_API ||
+                    candidate.source == CandidateSource.EMBEDDED_STATE
                 if (!looksJson || probes >= MAX_JSON_PROBES || candidate.postData != null) {
                     candidate
                 } else {
                     probes++
-                    probeJsonCandidate(candidate, probeQuery) { url, timeout ->
+                    probeJsonCandidate(candidate, probeQuery, stateFindings.hints) { url, timeout ->
                         timedFetch(url, timeout, acceptJson = true)
                     }
                 }
@@ -213,7 +273,7 @@ class SiteReconEngine @Inject constructor(
         val ordered = candidates
             .distinctBy { it.urlTemplate to it.postData }
             .sortedWith(
-                compareBy<SearchCandidate> { if (it.source == CandidateSource.FORM) 0 else 1 }
+                compareBy<SearchCandidate> { sourceRank(it.source) }
                     .thenBy { if (it.isJson) 0 else 1 }
                     .thenBy { if (it.source == CandidateSource.SITEMAP_DERIVED) 0 else 1 }
             )
@@ -245,15 +305,29 @@ class SiteReconEngine @Inject constructor(
 
     // ─── Search form harvesting ───────────────────────────────────────
 
-    private fun harvestSearchForm(doc: Document, base: String, paginationParam: String?): SearchCandidate? {
-        val forms = doc.select("form")
-        val form = forms.firstOrNull { candidate ->
-            candidate.selectFirst("input[type=search]") != null ||
-                candidate.select("input[name]").any { it.attr("name").lowercase() in SEARCH_FIELD_NAMES } ||
-                candidate.attr("action").contains("search", ignoreCase = true) ||
-                candidate.attr("role").equals("search", ignoreCase = true)
-        } ?: return null
+    private fun sourceRank(source: CandidateSource): Int = when (source) {
+        CandidateSource.FORM -> 0
+        CandidateSource.OPENSEARCH -> 1
+        CandidateSource.JSON_API -> 2
+        CandidateSource.EMBEDDED_STATE -> 3
+        CandidateSource.DISCOVERED_ENDPOINT -> 4
+        CandidateSource.SITEMAP_DERIVED -> 5
+    }
 
+    /** All distinct search forms on the page (GET and POST variants). */
+    private fun harvestSearchForms(doc: Document, base: String, paginationParam: String?): List<SearchCandidate> {
+        val forms = doc.select("form").filter { form ->
+            form.selectFirst("input[type=search]") != null ||
+                form.select("input[name]").any { it.attr("name").lowercase() in SEARCH_FIELD_NAMES } ||
+                form.attr("action").contains("search", ignoreCase = true) ||
+                form.attr("role").equals("search", ignoreCase = true)
+        }
+        return forms.mapNotNull { form -> buildFormCandidate(form, base, paginationParam) }
+            .distinctBy { it.urlTemplate to it.postData }
+            .take(MAX_FORM_CANDIDATES)
+    }
+
+    private fun buildFormCandidate(form: org.jsoup.nodes.Element, base: String, paginationParam: String?): SearchCandidate? {
         val action = form.absUrl("action").ifBlank { base }
         if (!action.startsWith("http", ignoreCase = true)) return null
 
@@ -303,6 +377,216 @@ class SiteReconEngine @Inject constructor(
         }
     }
 
+    // ─── OpenSearch / feeds / WordPress ───────────────────────────────
+
+    /**
+     * The site's published OpenSearch description: its Url template uses
+     * {searchTerms} for the query. Optional OpenSearch parameters
+     * ({count?}, {startPage?}, …) are dropped along with their key=value
+     * pair — a template that still has unresolved placeholders after
+     * conversion is rejected rather than guessed at.
+     */
+    private fun parseOpenSearch(
+        doc: Document,
+        base: String,
+        fetch: (String, Int) -> TimedFetch
+    ): SearchCandidate? {
+        val linkHref = doc.selectFirst("link[rel='search'][type='application/opensearchdescription+xml']")
+            ?.absUrl("href")
+            ?.takeIf { it.isNotBlank() }
+        val descriptionUrl = linkHref ?: "$base/opensearch.xml"
+        val xml = fetch(descriptionUrl, OPENSEARCH_TIMEOUT_MS).body ?: return null
+        if (!xml.contains("opensearch", ignoreCase = true) && !xml.contains("Url", ignoreCase = true)) {
+            return null
+        }
+        val urlElements = runCatching { Jsoup.parse(xml, base).select("Url") }.getOrDefault(emptyList())
+        if (urlElements.isEmpty()) return null
+        val chosen = urlElements.firstOrNull { it.attr("type").equals("text/html", ignoreCase = true) }
+            ?: urlElements.first()
+        var template = chosen.attr("template")
+        if (!template.contains("{searchTerms}")) return null
+        template = template.replace("{searchTerms}", "{query}")
+        // Drop pairs whose value is an optional placeholder: &key={x?}
+        template = template.replace(Regex("[&?][^&{]*=\\{[^}]*\\?\\}"), "")
+        template = template.replace(Regex("\\{[^}]*\\?\\}"), "")
+        if (template.contains('{') && !template.contains("{query}")) return null
+        if (template.contains(Regex("\\{(?!query\\}|page\\})"))) return null
+        val absolute = when {
+            template.startsWith("http") -> template
+            template.startsWith("/") -> base.trimEnd('/') + template
+            else -> return null
+        }
+        return SearchCandidate(urlTemplate = absolute, source = CandidateSource.OPENSEARCH)
+    }
+
+    /** Entry links from the site's first advertised RSS/Atom feed. */
+    private fun harvestFeedLinks(
+        doc: Document,
+        base: String,
+        fetch: (String, Int) -> TimedFetch
+    ): List<String> {
+        val feedUrl = doc.select("link[rel='alternate']")
+            .firstOrNull {
+                val type = it.attr("type").lowercase()
+                type.contains("rss") || type.contains("atom")
+            }
+            ?.absUrl("href")
+            ?.takeIf { it.isNotBlank() } ?: return emptyList()
+        val xml = fetch(feedUrl, FEED_TIMEOUT_MS).body ?: return emptyList()
+        val links = mutableListOf<String>()
+        Regex("<link>\\s*(https?://[^<]+?)\\s*</link>", RegexOption.IGNORE_CASE)
+            .findAll(xml).forEach { links += it.groupValues[1].trim() }
+        Regex("<link[^>]+href=\"(https?://[^\"]+)\"", RegexOption.IGNORE_CASE)
+            .findAll(xml).forEach { links += it.groupValues[1].trim() }
+        // The first RSS <link> is the channel's own URL, not an entry.
+        return links.drop(1).distinct().take(MAX_FEED_LINKS)
+    }
+
+    // ─── Script & embedded-state mining ───────────────────────────────
+
+    /**
+     * Search endpoints named by the page's own JavaScript: string
+     * literals in inline scripts and in same-host script files. Only
+     * literals that already carry a search parameter are converted
+     * (that parameter's value becomes {query}); bare API bases are not
+     * turned into guesses.
+     */
+    private fun mineScriptEndpoints(
+        doc: Document,
+        base: String,
+        baseHost: String,
+        fetch: (String, Int) -> TimedFetch
+    ): List<SearchCandidate> {
+        val scriptTexts = mutableListOf<String>()
+        doc.select("script:not([src])").forEach { script ->
+            val html = script.html()
+            if (html.isNotBlank()) scriptTexts += html
+        }
+        doc.select("script[src]").map { it.absUrl("src") }
+            .filter { it.startsWith("http") && runCatching { URL(it).host == baseHost }.getOrDefault(false) }
+            .distinct().take(MAX_SCRIPT_FILES)
+            .forEach { src ->
+                fetch(src, SCRIPT_TIMEOUT_MS).body?.let { scriptTexts += it }
+            }
+
+        val templates = linkedSetOf<String>()
+        for (text in scriptTexts) {
+            for (match in SCRIPT_URL_LITERAL_REGEX.findAll(text)) {
+                val literal = match.groupValues[1]
+                templateizeEndpointLiteral(literal, base)?.let { templates += it }
+            }
+            for (match in SCRIPT_ASSIGN_REGEX.findAll(text)) {
+                val literal = match.groupValues[1]
+                templateizeEndpointLiteral(literal, base)?.let { templates += it }
+            }
+        }
+        return templates.take(MAX_SCRIPT_CANDIDATES).map {
+            SearchCandidate(urlTemplate = it, source = CandidateSource.DISCOVERED_ENDPOINT)
+        }
+    }
+
+    /** Field names observed in an embedded state blob's result array. */
+    private data class JsonFieldHints(
+        val titleField: String?,
+        val urlField: String?,
+        val thumbnailField: String?
+    )
+
+    private data class StateBlobFindings(
+        val endpoints: List<String>,
+        val hints: JsonFieldHints?
+    )
+
+    /**
+     * Embedded state: `application/json` script tags, `__NEXT_DATA__`,
+     * and `window.__INITIAL_STATE__`-style assignments. The blob is the
+     * site's own data: endpoint URL strings inside it become candidates,
+     * and a result-shaped array inside it yields the field-name hints
+     * used when probing JSON endpoints.
+     */
+    private fun parseStateBlobs(doc: Document): StateBlobFindings {
+        val endpoints = linkedSetOf<String>()
+        var hints: JsonFieldHints? = null
+
+        val blobs = mutableListOf<String>()
+        doc.select("script[type='application/json'], script#__NEXT_DATA__").forEach { script ->
+            val data = script.data()
+            if (data.isNotBlank()) blobs += data
+        }
+        doc.select("script:not([src])").forEach { script ->
+            val html = script.html()
+            if (html.contains("__INITIAL_STATE__") || html.contains("__PRELOADED_STATE__") ||
+                html.contains("__APOLLO_STATE__") || html.contains("window.__DATA__")
+            ) {
+                val start = html.indexOf('{')
+                val end = html.lastIndexOf('}')
+                if (start >= 0 && end > start) blobs += html.substring(start, end + 1)
+            }
+        }
+
+        for (blob in blobs) {
+            val root = runCatching { json.parseToJsonElement(blob) }.getOrNull() ?: continue
+            // Endpoint strings named by the blob itself.
+            val strings = mutableListOf<String>()
+            fun collectStrings(element: JsonElement, depth: Int) {
+                if (depth > 8 || strings.size >= 200) return
+                when (element) {
+                    is JsonPrimitive -> element.contentOrNull?.let { strings += it }
+                    is JsonArray -> element.forEach { collectStrings(it, depth + 1) }
+                    is JsonObject -> element.values.forEach { collectStrings(it, depth + 1) }
+                    else -> Unit
+                }
+            }
+            collectStrings(root, 0)
+            for (value in strings) {
+                if ((value.startsWith("/") || value.startsWith("http")) &&
+                    value.length < 300 && !value.contains(' ')
+                ) {
+                    templateizeEndpointLiteral(value, doc.baseUri())?.let { endpoints += it }
+                }
+            }
+            // A result-shaped array proves the site's field names.
+            if (hints == null) {
+                findResultArray(root, "", 0)?.let { (_, firstObject) ->
+                    hints = JsonFieldHints(
+                        titleField = firstKeyOf(firstObject, TITLE_KEYS),
+                        urlField = firstKeyOf(firstObject, URL_KEYS),
+                        thumbnailField = firstKeyOf(firstObject, THUMB_KEYS)
+                    )
+                }
+            }
+        }
+        return StateBlobFindings(endpoints.take(MAX_SCRIPT_CANDIDATES), hints)
+    }
+
+    /**
+     * Convert a script/blob URL literal into a search template when —
+     * and only when — it already carries a search parameter: that
+     * parameter's value (including ${…} interpolations) becomes {query},
+     * a page parameter's value becomes {page}, and any other unresolved
+     * interpolation rejects the literal.
+     */
+    private fun templateizeEndpointLiteral(literal: String, base: String): String? {
+        var candidate = literal.trim()
+        if (candidate.isBlank() || candidate.length > 300) return null
+        if (!candidate.contains('?')) return null
+        val searchParam = SEARCH_PARAM_REGEX.find(candidate) ?: return null
+        val paramName = searchParam.groupValues[1]
+        candidate = candidate.replace(
+            Regex("([?&]" + Regex.escape(paramName) + "=)[^&]*"),
+            "$1{query}"
+        )
+        candidate = candidate.replace(Regex("([?&](?:page|paged|p)=)[^&]*"), "$1{page}")
+        if (candidate.contains("${'$'}") || candidate.contains(Regex("\\{(?!query\\}|page\\})"))) {
+            return null
+        }
+        return when {
+            candidate.startsWith("http") -> candidate
+            candidate.startsWith("/") -> base.trimEnd('/') + candidate
+            else -> null
+        }
+    }
+
     /** URLEncoder that preserves the {query}/{page} template tokens. */
     private fun encodeTemplateField(value: String): String {
         val encoded = URLEncoder.encode(
@@ -328,6 +612,7 @@ class SiteReconEngine @Inject constructor(
     private fun probeJsonCandidate(
         candidate: SearchCandidate,
         probeQuery: String,
+        hints: JsonFieldHints?,
         fetch: (String, Int) -> TimedFetch
     ): SearchCandidate? {
         val url = candidate.urlTemplate
@@ -337,41 +622,50 @@ class SiteReconEngine @Inject constructor(
         val body = response.body ?: return candidate
         val root = runCatching { json.parseToJsonElement(body) }.getOrNull() ?: return candidate
 
-        val found = findResultArray(root, path = "", depth = 0) ?: return null
+        val titleKeys = TITLE_KEYS + listOfNotNull(hints?.titleField)
+        val urlKeys = URL_KEYS + listOfNotNull(hints?.urlField)
+        val thumbKeys = THUMB_KEYS + listOfNotNull(hints?.thumbnailField)
+        val found = findResultArray(root, path = "", depth = 0, titleKeys, urlKeys) ?: return null
         val (path, firstObject) = found
-        val titleField = firstKeyOf(firstObject, TITLE_KEYS)
-        val urlField = firstKeyOf(firstObject, URL_KEYS)
+        val titleField = firstKeyOf(firstObject, titleKeys)
+        val urlField = firstKeyOf(firstObject, urlKeys)
         if (titleField == null || urlField == null) return null
         return candidate.copy(
             isJson = true,
             jsonResultPath = path,
             jsonTitleField = titleField,
             jsonUrlField = urlField,
-            jsonThumbnailField = firstKeyOf(firstObject, THUMB_KEYS)
+            jsonThumbnailField = firstKeyOf(firstObject, thumbKeys)
         )
     }
 
     /** Locate the first array (root-first, then object values in order)
      *  whose object elements carry both a title-ish and a url-ish key. */
-    private fun findResultArray(element: JsonElement, path: String, depth: Int): Pair<String, JsonObject>? {
+    private fun findResultArray(
+        element: JsonElement,
+        path: String,
+        depth: Int,
+        titleKeys: List<String> = TITLE_KEYS,
+        urlKeys: List<String> = URL_KEYS
+    ): Pair<String, JsonObject>? {
         if (depth > 8) return null
         when (element) {
             is JsonArray -> {
                 val firstObject = element.firstOrNull { it is JsonObject } as? JsonObject
                 if (firstObject != null &&
-                    firstKeyOf(firstObject, TITLE_KEYS) != null &&
-                    firstKeyOf(firstObject, URL_KEYS) != null
+                    firstKeyOf(firstObject, titleKeys) != null &&
+                    firstKeyOf(firstObject, urlKeys) != null
                 ) {
                     return path to firstObject
                 }
                 for (child in element) {
-                    findResultArray(child, path, depth + 1)?.let { return it }
+                    findResultArray(child, path, depth + 1, titleKeys, urlKeys)?.let { return it }
                 }
             }
             is JsonObject -> {
                 for ((key, value) in element) {
                     val childPath = if (path.isEmpty()) key else "$path.$key"
-                    findResultArray(value, childPath, depth + 1)?.let { return it }
+                    findResultArray(value, childPath, depth + 1, titleKeys, urlKeys)?.let { return it }
                 }
             }
             else -> Unit
@@ -435,6 +729,10 @@ class SiteReconEngine @Inject constructor(
             if (markerIndex >= 0 && segments.size > markerIndex + 1) {
                 val prefix = segments.take(markerIndex + 1).joinToString("/", prefix = "/")
                 templates += "$origin$prefix/{query}"
+            } else if (markerIndex >= 0 && markerIndex == segments.lastIndex) {
+                // The route root itself is the search marker (seen in
+                // robots.txt crawl rules and nav links): /search/{query}.
+                templates += "$origin${segments.joinToString("/", prefix = "/")}/{query}"
             }
         }
         return templates.take(MAX_TEMPLATES)
@@ -508,13 +806,27 @@ class SiteReconEngine @Inject constructor(
         private const val SITEMAP_TIMEOUT_MS = 5_000
         private const val HOMEPAGE_TIMEOUT_MS = 8_000
         private const val JSON_PROBE_TIMEOUT_MS = 6_000
+        private const val OPENSEARCH_TIMEOUT_MS = 5_000
+        private const val FEED_TIMEOUT_MS = 5_000
+        private const val SCRIPT_TIMEOUT_MS = 6_000
         private const val JSON_PROBE_DEADLINE_MS = 25_000L
         private const val DISCOVERY_TIMEOUT_MS = 15_000L
-        private const val MAX_SITEMAP_FILES = 3
+        private const val MAX_SITEMAP_FILES = 6
         private const val MAX_SITEMAP_URLS = 1_500
         private const val MAX_TEMPLATES = 6
-        private const val MAX_CANDIDATES = 6
+        private const val MAX_CANDIDATES = 8
+        private const val MAX_FORM_CANDIDATES = 3
+        private const val MAX_SCRIPT_FILES = 3
+        private const val MAX_SCRIPT_CANDIDATES = 4
+        private const val MAX_FEED_LINKS = 50
         private const val MAX_JSON_PROBES = 3
+
+        private val SCRIPT_URL_LITERAL_REGEX =
+            Regex("""['"`](/(?:api|ajax|search|wp-json)[^'"`\s]*?)['"`]""", RegexOption.IGNORE_CASE)
+        private val SCRIPT_ASSIGN_REGEX =
+            Regex("""(?:apiUrl|searchUrl|searchEndpoint|ajaxUrl)\s*[:=]\s*['"`]([^'"`]+)['"`]""", RegexOption.IGNORE_CASE)
+        private val SEARCH_PARAM_REGEX =
+            Regex("""[?&](q|s|query|keyword|keywords|term|search|search_query|wd)=([^&]*)""", RegexOption.IGNORE_CASE)
         private const val MIN_TIMEOUT_MS = 10_000
         private const val MAX_TIMEOUT_MS = 45_000
         private const val DEFAULT_TIMEOUT_MS = 25_000
@@ -590,4 +902,4 @@ data class SearchCandidate(
     val jsonThumbnailField: String? = null
 )
 
-enum class CandidateSource { FORM, SITEMAP_DERIVED, DISCOVERED_ENDPOINT, JSON_API }
+enum class CandidateSource { FORM, OPENSEARCH, SITEMAP_DERIVED, DISCOVERED_ENDPOINT, JSON_API, EMBEDDED_STATE }

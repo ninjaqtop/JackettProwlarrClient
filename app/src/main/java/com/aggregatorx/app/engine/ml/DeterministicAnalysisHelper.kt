@@ -207,7 +207,12 @@ object DeterministicAnalysisHelper {
         emit(AnalysisResult(AnalysisMode.PAGINATION_ANALYSIS, providerId, jsonOutput, if (hasPagination) 0.85f else 0.2f, false))
     }
 
-    private fun extractResultsFromJson(rawData: String, providerId: String): List<SearchResult> {
+    /**
+     * Extract item results from a JSON payload. Public so the Analyzer's
+     * live config verification (SearchConfigVerifier) extracts probe
+     * responses with exactly the same logic the analysis pipeline uses.
+     */
+    fun extractResultsFromJson(rawData: String, providerId: String): List<SearchResult> {
         fun processElement(providerId: String, results: MutableList<SearchResult>, element: JsonElement, depth: Int = 0) {
             if (depth > 10) return
             when (element) {
