@@ -4,9 +4,11 @@ import android.util.Log
 import com.aggregatorx.app.data.database.*
 import com.aggregatorx.app.data.model.*
 import com.aggregatorx.app.engine.analyzer.CandidateSource
+import com.aggregatorx.app.engine.analyzer.PaginationHint
 import com.aggregatorx.app.engine.analyzer.SearchCandidate
 import com.aggregatorx.app.engine.analyzer.SearchConfigVerifier
 import com.aggregatorx.app.engine.analyzer.SiteAnalyzerEngine
+import com.aggregatorx.app.engine.analyzer.SiteRecon
 import com.aggregatorx.app.engine.analyzer.SiteReconEngine
 import com.aggregatorx.app.engine.analyzer.VerificationOutcome
 import com.aggregatorx.app.engine.analyzer.VerifierCandidate
@@ -230,8 +232,10 @@ class AggregatorRepository @Inject constructor(
     )
 
     /**
-     * Build candidate configs for a provider that has none yet, then save
-     * only the first one that passes BOTH gates:
+     * Ensure the provider has a config that is proven against the
+     * site's live search right now. An existing config is re-verified
+     * first (re-analyze = re-map + re-prove); a new or replacement
+     * config is saved only when it passes BOTH gates:
      *
      *  1. the static [ProviderConfigValidator] gate (well-formed selectors
      *     and template), and
@@ -249,23 +253,64 @@ class AggregatorRepository @Inject constructor(
      * stays saved, enabled, and visible regardless of the outcome.
      */
     private suspend fun generateScrapingConfig(provider: Provider, analysis: SiteAnalysis) {
-        if (scrapingConfigDao.getConfigForProvider(provider.id) != null) return
+        val existing = scrapingConfigDao.getConfigForProvider(provider.id)
 
-        // Recon: map the site from its own data (bounded; never throws out).
+        // Recon: (re-)map the site from its own data (bounded; never
+        // throws out). This runs on re-analyze too — a site that changed
+        // gets re-mapped, not just re-trusted.
         val recon = withTimeoutOrNull(RECON_TIMEOUT_MS) {
             runCatching { siteReconEngine.mapSite(provider.baseUrl, analysis.rawHtml) }.getOrNull()
         }
         val configTimeout = recon?.suggestedTimeoutMs ?: 30_000
+        val paginationHint = PaginationHint(
+            param = recon?.paginationParam,
+            pathStyle = recon?.paginationPathStyle ?: false,
+            inventoryEvidence = recon != null && (recon.paginationParam != null || recon.paginationPathStyle)
+        )
+
+        // Re-verification: an existing config must re-prove itself
+        // against the site's live search. If it does (possibly with
+        // repaired selectors), it stays — with its timeout refreshed
+        // from the measured probe profile. If it does not, we look for
+        // a proven replacement below; the old config is only deleted
+        // once a replacement has actually verified, never on a bad day.
+        var existingRejectionReasons: List<String> = emptyList()
+        if (existing != null) {
+            val reOutcome = searchConfigVerifier.verify(
+                provider,
+                listOf(
+                    VerifierCandidate(
+                        existing,
+                        "Existing saved config",
+                        isFormRoute = existing.postData != null
+                    )
+                ),
+                recon?.probeQuery,
+                paginationHint
+            )
+            if (reOutcome is VerificationOutcome.Verified) {
+                val refreshed = reOutcome.config.copy(timeout = finalTimeoutMs(reOutcome, recon))
+                if (refreshed != existing) {
+                    scrapingConfigDao.insertConfig(refreshed)
+                }
+                if (recon != null && recon.medianResponseMs > 0) {
+                    providerDao.updateProviderStats(provider.id, provider.healthScore, recon.medianResponseMs)
+                }
+                recordVerificationInAnalysis(analysis, reOutcome, recon)
+                return
+            }
+            existingRejectionReasons = (reOutcome as VerificationOutcome.Rejected).reasons
+        }
 
         val candidates = mutableListOf<VerifierCandidate>()
-        fun addCandidate(config: ScrapingConfig, label: String) {
+        fun addCandidate(config: ScrapingConfig, label: String, isFormRoute: Boolean = false) {
             if (candidates.none {
                     it.config.searchUrlTemplate == config.searchUrlTemplate &&
                         it.config.postData == config.postData &&
                         it.config.resultSelector == config.resultSelector
                 }
             ) {
-                candidates += VerifierCandidate(config, label)
+                candidates += VerifierCandidate(config, label, isFormRoute)
             }
         }
 
@@ -289,7 +334,8 @@ class AggregatorRepository @Inject constructor(
                     postData = searchRequest.postData,
                     timeout = configTimeout
                 ),
-                "Analyzer selectors + form"
+                "Analyzer selectors + form",
+                isFormRoute = analysis.searchFormSelector != null
             )
         }
 
@@ -300,10 +346,13 @@ class AggregatorRepository @Inject constructor(
                 config = scrapingConfigForCandidate(provider, analysis, candidate, configTimeout),
                 label = when (candidate.source) {
                     CandidateSource.FORM -> "Site search form"
+                    CandidateSource.OPENSEARCH -> "OpenSearch template"
                     CandidateSource.SITEMAP_DERIVED -> "Sitemap-derived route"
                     CandidateSource.DISCOVERED_ENDPOINT -> "Discovered endpoint"
                     CandidateSource.JSON_API -> "JSON API endpoint"
-                } + if (candidate.isJson) " (JSON)" else ""
+                    CandidateSource.EMBEDDED_STATE -> "Embedded state endpoint"
+                } + if (candidate.isJson) " (JSON)" else "",
+                isFormRoute = candidate.source == CandidateSource.FORM
             )
         }
 
@@ -331,13 +380,19 @@ class AggregatorRepository @Inject constructor(
         }
 
         // Gate 2: live verification against the site's own search.
-        when (val outcome = searchConfigVerifier.verify(provider, liveCandidates, recon?.probeQuery)) {
+        when (val outcome = searchConfigVerifier.verify(provider, liveCandidates, recon?.probeQuery, paginationHint)) {
             is VerificationOutcome.Verified -> {
-                scrapingConfigDao.insertConfig(outcome.config)
+                val finalConfig = outcome.config.copy(timeout = finalTimeoutMs(outcome, recon))
+                if (existing != null && finalConfig.id != existing.id) {
+                    // A proven replacement for a config that failed
+                    // re-verification — only now is the old one removed.
+                    scrapingConfigDao.deleteConfigForProvider(provider.id)
+                }
+                scrapingConfigDao.insertConfig(finalConfig)
                 Log.i(
                     TAG,
                     "Verified config saved for provider=${provider.name}: ${outcome.verdict.reason}" +
-                        if (outcome.repaired) " (selectors repaired from the live results page)" else ""
+                        if (outcome.repaired) " (repaired from live evidence)" else ""
                 )
                 if (recon != null && recon.medianResponseMs > 0) {
                     providerDao.updateProviderStats(provider.id, provider.healthScore, recon.medianResponseMs)
@@ -345,12 +400,33 @@ class AggregatorRepository @Inject constructor(
                 recordVerificationInAnalysis(analysis, outcome, recon)
             }
             is VerificationOutcome.Rejected -> {
+                val prefix = if (existingRejectionReasons.isNotEmpty()) {
+                    "The existing config failed re-verification (" +
+                        existingRejectionReasons.joinToString("; ") +
+                        ") and no proven replacement was found — the previously saved config was left in place. "
+                } else {
+                    "Provider saved, but its search could not be verified: "
+                }
                 throw ConfigVerificationException(
-                    "Provider saved, but its search could not be verified: " +
-                        (staticFailures + outcome.reasons).joinToString("; ")
+                    prefix + (staticFailures + outcome.reasons).joinToString("; ")
                 )
             }
         }
+    }
+
+    /**
+     * The saved config's timeout, from measured evidence: the slowest
+     * verification probe (with margin) and the recon median profile,
+     * whichever demands more — clamped to the app's bounded limits so
+     * slow sites stop dying on a generic timeout without any single
+     * provider being able to hang a search.
+     */
+    private fun finalTimeoutMs(outcome: VerificationOutcome.Verified, recon: SiteRecon?): Int {
+        val fromProbes = outcome.verdict.slowestProbeMs
+            .takeIf { it > 0 }
+            ?.let { (it * 2 + 2_000).toInt() }
+        val parts = listOfNotNull(fromProbes, recon?.suggestedTimeoutMs)
+        return (parts.maxOrNull() ?: 30_000).coerceIn(10_000, 45_000)
     }
 
     /**
@@ -406,7 +482,7 @@ class AggregatorRepository @Inject constructor(
     private suspend fun recordVerificationInAnalysis(
         analysis: SiteAnalysis,
         outcome: VerificationOutcome.Verified,
-        recon: com.aggregatorx.app.engine.analyzer.SiteRecon?
+        recon: SiteRecon?
     ) {
         val matched = recon?.searchCandidates?.firstOrNull {
             it.urlTemplate == outcome.config.searchUrlTemplate && it.postData == outcome.config.postData
@@ -420,6 +496,11 @@ class AggregatorRepository @Inject constructor(
                 put("categoryCount", JsonPrimitive(outcome.verdict.categoryCount))
                 put("nonsenseItemCount", JsonPrimitive(outcome.verdict.nonsenseItemCount))
                 put("responseMs", JsonPrimitive(outcome.verdict.responseMs))
+                put("slowestProbeMs", JsonPrimitive(outcome.verdict.slowestProbeMs))
+                put("confidence", JsonPrimitive(outcome.verdict.confidence))
+                put("confidenceDetail", JsonPrimitive(outcome.verdict.confidenceDetail))
+                put("paginationProven", JsonPrimitive(outcome.verdict.paginationProven))
+                put("rendered", JsonPrimitive(outcome.verdict.rendered))
                 put("repaired", JsonPrimitive(outcome.repaired))
                 recon?.probeQuery?.let { put("probeQuery", JsonPrimitive(it)) }
                 recon?.paginationParam?.let { put("paginationParam", JsonPrimitive(it)) }
