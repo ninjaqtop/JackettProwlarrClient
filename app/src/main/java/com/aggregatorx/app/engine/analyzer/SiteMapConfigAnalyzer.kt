@@ -11,6 +11,11 @@ import java.net.URLEncoder
 object SiteMapConfigAnalyzer {
     private val json = Json { prettyPrint = true; ignoreUnknownKeys = true; encodeDefaults = true }
 
+    // Shared constants for sets that were rebuilt on every call/iteration below.
+    // They are immutable and only read, so sharing cannot change results.
+    private val FORM_FIELD_TYPES_IGNORED = setOf("hidden", "submit")
+    private val HTTP_SCHEMES = setOf("http", "https")
+
     @Serializable
     data class SiteMapConfig(
         val schemaVersion: Int = 1,
@@ -40,7 +45,7 @@ object SiteMapConfigAnalyzer {
         val action = form?.absUrl("action")?.ifBlank { pageUrl }
         val searchTemplate = if (method == "get" && queryName != null && action != null && isHttpUrl(action)) {
             val fixedFields = form.select("input[name]")
-                .filter { it !== input && it.attr("type").lowercase() in setOf("hidden", "submit") && it.attr("value").isNotBlank() }
+                .filter { it !== input && it.attr("type").lowercase() in FORM_FIELD_TYPES_IGNORED && it.attr("value").isNotBlank() }
                 .joinToString("&") { "${URLEncoder.encode(it.attr("name"), "UTF-8")}=${URLEncoder.encode(it.attr("value"), "UTF-8")}" }
             val separator = if (action.contains('?')) "&" else "?"
             action + separator + (if (fixedFields.isBlank()) "" else "$fixedFields&") +
@@ -85,6 +90,6 @@ object SiteMapConfigAnalyzer {
 
     private fun isHttpUrl(value: String): Boolean = runCatching {
         val uri = URI(value)
-        uri.scheme?.lowercase() in setOf("http", "https") && !uri.host.isNullOrBlank()
+        uri.scheme?.lowercase() in HTTP_SCHEMES && !uri.host.isNullOrBlank()
     }.getOrDefault(false)
 }

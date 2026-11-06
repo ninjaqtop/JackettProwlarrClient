@@ -40,6 +40,14 @@ class AggregatorRepository @Inject constructor(
         const val SITE_MAP_HEADER = "AggregatorX-Site-Map"
         const val PROVIDER_CONFIG_HEADER = "AggregatorX-Provider-Config"
         val json = Json { ignoreUnknownKeys = true; prettyPrint = true; encodeDefaults = true }
+
+        // Shared constants for values that were rebuilt on every call below.
+        // They are immutable and only read, so sharing cannot change results.
+        val NON_WORD_SPLIT_REGEX = Regex("\\W+")
+        val FORM_FIELD_TYPES_IGNORED = setOf("hidden", "submit")
+        val TORRENT_CATEGORY_KEYWORDS = listOf("torrent", "1337", "rarbg", "pirate")
+        val STREAMING_CATEGORY_KEYWORDS = listOf("stream", "movie", "watch", "video")
+        val NEWS_CATEGORY_KEYWORDS = listOf("news", "blog")
     }
 
     fun clearSearchCache() = scrapingEngine.clearCache()
@@ -175,7 +183,7 @@ class AggregatorRepository @Inject constructor(
             val action = form.absUrl("action").ifBlank { analysis.url.ifBlank { baseUrl } }
             val input = form.select("input[type=search], input[name=q], input[name=query], input[name=search], input[name=s], input[name=keyword], input[name=term]").firstOrNull()
             val queryName = input?.attr("name")?.takeIf { it.isNotBlank() } ?: "q"
-            val fixed = form.select("input[name]").filter { it !== input && it.attr("type").lowercase() in setOf("hidden", "submit") && it.attr("value").isNotBlank() }
+            val fixed = form.select("input[name]").filter { it !== input && it.attr("type").lowercase() in FORM_FIELD_TYPES_IGNORED && it.attr("value").isNotBlank() }
                 .joinToString("&") { "${URLEncoder.encode(it.attr("name"), "UTF-8")}=${URLEncoder.encode(it.attr("value"), "UTF-8")}" }
             return action + (if (action.contains('?')) "&" else "?") +
                 (if (fixed.isBlank()) "" else "$fixed&") + "${URLEncoder.encode(queryName, "UTF-8")}={query}&page={page}"
@@ -224,7 +232,7 @@ class AggregatorRepository @Inject constructor(
         return if (existing != null) {
             likedResultDao.removeLikeByUrl(result.url); rebuildLearnedProfile(); false
         } else {
-            val keywords = result.title.lowercase().split(Regex("\\W+")).filter { it.length > 2 }.distinct().joinToString(",")
+            val keywords = result.title.lowercase().split(NON_WORD_SPLIT_REGEX).filter { it.length > 2 }.distinct().joinToString(",")
             likedResultDao.insertLike(LikedResult(
                 title = result.title, url = result.url, providerId = result.providerId, providerName = result.providerName,
                 category = result.category.orEmpty(), quality = result.quality.orEmpty(), thumbnailUrl = result.thumbnailUrl,
@@ -261,11 +269,16 @@ class AggregatorRepository @Inject constructor(
     }
     private fun extractBaseUrl(url: String): String = try { URL(url).let { "${it.protocol}://${it.host}" } } catch (_: Exception) { url }
     private fun extractSiteName(url: String): String = try { URL(url).host.removePrefix("www.").substringBefore('.').replaceFirstChar { it.uppercase() } } catch (_: Exception) { "Unknown" }
-    private fun detectCategory(url: String): ProviderCategory = when {
-        listOf("torrent", "1337", "rarbg", "pirate").any(url.lowercase()::contains) -> ProviderCategory.TORRENT
-        listOf("stream", "movie", "watch", "video").any(url.lowercase()::contains) -> ProviderCategory.STREAMING
-        listOf("news", "blog").any(url.lowercase()::contains) -> ProviderCategory.NEWS
-        "api" in url.lowercase() -> ProviderCategory.API_BASED
-        else -> ProviderCategory.GENERAL
+    private fun detectCategory(url: String): ProviderCategory {
+        // lowercase() was recomputed for every when-branch (up to 4x per call);
+        // compute it once - the branch checks below are unchanged.
+        val urlLower = url.lowercase()
+        return when {
+            TORRENT_CATEGORY_KEYWORDS.any(urlLower::contains) -> ProviderCategory.TORRENT
+            STREAMING_CATEGORY_KEYWORDS.any(urlLower::contains) -> ProviderCategory.STREAMING
+            NEWS_CATEGORY_KEYWORDS.any(urlLower::contains) -> ProviderCategory.NEWS
+            "api" in urlLower -> ProviderCategory.API_BASED
+            else -> ProviderCategory.GENERAL
+        }
     }
 }
