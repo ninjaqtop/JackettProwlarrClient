@@ -90,7 +90,6 @@ dependencies {
     implementation("androidx.lifecycle:lifecycle-viewmodel-compose:2.9.0")
     implementation("androidx.activity:activity-compose:1.10.1")
     implementation("androidx.multidex:multidex:2.0.1")
-    implementation("androidx.work:work-runtime-ktx:2.10.0")
 
     // --- COMPOSE ---
     implementation(platform("androidx.compose:compose-bom:2025.02.00"))
@@ -142,7 +141,6 @@ dependencies {
     implementation("com.google.mlkit:text-recognition:16.0.1")
     implementation("org.jetbrains.kotlinx:kotlinx-serialization-json:1.8.0")
     implementation("org.jsoup:jsoup:1.18.3")
-    implementation("dev.ffmpegkit-maintained:llama-android:0.1.1")
 
     // --- TESTING ---
     testImplementation("junit:junit:4.13.2")

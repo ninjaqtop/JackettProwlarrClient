@@ -11,8 +11,6 @@ import com.aggregatorx.app.engine.scraper.HeadlessBrowserHelper
 import com.aggregatorx.app.engine.util.EngineUtils
 import com.aggregatorx.app.data.memory.ProviderMemoryStore
 import com.aggregatorx.app.engine.ml.AnalysisHelper
-import com.aggregatorx.app.engine.ml.LlamaService
-import com.aggregatorx.app.engine.ml.ModelDownloadManager
 import com.aggregatorx.app.engine.ml.ProviderPaginationManager
 import dagger.hilt.android.HiltAndroidApp
 import okhttp3.OkHttpClient
@@ -33,8 +31,6 @@ class AggregatorXApp : Application(), SingletonImageLoader.Factory {
         ProviderMemoryStore.init(this)
         ProviderPaginationManager.init()
         AnalysisHelper.init()
-        ModelDownloadManager.init(this)
-        LlamaService.start(this)
     }
 
     /**
