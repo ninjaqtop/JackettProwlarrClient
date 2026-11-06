@@ -505,15 +505,20 @@ class ScrapingEngine @Inject constructor(
                 outcome.document.select(analysis.resultItemSelector).mapNotNull { item ->
                     val title = extractBestTitle(item)
                     val resultUrl = extractUrlFromItem(item, provider.baseUrl)
-                    if (title.length < 3 || resultUrl.isBlank()) null else SearchResult(
-                        providerId = provider.id,
-                        providerName = provider.name,
-                        title = title,
-                        url = resultUrl,
-                        description = extractBestDescription(item),
-                        thumbnailUrl = extractBestThumbnail(item, provider.baseUrl),
-                        relevanceScore = calculateRelevanceScore(title, query, extractBestDescription(item), resultUrl)
-                    )
+                    if (title.length < 3 || resultUrl.isBlank()) null else {
+                        // extractBestDescription is a pure read of the item; compute
+                        // once instead of once per use below.
+                        val description = extractBestDescription(item)
+                        SearchResult(
+                            providerId = provider.id,
+                            providerName = provider.name,
+                            title = title,
+                            url = resultUrl,
+                            description = description,
+                            thumbnailUrl = extractBestThumbnail(item, provider.baseUrl),
+                            relevanceScore = calculateRelevanceScore(title, query, description, resultUrl)
+                        )
+                    }
                 }
             }.getOrDefault(emptyList())
         }
@@ -640,15 +645,20 @@ class ScrapingEngine @Inject constructor(
                 val title = extractBestTitle(item)
                 val u = extractUrlFromItem(item, p.baseUrl)
                 if (title.isEmpty() || u.isEmpty() || u.contains("javascript:")) null
-                else SearchResult(
-                    providerId = p.id,
-                    providerName = p.name,
-                    title = title,
-                    url = u,
-                    description = extractBestDescription(item),
-                    thumbnailUrl = extractBestThumbnail(item, p.baseUrl),
-                    relevanceScore = calculateRelevanceScore(title, q, extractBestDescription(item), u)
-                )
+                else {
+                    // extractBestDescription is a pure read of the item; compute
+                    // once instead of once per use below.
+                    val description = extractBestDescription(item)
+                    SearchResult(
+                        providerId = p.id,
+                        providerName = p.name,
+                        title = title,
+                        url = u,
+                        description = description,
+                        thumbnailUrl = extractBestThumbnail(item, p.baseUrl),
+                        relevanceScore = calculateRelevanceScore(title, q, description, u)
+                    )
+                }
             }
         }.orEmpty()
 
