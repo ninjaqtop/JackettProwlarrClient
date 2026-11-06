@@ -294,25 +294,59 @@ class ScrapingEngine @Inject constructor(
 
     suspend fun searchProviderSmart(provider: Provider, query: String, pageOffset: Int = 0): ProviderSearchResults {
         val startTime = System.currentTimeMillis()
-        // Send the user's query to the site exactly as typed, the same as typing it
-        // into the site's own search box. NLP rewriting changed the results.
-        val effectiveQuery = query.trim()
-
+        val processed = currentProcessedQuery
         return try {
             enforceRateLimit(provider.id)
             providerDao.incrementSearchCount(provider.id)
             val config = scrapingConfigDao.getConfigForProvider(provider.id)
             val analysis = siteAnalysisDao.getLatestAnalysis(provider.id)
-            val results = searchBoundedCandidates(provider, effectiveQuery, pageOffset, config, analysis)
+            val merged = LinkedHashMap<String, SearchResult>()
+            val primary = searchBoundedCandidates(provider, query, pageOffset, config, analysis)
+            for (result in primary) {
+                merged[result.url] = result
+            }
+            val primaryMatches = merged.values.count {
+                SearchResultFilter.hasQueryAffinity(it, query, processed)
+            }
+            if (primaryMatches < 5 && processed != null && processed.isNaturalLanguage &&
+                query.equals(processed.originalQuery, ignoreCase = true)
+            ) {
+                val refinements = processed.searchQueries
+                    .map { it.trim() }
+                    .filter { it.isNotBlank() && !it.equals(query, ignoreCase = true) }
+                    .distinctBy { it.lowercase() }
+                    .take(2)
+                for (refinement in refinements) {
+                    val refined = searchBoundedCandidates(
+                        provider, refinement, pageOffset, config, analysis,
+                        candidateLimit = 2, useExpensiveFallback = false
+                    )
+                    for (result in refined) {
+                        val existing = merged[result.url]
+                        if (existing == null || result.relevanceScore > existing.relevanceScore) {
+                            merged[result.url] = result
+                        }
+                    }
+                    val matches = merged.values.count {
+                        SearchResultFilter.hasQueryAffinity(it, query, processed)
+                    }
+                    if (matches >= 5) break
+                }
+            }
+            val results = merged.values
+                .sortedByDescending { it.relevanceScore }
+                .take(TARGET_RESULTS_PER_PROVIDER)
             val elapsed = System.currentTimeMillis() - startTime
             updateProviderHealth(provider.id, results.isNotEmpty(), elapsed)
-            if (results.isEmpty()) providerDao.incrementFailedCount(provider.id)
+            if (results.isEmpty()) {
+                providerDao.incrementFailedCount(provider.id)
+            }
             ProviderSearchResults(
                 provider = provider,
                 results = results,
                 searchTime = elapsed,
                 success = results.isNotEmpty(),
-                errorMessage = if (results.isEmpty()) "No parseable results found on live pages" else null,
+                errorMessage = if (results.isEmpty()) "No query-matching media results found" else null,
                 totalResults = results.size,
                 hasMore = results.isNotEmpty(),
                 status = if (results.isNotEmpty()) ProviderSearchStatus.RESULTS else ProviderSearchStatus.EMPTY
@@ -329,6 +363,8 @@ class ScrapingEngine @Inject constructor(
                 searchTime = elapsed,
                 success = false,
                 errorMessage = e.message ?: e.javaClass.simpleName,
+                totalResults = 0,
+                hasMore = false,
                 status = ProviderSearchStatus.FAILED
             )
         }
