@@ -107,6 +107,25 @@ class EndpointDiscoveryEngine @Inject constructor(
             "/sitemaps/sitemap.xml",
             "/wp-sitemap.xml"
         )
+
+        // OpenAPI / Swagger spec paths probed after CMS API probing
+        private val OPENAPI_SPEC_PATHS = listOf("/swagger.json", "/openapi.json", "/api-docs", "/api/docs", "/api/spec")
+
+        // Extracts Disallow/Allow/Sitemap paths from robots.txt bodies
+        private val ROBOTS_PATH_REGEX = Regex("(?:Disallow|Allow|Sitemap):\\s*(.+)", RegexOption.IGNORE_CASE)
+
+        // Endpoint hints extracted from raw page source during headless discovery.
+        // Hoisted: these Regex objects were rebuilt on every call; they are
+        // immutable and only read, so sharing one instance is equivalent.
+        private val HEADLESS_ENDPOINT_PATTERNS = listOf(
+            Regex("""['"/](api/[^'">\s]+)['"]"""),
+            Regex("""['"/](ajax/[^'">\s]+)['"]"""),
+            Regex("""['"/](graphql[^'">\s]*)['"]"""),
+            Regex("""fetch\(['"]([^'"]+)['"]"""),
+            Regex("""axios\.[a-z]+\(['"]([^'"]+)['"]"""),
+            Regex("""XMLHttpRequest[^;]+open\([^,]+,\s*['"]([^'"]+)['"]"""),
+            Regex("""url:\s*['"]([^'"]*(?:search|api|query|ajax)[^'"]*)['"]""", RegexOption.IGNORE_CASE)
+        )
     }
 
     // Cache: domain → DiscoveredEndpoints
@@ -284,17 +303,8 @@ class EndpointDiscoveryEngine @Inject constructor(
 
             // 2. Fetch page source and extract endpoint hints from JS bundles
             val html = HeadlessBrowserHelper.fetchPageContent(baseUrl) ?: ""
-            val endpointPatterns = listOf(
-                Regex("""['"/](api/[^'">\s]+)['"]"""),
-                Regex("""['"/](ajax/[^'">\s]+)['"]"""),
-                Regex("""['"/](graphql[^'">\s]*)['"]"""),
-                Regex("""fetch\(['"]([^'"]+)['"]"""),
-                Regex("""axios\.[a-z]+\(['"]([^'"]+)['"]"""),
-                Regex("""XMLHttpRequest[^;]+open\([^,]+,\s*['"]([^'"]+)['"]"""),
-                Regex("""url:\s*['"]([^'"]*(?:search|api|query|ajax)[^'"]*)['"]""", RegexOption.IGNORE_CASE)
-            )
             val host = extractDomain(baseUrl)
-            for (pattern in endpointPatterns) {
+            for (pattern in HEADLESS_ENDPOINT_PATTERNS) {
                 pattern.findAll(html).forEach { m ->
                     val path = m.groupValues[1]
                     val full = when {
@@ -406,8 +416,7 @@ class EndpointDiscoveryEngine @Inject constructor(
                 if (response.statusCode() == 200) {
                     val body = response.body()
                     // Extract Disallow/Allow paths — some reveal API paths
-                    val pathRegex = Regex("(?:Disallow|Allow|Sitemap):\\s*(.+)", RegexOption.IGNORE_CASE)
-                    pathRegex.findAll(body).forEach { match ->
+                    ROBOTS_PATH_REGEX.findAll(body).forEach { match ->
                         val path = match.groupValues[1].trim()
                         if (path.isNotEmpty() && !path.startsWith("#")) {
                             if (path.startsWith("http")) {
@@ -452,8 +461,9 @@ class EndpointDiscoveryEngine @Inject constructor(
                             when {
                                 response.statusCode() == 200 -> {
                                     val body = response.body()
-                                    val isJson = body.trimStart().startsWith("[") ||
-                                            body.trimStart().startsWith("{")
+                                    val trimmedBody = body.trimStart()
+                                    val isJson = trimmedBody.startsWith("[") ||
+                                            trimmedBody.startsWith("{")
                                     val isHtmlWithResults = body.length > 1000 &&
                                             !body.contains("Checking your browser")
 
@@ -473,8 +483,7 @@ class EndpointDiscoveryEngine @Inject constructor(
         }
 
         // Check for OpenAPI / Swagger spec
-        val specPaths = listOf("/swagger.json", "/openapi.json", "/api-docs", "/api/docs", "/api/spec")
-        for (specPath in specPaths) {
+        for (specPath in OPENAPI_SPEC_PATHS) {
             try {
                 val response = Jsoup.connect("$baseUrl$specPath")
                     .userAgent(UA)
