@@ -126,12 +126,16 @@ class SiteReconEngine @Inject constructor(
                     val childXml = timedFetch(child, SITEMAP_TIMEOUT_MS).body ?: continue
                     val childLocs = LOC_REGEX.findAll(childXml).map { it.groupValues[1].trim() }.toList()
                     sitemapUrlCount += childLocs.size
-                    urls += childLocs.take(MAX_SITEMAP_URLS - urls.size)
+                    // coerceAtLeast(0): robots crawl-rule paths are added
+                    // to the inventory uncapped, so the remaining room
+                    // can be negative — take() would throw and take the
+                    // whole recon pass down with it.
+                    urls += childLocs.take((MAX_SITEMAP_URLS - urls.size).coerceAtLeast(0))
                     if (urls.size >= MAX_SITEMAP_URLS) break
                 }
             } else {
                 sitemapUrlCount += locs.size
-                urls += locs.take(MAX_SITEMAP_URLS - urls.size)
+                urls += locs.take((MAX_SITEMAP_URLS - urls.size).coerceAtLeast(0))
             }
             if (urls.size >= MAX_SITEMAP_URLS) break
         }
