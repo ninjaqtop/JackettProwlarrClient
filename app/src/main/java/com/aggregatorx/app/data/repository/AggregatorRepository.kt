@@ -3,7 +3,13 @@ package com.aggregatorx.app.data.repository
 import android.util.Log
 import com.aggregatorx.app.data.database.*
 import com.aggregatorx.app.data.model.*
+import com.aggregatorx.app.engine.analyzer.CandidateSource
+import com.aggregatorx.app.engine.analyzer.SearchCandidate
+import com.aggregatorx.app.engine.analyzer.SearchConfigVerifier
 import com.aggregatorx.app.engine.analyzer.SiteAnalyzerEngine
+import com.aggregatorx.app.engine.analyzer.SiteReconEngine
+import com.aggregatorx.app.engine.analyzer.VerificationOutcome
+import com.aggregatorx.app.engine.analyzer.VerifierCandidate
 import com.aggregatorx.app.engine.nlp.NaturalLanguageQueryProcessor
 import com.aggregatorx.app.engine.ranking.RankingEngine
 import com.aggregatorx.app.engine.scraper.ScrapingEngine
@@ -12,6 +18,10 @@ import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.TimeoutCancellationException
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.withTimeout
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlinx.serialization.json.JsonPrimitive
+import kotlinx.serialization.json.buildJsonArray
+import kotlinx.serialization.json.buildJsonObject
 import org.jsoup.Jsoup
 import java.net.URL
 import java.net.URLEncoder
@@ -30,11 +40,14 @@ class AggregatorRepository @Inject constructor(
     private val siteAnalyzerEngine: SiteAnalyzerEngine,
     private val scrapingEngine: ScrapingEngine,
     private val rankingEngine: RankingEngine,
-    private val nlpProcessor: NaturalLanguageQueryProcessor
+    private val nlpProcessor: NaturalLanguageQueryProcessor,
+    private val siteReconEngine: SiteReconEngine,
+    private val searchConfigVerifier: SearchConfigVerifier
 ) {
     private companion object {
         const val TAG = "AggregatorRepository"
         const val PROVIDER_ANALYSIS_TIMEOUT_MS = 60_000L
+        const val RECON_TIMEOUT_MS = 20_000L
     }
 
     fun clearSearchCache() {
@@ -117,14 +130,22 @@ class AggregatorRepository @Inject constructor(
             )
         }
         siteAnalysisDao.insertAnalysis(analysis)
-        
-        // Generate scraping config from analysis. If selector generation fails,
-        // the provider still remains saved and searchable through generic fallback.
-        runCatching { generateScrapingConfig(provider, analysis) }
-        
+
+        // Generate + live-verify the scraping config. The provider itself
+        // stays saved either way; a config that cannot be verified is not
+        // saved, and the rejection reason is surfaced to the caller so the
+        // Analyzer UI shows the specific failure instead of a silent pass.
+        val configFailure = runCatching { generateScrapingConfig(provider, analysis) }
+            .exceptionOrNull()
+        if (configFailure != null && configFailure !is ConfigVerificationException) {
+            Log.w(TAG, "Config generation failed for provider=${provider.name}: ${configFailure.message}")
+        }
+
         // Update provider last analyzed timestamp
         providerDao.updateLastAnalyzed(providerId, System.currentTimeMillis())
-        
+
+        if (configFailure is ConfigVerificationException) throw configFailure
+
         return analysis
     }
     
@@ -208,36 +229,213 @@ class AggregatorRepository @Inject constructor(
         val postData: String? = null
     )
 
+    /**
+     * Build candidate configs for a provider that has none yet, then save
+     * only the first one that passes BOTH gates:
+     *
+     *  1. the static [ProviderConfigValidator] gate (well-formed selectors
+     *     and template), and
+     *  2. live verification ([SearchConfigVerifier]): the candidate's own
+     *     search route must return item results — not category pages —
+     *     for a probe term taken from the site's own inventory, and
+     *     ~nothing for a nonsense term.
+     *
+     * Candidates come from the site's own data: the Analyzer's analysis,
+     * and the [SiteReconEngine] recon pass (its real search form,
+     * sitemap-derived routes, live-verified endpoints, and probed JSON
+     * APIs). No guessed URL shapes are saved anymore: if nothing
+     * verifies, a [ConfigVerificationException] carries every specific
+     * reason to the UI. The provider row itself is untouched here — it
+     * stays saved, enabled, and visible regardless of the outcome.
+     */
     private suspend fun generateScrapingConfig(provider: Provider, analysis: SiteAnalysis) {
         if (scrapingConfigDao.getConfigForProvider(provider.id) != null) return
 
-        val resultSelector = analysis.resultItemSelector?.takeIf { it.isNotBlank() } ?: return
-        val titleSelector = analysis.titleSelector?.takeIf { it.isNotBlank() } ?: return
-
-        val searchRequest = buildSearchRequestTemplate(provider.baseUrl, analysis)
-        val config = ScrapingConfig(
-            providerId = provider.id,
-            searchUrlTemplate = searchRequest.urlTemplate,
-            resultSelector = resultSelector,
-            titleSelector = titleSelector,
-            urlSelector = "a[href]",
-            descriptionSelector = analysis.descriptionSelector,
-            thumbnailSelector = analysis.thumbnailSelector,
-            dateSelector = analysis.dateSelector,
-            ratingSelector = analysis.ratingSelector,
-            postData = searchRequest.postData
-        )
-
-        val validation = ProviderConfigValidator.validateScrapingConfig(config, provider.baseUrl, analysis.rawHtml)
-        val hasUnverifiableSelectors = validation.warnings.any { warning ->
-            warning.startsWith("Result selector did not match") ||
-                warning.startsWith("The selectors did not map") ||
-                warning.startsWith("Some sample items are missing")
+        // Recon: map the site from its own data (bounded; never throws out).
+        val recon = withTimeoutOrNull(RECON_TIMEOUT_MS) {
+            runCatching { siteReconEngine.mapSite(provider.baseUrl, analysis.rawHtml) }.getOrNull()
         }
-        if (validation.isValid && !hasUnverifiableSelectors) {
-            scrapingConfigDao.insertConfig(config)
-        } else if (hasUnverifiableSelectors) {
-            Log.i(TAG, "Skipping unverified auto-generated result selectors for provider=${provider.name}")
+        val configTimeout = recon?.suggestedTimeoutMs ?: 30_000
+
+        val candidates = mutableListOf<VerifierCandidate>()
+        fun addCandidate(config: ScrapingConfig, label: String) {
+            if (candidates.none {
+                    it.config.searchUrlTemplate == config.searchUrlTemplate &&
+                        it.config.postData == config.postData &&
+                        it.config.resultSelector == config.resultSelector
+                }
+            ) {
+                candidates += VerifierCandidate(config, label)
+            }
+        }
+
+        // (a) The Analyzer's own analysis, as before — but now it must
+        // also prove itself live instead of being trusted from one page.
+        val analysisResultSelector = analysis.resultItemSelector?.takeIf { it.isNotBlank() }
+        val analysisTitleSelector = analysis.titleSelector?.takeIf { it.isNotBlank() }
+        if (analysisResultSelector != null && analysisTitleSelector != null) {
+            val searchRequest = buildSearchRequestTemplate(provider.baseUrl, analysis)
+            addCandidate(
+                ScrapingConfig(
+                    providerId = provider.id,
+                    searchUrlTemplate = searchRequest.urlTemplate,
+                    resultSelector = analysisResultSelector,
+                    titleSelector = analysisTitleSelector,
+                    urlSelector = "a[href]",
+                    descriptionSelector = analysis.descriptionSelector,
+                    thumbnailSelector = analysis.thumbnailSelector,
+                    dateSelector = analysis.dateSelector,
+                    ratingSelector = analysis.ratingSelector,
+                    postData = searchRequest.postData,
+                    timeout = configTimeout
+                ),
+                "Analyzer selectors + form"
+            )
+        }
+
+        // (b) Recon candidates: real form, sitemap routes, live endpoints,
+        // probed JSON APIs — every value derived from the site itself.
+        for (candidate in recon?.searchCandidates.orEmpty()) {
+            addCandidate(
+                config = scrapingConfigForCandidate(provider, analysis, candidate, configTimeout),
+                label = when (candidate.source) {
+                    CandidateSource.FORM -> "Site search form"
+                    CandidateSource.SITEMAP_DERIVED -> "Sitemap-derived route"
+                    CandidateSource.DISCOVERED_ENDPOINT -> "Discovered endpoint"
+                    CandidateSource.JSON_API -> "JSON API endpoint"
+                } + if (candidate.isJson) " (JSON)" else ""
+            )
+        }
+
+        // Gate 1: static validation. Error-level failures never reach the
+        // live probe; their reasons are kept for the final report.
+        val staticFailures = mutableListOf<String>()
+        val liveCandidates = candidates.filter { candidate ->
+            val validation = ProviderConfigValidator.validateScrapingConfig(
+                candidate.config, provider.baseUrl, null
+            )
+            if (validation.isValid) {
+                true
+            } else {
+                staticFailures += "${candidate.sourceLabel}: invalid config — ${validation.errors.joinToString(", ")}"
+                false
+            }
+        }
+        if (liveCandidates.isEmpty()) {
+            throw ConfigVerificationException(
+                "Provider saved, but no search configuration could be verified: " +
+                    (staticFailures.ifEmpty {
+                        listOf("no candidate search route could be derived from the site's own data (no search form, sitemap route, or live endpoint found)")
+                    }).joinToString("; ")
+            )
+        }
+
+        // Gate 2: live verification against the site's own search.
+        when (val outcome = searchConfigVerifier.verify(provider, liveCandidates, recon?.probeQuery)) {
+            is VerificationOutcome.Verified -> {
+                scrapingConfigDao.insertConfig(outcome.config)
+                Log.i(
+                    TAG,
+                    "Verified config saved for provider=${provider.name}: ${outcome.verdict.reason}" +
+                        if (outcome.repaired) " (selectors repaired from the live results page)" else ""
+                )
+                if (recon != null && recon.medianResponseMs > 0) {
+                    providerDao.updateProviderStats(provider.id, provider.healthScore, recon.medianResponseMs)
+                }
+                recordVerificationInAnalysis(analysis, outcome, recon)
+            }
+            is VerificationOutcome.Rejected -> {
+                throw ConfigVerificationException(
+                    "Provider saved, but its search could not be verified: " +
+                        (staticFailures + outcome.reasons).joinToString("; ")
+                )
+            }
+        }
+    }
+
+    /**
+     * Translate one recon candidate into a [ScrapingConfig]. For a
+     * JSON-driven route the derived result-array path and field names are
+     * recorded in the selector fields (the runtime's JSON extractor keys
+     * off the payload the same way); for HTML routes the Analyzer's
+     * selectors are preferred, with broad fallbacks the live verifier
+     * can repair from the actual results page.
+     */
+    private fun scrapingConfigForCandidate(
+        provider: Provider,
+        analysis: SiteAnalysis,
+        candidate: SearchCandidate,
+        timeoutMs: Int
+    ): ScrapingConfig {
+        return if (candidate.isJson) {
+            ScrapingConfig(
+                providerId = provider.id,
+                searchUrlTemplate = candidate.urlTemplate,
+                resultSelector = candidate.jsonResultPath?.takeIf { it.isNotBlank() } ?: "results",
+                titleSelector = candidate.jsonTitleField ?: "title",
+                urlSelector = candidate.jsonUrlField ?: "url",
+                descriptionSelector = analysis.descriptionSelector,
+                thumbnailSelector = analysis.thumbnailSelector,
+                dateSelector = analysis.dateSelector,
+                ratingSelector = analysis.ratingSelector,
+                postData = candidate.postData,
+                timeout = timeoutMs
+            )
+        } else {
+            ScrapingConfig(
+                providerId = provider.id,
+                searchUrlTemplate = candidate.urlTemplate,
+                resultSelector = analysis.resultItemSelector?.takeIf { it.isNotBlank() }
+                    ?: "article, .result, .item, .card, .post, .entry, li",
+                titleSelector = analysis.titleSelector?.takeIf { it.isNotBlank() }
+                    ?: "a, h1, h2, h3, h4, .title, [class*='title']",
+                urlSelector = "a[href]",
+                descriptionSelector = analysis.descriptionSelector,
+                thumbnailSelector = analysis.thumbnailSelector,
+                dateSelector = analysis.dateSelector,
+                ratingSelector = analysis.ratingSelector,
+                postData = candidate.postData,
+                timeout = timeoutMs
+            )
+        }
+    }
+
+    /** Persist the verification evidence onto the stored SiteAnalysis row
+     *  (same primary key — the DAO replaces), so the verified endpoint,
+     *  probe term, and counts survive with the analysis. */
+    private suspend fun recordVerificationInAnalysis(
+        analysis: SiteAnalysis,
+        outcome: VerificationOutcome.Verified,
+        recon: com.aggregatorx.app.engine.analyzer.SiteRecon?
+    ) {
+        val matched = recon?.searchCandidates?.firstOrNull {
+            it.urlTemplate == outcome.config.searchUrlTemplate && it.postData == outcome.config.postData
+        }
+        val endpointsJson = buildJsonArray {
+            add(buildJsonObject {
+                put("url", JsonPrimitive(outcome.config.searchUrlTemplate))
+                put("source", JsonPrimitive(outcome.verdict.sourceLabel))
+                put("verified", JsonPrimitive(true))
+                put("itemCount", JsonPrimitive(outcome.verdict.itemCount))
+                put("categoryCount", JsonPrimitive(outcome.verdict.categoryCount))
+                put("nonsenseItemCount", JsonPrimitive(outcome.verdict.nonsenseItemCount))
+                put("responseMs", JsonPrimitive(outcome.verdict.responseMs))
+                put("repaired", JsonPrimitive(outcome.repaired))
+                recon?.probeQuery?.let { put("probeQuery", JsonPrimitive(it)) }
+                recon?.paginationParam?.let { put("paginationParam", JsonPrimitive(it)) }
+                put("paginationPathStyle", JsonPrimitive(recon?.paginationPathStyle ?: false))
+                matched?.jsonResultPath?.let { put("jsonResultPath", JsonPrimitive(it)) }
+                matched?.jsonTitleField?.let { put("jsonTitleField", JsonPrimitive(it)) }
+                matched?.jsonUrlField?.let { put("jsonUrlField", JsonPrimitive(it)) }
+            })
+        }.toString()
+        runCatching {
+            siteAnalysisDao.insertAnalysis(
+                analysis.copy(
+                    apiEndpoints = endpointsJson,
+                    hasAPI = analysis.hasAPI || (matched?.isJson == true)
+                )
+            )
         }
     }
 
@@ -462,3 +660,12 @@ class AggregatorRepository @Inject constructor(
         learnedProfileDao.saveProfile(profile)
     }
 }
+
+/**
+ * Raised when a provider was saved but none of its candidate search
+ * configurations passed live verification. The message carries the
+ * specific per-route reasons and is surfaced through the Analyzer UI's
+ * existing error state — the provider stays saved, enabled, and
+ * visible; only the unverified config is withheld.
+ */
+class ConfigVerificationException(message: String) : Exception(message)
