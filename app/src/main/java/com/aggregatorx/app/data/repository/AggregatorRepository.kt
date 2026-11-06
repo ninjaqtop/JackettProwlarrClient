@@ -93,15 +93,15 @@ class AggregatorRepository @Inject constructor(
 
         val mapping = SiteMapConfigAnalyzer.analyze(rawAnalysis.rawHtml.orEmpty(), rawAnalysis.url.ifBlank { provider.url })
         val config = buildScrapingConfig(provider, rawAnalysis, mapping)
-        val enrichedHeaders = enrichAnalyzerJson(rawAnalysis.headers, mapping, config)
-        val analysis = rawAnalysis.copy(headers = enrichedHeaders)
+        val analysis = rawAnalysis.copy(headers = enrichAnalyzerJson(rawAnalysis.headers, mapping, config))
 
-        // Keep both persisted records linked to the same provider; analysis JSON also
-        // carries a readable/exportable copy for the Settings analysis screen.
+        // The SiteAnalysis row owns the analyzer JSON; the per-provider ScrapingConfig
+        // row is the runtime search mapping. Both are saved on every analysis/refresh.
         siteAnalysisDao.insertAnalysis(analysis)
         scrapingConfigDao.deleteConfigForProvider(providerId)
         scrapingConfigDao.insertConfig(config)
         providerDao.updateLastAnalyzed(providerId, System.currentTimeMillis())
+        clearSearchCache()
         return analysis
     }
 
@@ -121,8 +121,10 @@ class AggregatorRepository @Inject constructor(
             thumbnailSelector = mapping.thumbnailSelector ?: analysis.thumbnailSelector,
             dateSelector = analysis.dateSelector,
             ratingSelector = analysis.ratingSelector,
-            headers = analysis.headers.ifBlank { "{}" },
-            cookies = analysis.cookies.ifBlank { "[]" },
+            // Analysis response headers contain report metadata, not request headers.
+            // Don't accidentally send that metadata as custom HTTP request headers.
+            headers = "{}",
+            cookies = "{}",
             userAgent = com.aggregatorx.app.engine.util.EngineUtils.DEFAULT_USER_AGENT,
             timeout = 12_000,
             retryCount = 1
@@ -239,14 +241,13 @@ class AggregatorRepository @Inject constructor(
             val max = counts.values.maxOrNull()?.toFloat() ?: 1f
             return counts.entries.joinToString(";") { "${it.key}:${it.value / max}" }
         }
-        val profile = LearnedUserProfile(
+        learnedProfileDao.saveProfile(LearnedUserProfile(
             preferredKeywords = weights(likes.flatMap { it.titleKeywords.split(",") }),
             preferredProviders = weights(likes.map { it.providerId }),
             preferredCategories = weights(likes.mapNotNull { it.category?.lowercase() }),
             preferredQualities = weights(likes.mapNotNull { it.quality?.lowercase() }),
             totalLikes = likes.size
-        )
-        learnedProfileDao.saveProfile(profile)
+        ))
     }
 
     private fun normalizeUrl(url: String): String {
