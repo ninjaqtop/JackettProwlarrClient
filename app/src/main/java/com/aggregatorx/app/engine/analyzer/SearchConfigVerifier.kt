@@ -628,13 +628,13 @@ class SearchConfigVerifier @Inject constructor() {
                     "Content-Type" to "application/x-www-form-urlencoded"
                 ),
                 body = fill(postData),
-                timeoutMs = PROBE_TIMEOUT_MS
+                timeoutMs = config.timeout.coerceIn(PROBE_TIMEOUT_MS, MAX_PROBE_TIMEOUT_MS)
             )
         } else {
             TlsRequest(
                 url = url,
                 headers = mapOf("User-Agent" to EngineUtils.DEFAULT_USER_AGENT),
-                timeoutMs = PROBE_TIMEOUT_MS
+                timeoutMs = config.timeout.coerceIn(PROBE_TIMEOUT_MS, MAX_PROBE_TIMEOUT_MS)
             )
         }
     }
@@ -1084,6 +1084,8 @@ class SearchConfigVerifier @Inject constructor() {
         const val NONSENSE_QUERY = "zqxv123nonexistent"
         const val MIN_AUTOSAVE_CONFIDENCE = 0.7f
         private const val PROBE_TIMEOUT_MS = 8_000
+        /** Slow sites get their measured (recon) timeout for probes, capped here. */
+        private const val MAX_PROBE_TIMEOUT_MS = 20_000
         private const val RENDER_TIMEOUT_MS = 15_000
         private const val RAW_BUDGET_MS = 40_000L
         private const val RENDER_BUDGET_MS = 60_000L
