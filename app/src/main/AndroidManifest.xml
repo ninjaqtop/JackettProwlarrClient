@@ -58,12 +58,6 @@
             </intent-filter>
         </service>
 
-        <service
-            android:name=".engine.ml.LlamaService"
-            android:enabled="true"
-            android:exported="false"
-            android:foregroundServiceType="dataSync" />
-
         <provider
             android:name="androidx.core.content.FileProvider"
             android:authorities="${applicationId}.provider"
