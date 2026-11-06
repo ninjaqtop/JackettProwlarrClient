@@ -5,6 +5,7 @@ import androidx.lifecycle.viewModelScope
 import com.aggregatorx.app.data.model.*
 import com.aggregatorx.app.data.repository.AggregatorRepository
 import dagger.hilt.android.lifecycle.HiltViewModel
+import kotlinx.coroutines.CancellationException
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.launch
 import javax.inject.Inject
@@ -35,15 +36,24 @@ class ProvidersViewModel @Inject constructor(
             
             try {
                 val analysis = repository.analyzeProvider(providerId)
-                _uiState.update { 
+                _uiState.update {
                     it.copy(
                         lastAnalysis = analysis,
                         message = "Analysis completed successfully"
-                    ) 
+                    )
                 }
+            } catch (e: CancellationException) {
+                // Cancellation is not an analysis outcome — never turn
+                // it into an "Analysis failed" error state.
+                throw e
             } catch (e: Exception) {
-                _uiState.update { 
-                    it.copy(error = e.message ?: "Analysis failed") 
+                _uiState.update {
+                    // Verification rejections carry their specific
+                    // reasons in the message and pass through verbatim;
+                    // only a message-less failure falls back to a
+                    // generic label, and then it names the exception
+                    // type so the failure is diagnosable.
+                    it.copy(error = e.message ?: "Analysis failed (${e.javaClass.simpleName})")
                 }
             } finally {
                 _analyzingProviders.update { it - providerId }
