@@ -76,7 +76,10 @@ class ScrapingEngine @Inject constructor(
         private const val DEFAULT_RETRY_COUNT = 1
         private const val DEFAULT_RETRY_DELAY = 300L
         private const val DEFAULT_RATE_LIMIT_MS = 50L
-        private const val MAX_CONCURRENT_PROVIDERS = 4
+        private const val MAX_CONCURRENT_PROVIDERS = 6
+        private const val MIN_PROVIDER_TIMEOUT_MS = 10_000
+        private const val MAX_PROVIDER_TIMEOUT_MS = 45_000
+        private const val PROVIDER_PARSE_MARGIN_MS = 3_000L
         private const val CACHE_TTL_MS = 10 * 60 * 1000L
         private const val TARGET_RESULTS_PER_PROVIDER = 50
         private const val MAX_PAGES_PER_PROVIDER_SEARCH = 2
@@ -173,38 +176,78 @@ class ScrapingEngine @Inject constructor(
                 .thenBy { it.avgResponseTime }
         )
 
-        val semaphore = Semaphore(MAX_CONCURRENT_PROVIDERS)
+        // Bounded concurrency (spec §4): a fixed pool of workers drains a
+        // queue of providers — never a coroutine or thread per provider, at
+        // any provider count. Each provider is bounded by its own saved
+        // timeout and fails alone; results stream out as each one finishes.
+        val queue = kotlinx.coroutines.channels.Channel<Provider>(kotlinx.coroutines.channels.Channel.UNLIMITED)
+        enabledProviders.forEach { queue.trySend(it) }
+        queue.close()
         val results = java.util.Collections.synchronizedList(mutableListOf<ProviderSearchResults>())
 
-        val jobs = enabledProviders.map { provider ->
+        val workers = List(MAX_CONCURRENT_PROVIDERS.coerceAtMost(enabledProviders.size)) {
             launch(Dispatchers.IO) {
-                val result = try {
-                    semaphore.withPermit {
-                        withTimeoutOrNull(PER_PROVIDER_TIMEOUT_MS) {
+                for (provider in queue) {
+                    send(
+                        ProviderSearchResults(
+                            provider = provider,
+                            results = emptyList(),
+                            searchTime = 0L,
+                            success = false,
+                            status = ProviderSearchStatus.SEARCHING
+                        )
+                    )
+                    val budgetMs = providerBudgetMs(provider)
+                    val started = System.currentTimeMillis()
+                    val result = try {
+                        withTimeoutOrNull(budgetMs) {
                             safeSearchProvider(provider, query, pages[provider.id] ?: 0)
                         } ?: ProviderSearchResults(
                             provider = provider,
                             results = emptyList(),
-                            searchTime = PER_PROVIDER_TIMEOUT_MS,
+                            searchTime = budgetMs,
                             success = false,
-                            errorMessage = "Timed out"
+                            errorMessage = "Timed out after ${budgetMs / 1000}s (this provider's saved timeout); other providers continued",
+                            status = ProviderSearchStatus.TIMED_OUT
+                        )
+                    } catch (e: CancellationException) {
+                        // A new search or leaving the screen: stop cleanly,
+                        // never emit late results from a cancelled search.
+                        throw e
+                    } catch (e: Exception) {
+                        ProviderSearchResults(
+                            provider, emptyList(), System.currentTimeMillis() - started, false,
+                            "Error: ${e.javaClass.simpleName}: ${e.message?.take(160) ?: "no detail"}",
+                            status = ProviderSearchStatus.FAILED
+                        )
+                    } catch (e: StackOverflowError) {
+                        ProviderSearchResults(
+                            provider, emptyList(), System.currentTimeMillis() - started, false,
+                            "Error: page too deeply nested to parse", status = ProviderSearchStatus.FAILED
                         )
                     }
-                } catch (e: CancellationException) {
-                    ProviderSearchResults(provider, emptyList(), 0L, false, "Cancelled")
-                } catch (e: Exception) {
-                    ProviderSearchResults(provider, emptyList(), 0L, false, "Error: ${e.message?.take(100)}")
+                    results.add(result)
+                    send(result)
                 }
-                results.add(result)
-                send(result)
             }
         }
 
-        jobs.joinAll()
+        workers.joinAll()
         if (cache && results.any { it.success }) {
             synchronized(resultCache) { resultCache[cacheKey] = CacheEntry(results.toList()) }
         }
     }.flowOn(Dispatchers.IO)
+
+    /**
+     * The provider's own bound: its saved adaptive timeout (measured during
+     * verification, 10–45 s) plus a small parse margin; providers without a
+     * saved config get the default.
+     */
+    private suspend fun providerBudgetMs(provider: Provider): Long {
+        val saved = runCatching { scrapingConfigDao.getConfigForProvider(provider.id)?.timeout }.getOrNull()
+        val timeout = (saved ?: PER_PROVIDER_TIMEOUT_MS.toInt()).coerceIn(MIN_PROVIDER_TIMEOUT_MS, MAX_PROVIDER_TIMEOUT_MS)
+        return timeout + PROVIDER_PARSE_MARGIN_MS
+    }
 
     private suspend fun safeSearchProvider(provider: Provider, query: String, pageOffset: Int = 0): ProviderSearchResults {
         val startTime = System.currentTimeMillis()
@@ -218,16 +261,28 @@ class ScrapingEngine @Inject constructor(
                 // Phone-build behavior (sync part 3): the live results pass through
                 // the display filter; if nothing query-matching survives, the
                 // provider reports an honest EMPTY instead of off-query results.
-                val displayResults = SearchResultFilter.filterResultsForDisplay(
+                val queryFiltered = SearchResultFilter.filterResultsForDisplay(
                     result.results,
                     query,
-                    currentProcessedQuery
+                    currentProcessedQuery,
+                    TARGET_RESULTS_PER_PROVIDER
                 )
+                // Result intelligence gate (b): after — never instead of — the
+                // query-affinity filter, drop category/listing/navigation links
+                // using the classification data learned at config time.
+                val classification = runCatching {
+                    ResultClassification.parse(scrapingConfigDao.getConfigForProvider(provider.id)?.classificationData)
+                }.getOrNull()
+                val displayResults = queryFiltered.filterNot { ResultClassification.isCategoryResult(it.url, classification) }
                 if (displayResults.isEmpty()) {
                     result.copy(
                         results = emptyList(),
                         success = false,
-                        errorMessage = "No query-matching media results found",
+                        errorMessage = if (queryFiltered.isEmpty()) {
+                            "No results on ${provider.name} match \"$query\" (${result.results.size} links on the page, none matched the query)"
+                        } else {
+                            "Only category/listing pages matched \"$query\" on ${provider.name} — no item results"
+                        },
                         totalResults = 0,
                         hasMore = false,
                         status = ProviderSearchStatus.EMPTY
@@ -247,7 +302,7 @@ class ScrapingEngine @Inject constructor(
                         totalResults = displayResults.size,
                         success = true,
                         status = ProviderSearchStatus.RESULTS,
-                        hasMore = true
+                        hasMore = result.hasMore
                     )
                 }
             }
@@ -302,6 +357,21 @@ class ScrapingEngine @Inject constructor(
             providerDao.incrementSearchCount(provider.id)
             val config = scrapingConfigDao.getConfigForProvider(provider.id)
             val analysis = siteAnalysisDao.getLatestAnalysis(provider.id)
+            // Load More (spec §5) reads the saved pagination rule: a verified
+            // provider whose page 2 was never proven live has no next page to
+            // fetch — say so instead of guessing a URL.
+            if (pageOffset > 0 && config?.verified == true && config.paginationRule == null) {
+                return ProviderSearchResults(
+                    provider = provider,
+                    results = emptyList(),
+                    searchTime = System.currentTimeMillis() - startTime,
+                    success = false,
+                    errorMessage = "No next page: this provider's pagination was not proven during verification",
+                    totalResults = 0,
+                    hasMore = false,
+                    status = ProviderSearchStatus.EMPTY
+                )
+            }
             val merged = LinkedHashMap<String, SearchResult>()
             val primary = searchBoundedCandidates(provider, query, pageOffset, config, analysis)
             for (result in primary) {
@@ -310,7 +380,7 @@ class ScrapingEngine @Inject constructor(
             val primaryMatches = merged.values.count {
                 SearchResultFilter.hasQueryAffinity(it, query, processed)
             }
-            if (primaryMatches < 5 && processed != null && processed.isNaturalLanguage &&
+            if (pageOffset == 0 && primaryMatches < 5 && processed != null && processed.isNaturalLanguage &&
                 query.equals(processed.originalQuery, ignoreCase = true)
             ) {
                 val refinements = processed.searchQueries
@@ -348,9 +418,9 @@ class ScrapingEngine @Inject constructor(
                 results = results,
                 searchTime = elapsed,
                 success = results.isNotEmpty(),
-                errorMessage = if (results.isEmpty()) "No query-matching media results found" else null,
+                errorMessage = if (results.isEmpty()) "The site returned no parseable results for \"$query\"" else null,
                 totalResults = results.size,
-                hasMore = results.isNotEmpty(),
+                hasMore = results.isNotEmpty() && (config?.verified != true || config.paginationRule != null),
                 status = if (results.isNotEmpty()) ProviderSearchStatus.RESULTS else ProviderSearchStatus.EMPTY
             )
         } catch (e: CancellationException) {
@@ -406,7 +476,7 @@ class ScrapingEngine @Inject constructor(
             val outcomes = supervisorScope {
                 batch.map { candidate ->
                     async(Dispatchers.IO) {
-                        withTimeoutOrNull(FAST_CANDIDATE_TIMEOUT_MS + 1_000L) {
+                        withTimeoutOrNull((config?.timeout ?: DEFAULT_TIMEOUT).toLong() + 2_000L) {
                             fetchFastOutcome(candidate, config, query, pageOffset, provider.baseUrl)
                         }
                     }
@@ -428,7 +498,10 @@ class ScrapingEngine @Inject constructor(
             SearchResultFilter.hasQueryAffinity(it, query, currentProcessedQuery)
         }
 
-        if (useExpensiveFallback && queryMatches < MIN_RELEVANT_RESULTS_BEFORE_STOP) {
+        // A live-verified route was proven to return the site's own results;
+        // a thin answer from it is the site's answer (e.g. nonsense → empty),
+        // not a reason to go scrape other pages in a browser.
+        if (useExpensiveFallback && config?.verified != true && queryMatches < MIN_RELEVANT_RESULTS_BEFORE_STOP) {
             val hasSearchForm = when {
                 analysis?.searchFormSelector != null -> true
                 analysis?.rawHtml != null -> Regex("<form\\b", RegexOption.IGNORE_CASE)
@@ -541,9 +614,21 @@ class ScrapingEngine @Inject constructor(
         val encoding = config?.encoding?.takeIf { it.isNotBlank() } ?: "UTF-8"
         val encoded = runCatching { URLEncoder.encode(query, encoding) }
             .getOrElse { URLEncoder.encode(query, "UTF-8") }
-        val page = pageOffset + 1
+        val page = (config?.paginationStart ?: 1) + pageOffset
         val base = provider.baseUrl.trimEnd('/')
         val candidates = linkedSetOf<String>()
+
+        // A live-verified config IS the site's own search request (route,
+        // method, query param, hidden fields, pagination rule): use exactly
+        // that, and never add guessed URL shapes next to it (spec §4).
+        if (config?.verified == true) {
+            config.searchUrlTemplate
+                .replace("{baseUrl}", base)
+                .replace("{query}", encoded)
+                .replace("{page}", page.toString())
+                .takeIf { it.startsWith("http", ignoreCase = true) }
+                ?.let { return listOf(it) }
+        }
 
         // 1. The search URL learned from the site's own search form (most faithful).
         config?.searchUrlTemplate
@@ -777,6 +862,11 @@ class ScrapingEngine @Inject constructor(
 
         val raw = outcome.body.trimStart()
         if (raw.startsWith('{') || raw.startsWith('[')) {
+            // JSON-first: a verified JSON config names the exact result array
+            // and fields; the generic walker only supplements it.
+            if (config?.isJson == true) {
+                combined += extractResultsFromJsonConfig(outcome.body, provider, query, config)
+            }
             combined += extractResultsFromJson(outcome.body, provider, query)
         }
         combined += extractResultsFromJsonLd(outcome.document, provider, query)
@@ -815,6 +905,48 @@ class ScrapingEngine @Inject constructor(
             .distinctBy { it.url }
             .sortedByDescending { it.relevanceScore }
             .take(TARGET_RESULTS_PER_PROVIDER)
+    }
+
+    /** Extract with the saved JSON mapping: result-array path + exact field names. */
+    private fun extractResultsFromJsonConfig(
+        body: String,
+        provider: Provider,
+        query: String,
+        config: ScrapingConfig
+    ): List<SearchResult> {
+        val root = runCatching { json.parseToJsonElement(body) }.getOrNull() ?: return emptyList()
+        var node: JsonElement? = root
+        config.jsonResultPath?.split('.')?.filter { it.isNotBlank() }?.forEach { key ->
+            node = (node as? JsonObject)?.get(key)
+        }
+        val array = node as? JsonArray ?: return emptyList()
+        fun JsonObject.path(path: String?): String? {
+            if (path.isNullOrBlank()) return null
+            var cur: JsonElement? = this
+            for (k in path.split('.')) cur = (cur as? JsonObject)?.get(k)
+            return when (val v = cur) {
+                is JsonPrimitive -> v.contentOrNull
+                is JsonObject -> (v["rendered"] as? JsonPrimitive)?.contentOrNull ?: (v["url"] as? JsonPrimitive)?.contentOrNull
+                else -> null
+            }
+        }
+        return array.mapNotNull { element ->
+            val item = element as? JsonObject ?: return@mapNotNull null
+            val title = item.path(config.jsonTitleField ?: config.titleSelector)?.let { Jsoup.parse(it).text() }?.trim().orEmpty()
+            val rawUrl = item.path(config.jsonUrlField ?: config.urlSelector)?.trim().orEmpty()
+            if (title.length < 3 || rawUrl.isBlank()) return@mapNotNull null
+            val resultUrl = normalizeUrl(rawUrl, provider.baseUrl)
+            if (!resultUrl.startsWith("http")) return@mapNotNull null
+            SearchResult(
+                providerId = provider.id,
+                providerName = provider.name,
+                title = title,
+                url = resultUrl,
+                thumbnailUrl = item.path(config.jsonThumbnailField)?.let { normalizeUrl(it, provider.baseUrl) },
+                relevanceScore = calculateRelevanceScore(title, query, null, resultUrl),
+                metadata = mapOf("extractor" to "json-config")
+            )
+        }.take(TARGET_RESULTS_PER_PROVIDER)
     }
 
     private fun extractResultsFromJson(body: String, provider: Provider, query: String): List<SearchResult> {

@@ -188,6 +188,8 @@ data class ProviderSearchResults(
 @Serializable
 enum class ProviderSearchStatus {
     READY,
+    /** Queued in the aggregate search, waiting for a concurrency slot. */
+    PENDING,
     SEARCHING,
     RESULTS,
     EMPTY,

@@ -152,7 +152,7 @@ class SearchViewModel @Inject constructor(
                         searchTime = 0L,
                         success = false,
                         errorMessage = null,
-                        status = ProviderSearchStatus.SEARCHING
+                        status = ProviderSearchStatus.PENDING
                     )
                 }.toMutableList()
             }
@@ -165,12 +165,19 @@ class SearchViewModel @Inject constructor(
                 repository.searchAllProviders(query, pages = _providerFetchPages.value)
                     .catch { e -> if (currentResults.isEmpty()) _uiState.update { it.copy(error = e.message) } }
                     .collect { providerResult ->
+                        if (providerResult.status == ProviderSearchStatus.SEARCHING) {
+                            // Progress event: this provider left the queue.
+                            upsertProviderResult(currentResults, providerResult)
+                            _providerResults.value = currentResults.toList()
+                            return@collect
+                        }
                         try {
                             val normalizedResults = safeNormalize(providerResult)
                             ProviderPaginationManager.markFetched(providerResult.provider.id, normalizedResults.size)
                             val terminalStatus = when {
                                 normalizedResults.isNotEmpty() -> ProviderSearchStatus.RESULTS
                                 providerResult.status == ProviderSearchStatus.TIMED_OUT -> ProviderSearchStatus.TIMED_OUT
+                                providerResult.status == ProviderSearchStatus.EMPTY -> ProviderSearchStatus.EMPTY
                                 providerResult.success -> ProviderSearchStatus.EMPTY
                                 else -> ProviderSearchStatus.FAILED
                             }
@@ -187,9 +194,8 @@ class SearchViewModel @Inject constructor(
                             upsertProviderResult(currentResults, normalizedProviderResult)
                             _providerResults.value = currentResults.toList()
                             updateSearchStats(currentResults)
-                            if (terminalStatus == ProviderSearchStatus.RESULTS && normalizedResults.size < PROVIDER_PAGE_SIZE) {
-                                scheduleAutoFill(providerResult.provider.id, query)
-                            }
+                            // No background auto-fill of further pages: pagination
+                            // is fetched on demand (Load More), never prefetched.
                         } catch (e: CancellationException) {
                             throw e
                         } catch (e: Throwable) {
@@ -205,7 +211,7 @@ class SearchViewModel @Inject constructor(
                         }
                     }
                 currentResults.replaceAll { result ->
-                    if (result.status == ProviderSearchStatus.SEARCHING) {
+                    if (result.status == ProviderSearchStatus.SEARCHING || result.status == ProviderSearchStatus.PENDING) {
                         result.copy(
                             success = false,
                             errorMessage = "Search ended before this provider responded",
