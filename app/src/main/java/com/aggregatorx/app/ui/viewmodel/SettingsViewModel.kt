@@ -27,10 +27,10 @@ class SettingsViewModel @Inject constructor(
 
     private val _uiState = MutableStateFlow(SettingsUiState())
     val uiState: StateFlow<SettingsUiState> = _uiState.asStateFlow()
-    
+
     val providers: StateFlow<List<Provider>> = repository.getAllProviders()
         .stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
-    
+
     fun updateCustomUrl(url: String) {
         _uiState.update {
             it.copy(
@@ -43,106 +43,112 @@ class SettingsViewModel @Inject constructor(
             )
         }
     }
-    
+
     fun analyzeCustomUrl() {
         val url = _uiState.value.customUrl.trim()
+        if (_uiState.value.isAnalyzing) return
         if (url.isEmpty()) {
             _uiState.update { it.copy(error = "Please enter a URL") }
             return
         }
-        
+
         viewModelScope.launch {
-            _uiState.update { it.copy(isAnalyzing = true, error = null) }
-            
+            _uiState.update { it.copy(isAnalyzing = true, error = null, message = null) }
+
             try {
                 val (provider, analysis) = withTimeout(ANALYZE_TIMEOUT_MS) {
                     repository.analyzeNewUrl(url)
                 }
-                _uiState.update { 
+                _uiState.update {
                     it.copy(
                         isAnalyzing = false,
                         lastAnalysis = analysis,
                         lastProvider = provider,
                         customUrl = "",
-                        message = "Successfully analyzed and added: ${provider.name}"
-                    ) 
+                        message = "Added and enabled ${provider.name}. Site analysis completed; you can review its detected mappings."
+                    )
                 }
             } catch (e: TimeoutCancellationException) {
+                // The repository inserts/enables the provider before it performs network
+                // analysis. A timeout therefore does not prove that the provider was not
+                // saved; keep the input so the user can retry after checking Providers.
                 _uiState.update {
                     it.copy(
                         isAnalyzing = false,
-                        error = "Analysis timed out. The button has been reset; try the address again or check that the site is reachable."
+                        error = "Analysis timed out. The provider may already be saved and enabled; check Providers before retrying. Your URL is still available to retry."
                     )
                 }
             } catch (e: CancellationException) {
                 throw e
             } catch (e: Exception) {
-                _uiState.update { 
+                // Errors can occur after provider insertion (for example while writing its
+                // analysis/configuration), so do not claim that no provider was saved.
+                _uiState.update {
                     it.copy(
                         isAnalyzing = false,
-                        error = "Analysis could not finish for this address. The provider was not saved; check the URL and try again."
-                    ) 
+                        error = "Could not complete analysis: ${e.message?.take(160) ?: e.javaClass.simpleName}. Check Providers before retrying; the URL was kept."
+                    )
                 }
             }
         }
     }
-    
+
     fun refreshAllProviders() {
         viewModelScope.launch {
-            _uiState.update { 
+            _uiState.update {
                 it.copy(
-                    isRefreshingAll = true, 
+                    isRefreshingAll = true,
                     refreshProgress = 0f,
                     error = null
-                ) 
+                )
             }
-            
+
             try {
                 val providerList = providers.value
                 if (providerList.isEmpty()) {
-                    _uiState.update { 
+                    _uiState.update {
                         it.copy(
                             isRefreshingAll = false,
                             error = "No providers to refresh"
-                        ) 
+                        )
                     }
                     return@launch
                 }
-                
+
                 val results = repository.refreshAllProviders()
                 val successful = results.count { it.second.isSuccess }
                 val failed = results.count { it.second.isFailure }
-                
-                _uiState.update { 
+
+                _uiState.update {
                     it.copy(
                         isRefreshingAll = false,
                         refreshProgress = 1f,
                         message = "Refreshed $successful providers${if (failed > 0) ", $failed failed" else ""}"
-                    ) 
+                    )
                 }
             } catch (e: Exception) {
-                _uiState.update { 
+                _uiState.update {
                     it.copy(
                         isRefreshingAll = false,
                         error = e.message ?: "Refresh failed"
-                    ) 
+                    )
                 }
             }
         }
     }
-    
+
     fun clearMessage() {
         _uiState.update { it.copy(message = null) }
     }
-    
+
     fun clearError() {
         _uiState.update { it.copy(error = null) }
     }
-    
+
     fun showAnalysisDetails(analysis: SiteAnalysis) {
         _uiState.update { it.copy(showAnalysisDetails = true, lastAnalysis = analysis) }
     }
-    
+
     fun hideAnalysisDetails() {
         _uiState.update { it.copy(showAnalysisDetails = false) }
     }
