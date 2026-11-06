@@ -46,6 +46,25 @@ class UniversalFormatParser @Inject constructor() {
             "Movie", "TVSeries", "TVEpisode", "VideoObject", "MediaObject",
             "Article", "SearchResultsPage", "ItemList", "WebPage"
         )
+
+        // Pre-compiled patterns that were rebuilt on every call below.
+        // Regex instances are immutable and only read, so sharing is equivalent.
+        private val NUXT_WINDOW_PATTERN = Regex("window\\.__NUXT__\\s*=\\s*(\\{.+\\})")
+        private val NUXT_FALLBACK_PATTERN = Regex("__NUXT__\\s*=\\s*(\\{.+\\})")
+        private val SPA_STATE_PATTERNS = listOf(
+            Regex("window\\.__INITIAL_STATE__\\s*=\\s*(\\{.+?\\});"),
+            Regex("window\\.__PRELOADED_STATE__\\s*=\\s*(\\{.+?\\});"),
+            Regex("window\\.\\w+State\\s*=\\s*(\\{.+?\\});")
+        )
+        private val EMBEDDED_JSON_PATTERNS = listOf(
+            Regex("var\\s+(videos?|movies?|items?|results?|data)\\s*=\\s*(\\[\\{.+?\\}\\]);", RegexOption.DOT_MATCHES_ALL),
+            Regex("const\\s+(videos?|movies?|items?|results?|data)\\s*=\\s*(\\[\\{.+?\\}\\]);", RegexOption.DOT_MATCHES_ALL),
+            Regex("\"(videos?|movies?|items?|results?)\"\\s*:\\s*(\\[\\{.+?\\}\\])", RegexOption.DOT_MATCHES_ALL)
+        )
+        private val NUMBER_REGEX = Regex("\\d+\\.?\\d*")
+        private val DURATION_REGEX = Regex("(\\d{1,2}:\\d{2}(?::\\d{2})?)")
+        private val YEAR_REGEX = Regex("\\b(19|20)\\d{2}\\b")
+        private val RATING_VALUE_REGEX = Regex("(\\d\\.\\d|\\d{1,2})")
     }
     
     /**
@@ -165,8 +184,8 @@ class UniversalFormatParser @Inject constructor() {
             val content = script.html()
             if (content.contains("__NUXT__") || content.contains("window.__NUXT__")) {
                 // Extract the JSON part
-                val jsonMatch = Regex("window\\.__NUXT__\\s*=\\s*(\\{.+\\})").find(content)
-                    ?: Regex("__NUXT__\\s*=\\s*(\\{.+\\})").find(content)
+                val jsonMatch = NUXT_WINDOW_PATTERN.find(content)
+                    ?: NUXT_FALLBACK_PATTERN.find(content)
                 
                 jsonMatch?.let {
                     return try {
@@ -186,16 +205,10 @@ class UniversalFormatParser @Inject constructor() {
         val results = mutableListOf<ExtractedContent>()
         
         // Look for common state patterns
-        val statePatterns = listOf(
-            Regex("window\\.__INITIAL_STATE__\\s*=\\s*(\\{.+?\\});"),
-            Regex("window\\.__PRELOADED_STATE__\\s*=\\s*(\\{.+?\\});"),
-            Regex("window\\.\\w+State\\s*=\\s*(\\{.+?\\});")
-        )
-        
         val scripts = document.select("script")
         for (script in scripts) {
             val content = script.html()
-            for (pattern in statePatterns) {
+            for (pattern in SPA_STATE_PATTERNS) {
                 pattern.find(content)?.let { match ->
                     try {
                         val jsonElement = json.parseToJsonElement(match.groupValues[1])
@@ -241,8 +254,8 @@ class UniversalFormatParser @Inject constructor() {
                             thumbnail = extractJsonString(item, "image", "thumbnailUrl", "poster"),
                             duration = extractJsonString(item, "duration"),
                             year = extractJsonString(item, "datePublished", "dateCreated")?.take(4),
-                            rating = extractJsonString(item, "aggregateRating")?.let { 
-                                Regex("\\d+\\.?\\d*").find(it)?.value 
+                            rating = extractJsonString(item, "aggregateRating")?.let {
+                                NUMBER_REGEX.find(it)?.value
                             },
                             contentType = mapSchemaToContentType(type),
                             rawJson = item.toString(),
@@ -295,16 +308,10 @@ class UniversalFormatParser @Inject constructor() {
         val results = mutableListOf<ExtractedContent>()
         
         // Common variable patterns for embedded data
-        val patterns = listOf(
-            Regex("var\\s+(videos?|movies?|items?|results?|data)\\s*=\\s*(\\[\\{.+?\\}\\]);", RegexOption.DOT_MATCHES_ALL),
-            Regex("const\\s+(videos?|movies?|items?|results?|data)\\s*=\\s*(\\[\\{.+?\\}\\]);", RegexOption.DOT_MATCHES_ALL),
-            Regex("\"(videos?|movies?|items?|results?)\"\\s*:\\s*(\\[\\{.+?\\}\\])", RegexOption.DOT_MATCHES_ALL)
-        )
-        
         document.select("script").forEach { script ->
             val content = script.html()
-            
-            patterns.forEach { pattern ->
+
+            EMBEDDED_JSON_PATTERNS.forEach { pattern ->
                 pattern.findAll(content).forEach { match ->
                     try {
                         val jsonArray = json.parseToJsonElement(match.groupValues[2])
@@ -424,7 +431,7 @@ class UniversalFormatParser @Inject constructor() {
         // Find duration
         val duration = element.select("[class*='duration'], [class*='time'], .length, .runtime")
             .firstOrNull()?.text()
-            ?: Regex("(\\d{1,2}:\\d{2}(?::\\d{2})?)").find(element.text())?.value
+            ?: DURATION_REGEX.find(element.text())?.value
         
         // Find quality
         val quality = element.select("[class*='quality'], .resolution, .badge")
@@ -433,12 +440,12 @@ class UniversalFormatParser @Inject constructor() {
                 .firstOrNull { element.text().contains(it, ignoreCase = true) }
         
         // Find year
-        val year = Regex("\\b(19|20)\\d{2}\\b").find(element.text())?.value
-        
+        val year = YEAR_REGEX.find(element.text())?.value
+
         // Find rating
         val rating = element.select("[class*='rating'], [class*='imdb'], .score, .stars")
             .firstOrNull()?.text()
-            ?.let { Regex("(\\d\\.\\d|\\d{1,2})").find(it)?.value }
+            ?.let { RATING_VALUE_REGEX.find(it)?.value }
         
         // Find description
         val description = element.select(".description, .desc, .synopsis, p")

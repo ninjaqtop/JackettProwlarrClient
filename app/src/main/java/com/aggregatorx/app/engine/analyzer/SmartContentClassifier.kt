@@ -63,6 +63,24 @@ class SmartContentClassifier @Inject constructor() {
         private const val CATEGORY_THRESHOLD = 0.6f
         private const val CONTENT_THRESHOLD = 0.55f
         private const val AD_THRESHOLD = 0.5f
+
+        // Pre-compiled patterns that were rebuilt on every call below.
+        // Regex instances are immutable and only read, so sharing is equivalent.
+        private val CONTENT_CLASS_REGEX = Regex(".*(result|item|video|movie|episode)s?.*")
+        private val CATEGORY_CLASS_REGEX = Regex(".*(categor|genre|filter|nav|menu).*")
+        private val WHITESPACE_SPLIT_REGEX = Regex("\\s+")
+        private val CONTENT_TEXT_PATTERNS = listOf(
+            Regex("\\d+\\s*(min|hour|hr|episode|ep|season|s\\d+)"),
+            Regex("\\d{4}"),  // Year
+            Regex("\\d+\\.\\d+"),  // Rating like 7.5
+            Regex("\\d+\\s*views?"),
+            Regex("(watch|play|stream)\\s+(now|online|free)?")
+        )
+        private val HOME_URL_REGEX = Regex("https?://[^/]+/?$")
+        private val YEAR_REGEX = Regex("\\b(19|20)\\d{2}\\b")
+        private val NUMBER_REGEX = Regex("\\d+\\.?\\d*")
+        private val EPISODE_CODE_REGEX = Regex("s\\d+e\\d+")
+        private val CATEGORY_COUNT_REGEX = Regex("\\((\\d+)\\)")
     }
     
     /**
@@ -217,10 +235,10 @@ class SmartContentClassifier @Inject constructor() {
         }
         
         // Strong signals from specific attributes
-        if (classNames.matches(Regex(".*(result|item|video|movie|episode)s?.*"))) {
+        if (classNames.matches(CONTENT_CLASS_REGEX)) {
             scores.contentScore += 0.25f
         }
-        if (classNames.matches(Regex(".*(categor|genre|filter|nav|menu).*"))) {
+        if (classNames.matches(CATEGORY_CLASS_REGEX)) {
             scores.categoryScore += 0.25f
         }
     }
@@ -332,18 +350,10 @@ class SmartContentClassifier @Inject constructor() {
      */
     private fun analyzeTextContent(element: Element, scores: ContainerScores) {
         val text = element.text().lowercase()
-        val words = text.split(Regex("\\s+"))
-        
+        val words = text.split(WHITESPACE_SPLIT_REGEX)
+
         // Check for content-specific patterns
-        val contentPatterns = listOf(
-            Regex("\\d+\\s*(min|hour|hr|episode|ep|season|s\\d+)"),
-            Regex("\\d{4}"),  // Year
-            Regex("\\d+\\.\\d+"),  // Rating like 7.5
-            Regex("\\d+\\s*views?"),
-            Regex("(watch|play|stream)\\s+(now|online|free)?")
-        )
-        
-        contentPatterns.forEach { pattern ->
+        CONTENT_TEXT_PATTERNS.forEach { pattern ->
             if (pattern.containsMatchIn(text)) {
                 scores.contentScore += 0.1f
             }
@@ -461,7 +471,7 @@ class SmartContentClassifier @Inject constructor() {
             containers.any { it.classification == ContainerType.CONTENT_RESULTS && it.confidence > 0.7f } ->
                 PageType.CONTENT_LISTING
             
-            title.contains("home") || url.endsWith("/") || url.matches(Regex("https?://[^/]+/?$")) ->
+            title.contains("home") || url.endsWith("/") || url.matches(HOME_URL_REGEX) ->
                 PageType.HOME_PAGE
             
             else -> PageType.UNKNOWN
@@ -533,11 +543,11 @@ class SmartContentClassifier @Inject constructor() {
                 .firstOrNull { text.contains(it, ignoreCase = true) }
         }
         
-        val year = Regex("\\b(19|20)\\d{2}\\b").find(element.text())?.value
-        
+        val year = YEAR_REGEX.find(element.text())?.value
+
         val rating = element.select("[class*='rating'], [class*='imdb'], .score")
             .firstOrNull()?.text()
-            ?.let { Regex("\\d+\\.?\\d*").find(it)?.value }
+            ?.let { NUMBER_REGEX.find(it)?.value }
         
         return ResultItem(
             title = title.trim(),
@@ -558,7 +568,7 @@ class SmartContentClassifier @Inject constructor() {
         val text = "${element.text()} $url".lowercase()
         
         return when {
-            text.contains("episode") || text.contains("s\\d+e\\d+".toRegex()) -> ContentType.EPISODE
+            text.contains("episode") || text.contains(EPISODE_CODE_REGEX) -> ContentType.EPISODE
             text.contains("season") || text.contains("series") -> ContentType.SERIES
             text.contains("movie") || text.contains("film") -> ContentType.MOVIE
             text.contains("trailer") -> ContentType.TRAILER
@@ -578,7 +588,7 @@ class SmartContentClassifier @Inject constructor() {
                 CategoryItem(
                     text = text,
                     url = href,
-                    count = Regex("\\((\\d+)\\)").find(link.text())?.groupValues?.get(1)?.toIntOrNull()
+                    count = CATEGORY_COUNT_REGEX.find(link.text())?.groupValues?.get(1)?.toIntOrNull()
                 )
             } else null
         }
