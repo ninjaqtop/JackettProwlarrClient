@@ -7,17 +7,7 @@ set_target_properties(tlsclient PROPERTIES
     IMPORTED_LOCATION "${CMAKE_SOURCE_DIR}/../jniLibs/${ANDROID_ABI}/libtlsclient.so"
 )
 
-add_library(tlsclientbridge SHARED native-lib.cpp)
-
-target_include_directories(tlsclientbridge PRIVATE "${CMAKE_SOURCE_DIR}")
-
-target_link_options(tlsclientbridge PRIVATE
-    "-Wl,-z,max-page-size=16384"
-    "-Wl,-z,common-page-size=16384"
-)
-
-target_link_libraries(tlsclientbridge
-    tlsclient
-    log
-)
+# libtlsclientbridge is shipped as a prebuilt in jniLibs (the exact binary
+# from Jonathan's build) instead of being compiled here from native-lib.cpp.
+# native-lib.cpp remains in the repo as the bridge's source of record.
 

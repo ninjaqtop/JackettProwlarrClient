@@ -31,7 +31,7 @@ jobs:
 
       - name: Install Android SDK components
         run: |
-          echo "y" | sdkmanager --install "platform-tools" "platforms;android-35" "build-tools;35.0.0" "cmake;3.22.1" "ndk;27.0.12077973"
+          echo "y" | sdkmanager --install "platform-tools" "platforms;android-36" "build-tools;36.0.0" "cmake;3.22.1" "ndk;27.0.12077973"
           echo "sdk.dir=$ANDROID_HOME" > local.properties
 
       - name: Cache Gradle packages
