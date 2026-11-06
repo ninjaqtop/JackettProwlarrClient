@@ -210,28 +210,44 @@ class ScrapingEngine @Inject constructor(
 
         return try {
             val result = searchProviderSmart(provider, query, pageOffset)
-            if (result.results.isNotEmpty()) {
-                // Keep exactly what the provider's own search page returned, in the
-                // provider's order. Re-filtering/re-sorting here is what made the app
-                // diverge from the results a user sees when searching on the site.
-                aiDecisionEngine.learnFromSuccess(
-                    domain,
-                    ScrapingStrategy.HYBRID,
-                    null,
-                    null,
-                    null,
-                    result.results.size,
-                    System.currentTimeMillis() - startTime
-                )
-                result.copy(
-                    totalResults = result.results.size,
-                    success = true,
-                    errorMessage = null,
-                    status = ProviderSearchStatus.RESULTS,
-                    hasMore = true
-                )
-            } else {
+            if (result.results.isEmpty()) {
                 result
+            } else {
+                // Phone-build behavior (sync part 3): the live results pass through
+                // the display filter; if nothing query-matching survives, the
+                // provider reports an honest EMPTY instead of off-query results.
+                val displayResults = SearchResultFilter.filterResultsForDisplay(
+                    result.results,
+                    query,
+                    currentProcessedQuery
+                )
+                if (displayResults.isEmpty()) {
+                    result.copy(
+                        results = emptyList(),
+                        success = false,
+                        errorMessage = "No query-matching media results found",
+                        totalResults = 0,
+                        hasMore = false,
+                        status = ProviderSearchStatus.EMPTY
+                    )
+                } else {
+                    aiDecisionEngine.learnFromSuccess(
+                        domain,
+                        ScrapingStrategy.HYBRID,
+                        null,
+                        null,
+                        null,
+                        displayResults.size,
+                        System.currentTimeMillis() - startTime
+                    )
+                    result.copy(
+                        results = displayResults,
+                        totalResults = displayResults.size,
+                        success = true,
+                        status = ProviderSearchStatus.RESULTS,
+                        hasMore = true
+                    )
+                }
             }
         } catch (e: CancellationException) {
             throw e
