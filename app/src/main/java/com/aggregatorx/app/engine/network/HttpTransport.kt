@@ -116,7 +116,7 @@ object HttpTransport {
     const val MIN_TIMEOUT_MS = 1_000
     const val MAX_TIMEOUT_MS = 60_000
     private const val NATIVE_GRACE_MS = 2_000L
-    private const val MAX_NATIVE_IN_FLIGHT = 8
+    private const val MAX_NATIVE_IN_FLIGHT = 16
     private const val MAX_BODY_BYTES = 8L * 1024 * 1024
 
     private val nativeExecutor = Executors.newFixedThreadPool(MAX_NATIVE_IN_FLIGHT) { r ->

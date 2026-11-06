@@ -59,6 +59,13 @@ class AggregatorXApp : Application(), SingletonImageLoader.Factory {
             .components {
                 add(OkHttpNetworkFetcherFactory(callFactory = { okHttpClient }))
             }
+            // Bounded thumbnail memory cache so long result lists scroll
+            // without unbounded bitmap growth (spec §4 memory discipline).
+            .memoryCache {
+                coil3.memory.MemoryCache.Builder()
+                    .maxSizePercent(context, 0.15)
+                    .build()
+            }
             .crossfade(true)
             .build()
     }
