@@ -1,5 +1,7 @@
 package com.aggregatorx.app.engine.analyzer
 
+import com.aggregatorx.app.engine.network.HttpTransport
+
 import android.util.Log
 import com.aggregatorx.app.engine.network.CloudflareBypassEngine
 import com.aggregatorx.app.engine.network.TlsClient
@@ -70,7 +72,7 @@ class SiteReconEngine @Inject constructor(
         fun timedFetch(url: String, timeoutMs: Int, acceptJson: Boolean = false): TimedFetch {
             val t0 = System.currentTimeMillis()
             val response = runCatching {
-                TlsClient.execute(
+                HttpTransport.executeTls(
                     TlsRequest(
                         url = url,
                         headers = buildMap {

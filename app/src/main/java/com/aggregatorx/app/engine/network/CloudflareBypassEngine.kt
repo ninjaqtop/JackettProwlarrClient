@@ -199,7 +199,7 @@ class CloudflareBypassEngine @Inject constructor(
         val cookies = domainCookieJars[domain] ?: emptyMap()
 
         try {
-            val conn = Jsoup.connect(url)
+            val conn = HttpTransport.connect(url)
                 .timeout(timeoutMs)
                 .followRedirects(true)
                 .ignoreHttpErrors(true)
@@ -291,7 +291,7 @@ class CloudflareBypassEngine @Inject constructor(
         timeoutMs: Int
     ): BypassResult {
         val profile = selectNativeProfile(headers)
-        val response = TlsClient.execute(
+        val response = HttpTransport.executeTls(
             TlsRequest(
                 url = url,
                 method = "GET",

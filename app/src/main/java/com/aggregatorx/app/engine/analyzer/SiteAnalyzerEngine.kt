@@ -1,5 +1,7 @@
 package com.aggregatorx.app.engine.analyzer
 
+import com.aggregatorx.app.engine.network.HttpTransport
+
 import com.aggregatorx.app.data.model.*
 import com.aggregatorx.app.engine.network.TlsFingerprintEngine
 import com.aggregatorx.app.engine.scraper.HeadlessBrowserHelper
@@ -263,7 +265,7 @@ class SiteAnalyzerEngine @Inject constructor(
 
     private suspend fun fetchAnalyzerPage(url: String): AnalyzerFetchedPage {
         return try {
-            val response = Jsoup.connect(url)
+            val response = HttpTransport.connect(url)
                 .userAgent(DEFAULT_USER_AGENT)
                 .timeout(DEFAULT_TIMEOUT)
                 .followRedirects(true)

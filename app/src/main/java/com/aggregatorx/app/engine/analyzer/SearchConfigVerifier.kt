@@ -1,5 +1,7 @@
 package com.aggregatorx.app.engine.analyzer
 
+import com.aggregatorx.app.engine.network.HttpTransport
+
 import com.aggregatorx.app.data.model.Provider
 import com.aggregatorx.app.data.model.ScrapingConfig
 import com.aggregatorx.app.engine.ml.DeterministicAnalysisHelper
@@ -221,7 +223,7 @@ class SearchConfigVerifier @Inject constructor() {
 
         val probe = buildRequest(provider, config, probeQuery)
         val t0 = System.currentTimeMillis()
-        val response = TlsClient.execute(probe)
+        val response = HttpTransport.executeTls(probe)
         val responseMs = System.currentTimeMillis() - t0
         slowest = maxOf(slowest, responseMs)
 
@@ -267,7 +269,7 @@ class SearchConfigVerifier @Inject constructor() {
 
         // Negative control: the site's own search must find ~nothing for nonsense.
         val nonsenseStart = System.currentTimeMillis()
-        val nonsenseResponse = TlsClient.execute(buildRequest(provider, effectiveConfig, NONSENSE_QUERY))
+        val nonsenseResponse = HttpTransport.executeTls(buildRequest(provider, effectiveConfig, NONSENSE_QUERY))
         slowest = maxOf(slowest, System.currentTimeMillis() - nonsenseStart)
         if (nonsenseResponse.error != null || nonsenseResponse.statusCode !in 200..399) {
             return CandidateAttempt.Failed(
@@ -422,7 +424,7 @@ class SearchConfigVerifier @Inject constructor() {
         // Nonsense control over raw HTTP: a JS app's raw route still has
         // to stay silent for nonsense; if it echoes the same items, the
         // "results" were the app's shell content, not search output.
-        val nonsenseResponse = TlsClient.execute(buildRequest(provider, extraction.effectiveConfig, NONSENSE_QUERY))
+        val nonsenseResponse = HttpTransport.executeTls(buildRequest(provider, extraction.effectiveConfig, NONSENSE_QUERY))
         val nonsenseItems = if (nonsenseResponse.error == null && nonsenseResponse.statusCode in 200..399) {
             classify(
                 extractFromBody(nonsenseResponse.body, nonsenseResponse.finalUrl, provider, extraction.effectiveConfig, hint, allowRepair = false).pairs

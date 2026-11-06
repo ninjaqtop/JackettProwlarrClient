@@ -1,5 +1,7 @@
 package com.aggregatorx.app.engine.scraper
 
+import com.aggregatorx.app.engine.network.HttpTransport
+
 import android.util.Log
 import com.aggregatorx.app.data.database.ProviderDao
 import com.aggregatorx.app.data.database.ScrapingConfigDao
@@ -15,8 +17,8 @@ import com.aggregatorx.app.engine.nlp.NaturalLanguageQueryProcessor
 import com.aggregatorx.app.engine.nlp.ProcessedQuery
 import com.aggregatorx.app.engine.scraper.SearchResultFilter
 import com.aggregatorx.app.engine.network.CloudflareBypassEngine
-import com.aggregatorx.app.engine.network.TlsClient
-import com.aggregatorx.app.engine.network.TlsRequest
+import com.aggregatorx.app.engine.network.TransportEngine
+import com.aggregatorx.app.engine.network.TransportRequest
 import kotlinx.coroutines.*
 import kotlinx.coroutines.flow.*
 import kotlinx.coroutines.sync.Semaphore
@@ -572,73 +574,48 @@ class ScrapingEngine @Inject constructor(
         return candidates.toList().take(MAX_SEARCH_CANDIDATES)
     }
 
+    /**
+     * One request through the app's single transport ([HttpTransport]): the native
+     * TLS client first, bounded by the provider's saved timeout; OkHttp only as a
+     * logged, user-visible degradation. (The old code raced native TLS against a
+     * separate Jsoup/HttpURLConnection stack and silently kept whichever body was
+     * longer — two stacks, and no way to know which one answered.)
+     */
     private suspend fun fetchFastOutcome(
         url: String,
         config: ScrapingConfig?,
         query: String,
         pageOffset: Int,
         baseUrl: String
-    ): FetchOutcome? = supervisorScope {
-        val timeout = minOf(config?.timeout ?: DEFAULT_TIMEOUT, FAST_CANDIDATE_TIMEOUT_MS.toInt())
+    ): FetchOutcome? {
+        val timeout = config?.timeout ?: DEFAULT_TIMEOUT
         val postBody = configuredPostBody(config, url, query, pageOffset + 1, baseUrl)
         val headers = buildRequestHeaders(config, url, baseUrl, isPost = postBody != null)
-        val native = async(Dispatchers.IO) {
-            if (!TlsClient.isAvailable) return@async null
-            val response = TlsClient.execute(
-                TlsRequest(
-                    url = url,
-                    method = if (postBody == null) "GET" else "POST",
-                    headers = headers,
-                    body = postBody ?: "",
-                    clientProfile = TlsClient.DEFAULT_PROFILE,
-                    timeoutMs = timeout
-                )
+        val response = HttpTransport.fetch(
+            TransportRequest(
+                url = url,
+                method = if (postBody == null) "GET" else "POST",
+                headers = headers,
+                body = postBody,
+                timeoutMs = timeout
             )
-            response.body.takeIf {
-                response.error.isNullOrBlank() &&
-                    response.statusCode in 200..399 &&
-                    isUsableBody(it)
-            }?.let { body ->
-                val finalUrl = response.finalUrl.ifBlank { url }
-                FetchOutcome(
-                    document = Jsoup.parse(body, finalUrl),
-                    body = body,
-                    finalUrl = finalUrl,
-                    statusCode = response.statusCode,
-                    transport = "native-tls"
-                )
-            }
+        )
+        if (!response.isHttpOk || !isUsableBody(response.body)) {
+            Log.i(
+                TAG,
+                "fetch url=${url.take(160)} engine=${response.engine} status=${response.statusCode} " +
+                    "error=${response.error ?: "-"} degraded=${response.degradedReason ?: "-"}"
+            )
+            return null
         }
-        val standard = async(Dispatchers.IO) {
-            runCatching {
-                val connection = Jsoup.connect(url)
-                    .headers(headers)
-                    .timeout(timeout)
-                    .followRedirects(true)
-                    .ignoreContentType(true)
-                    .ignoreHttpErrors(true)
-                    .maxBodySize(8 * 1024 * 1024)
-                if (postBody != null) {
-                    connection.method(Connection.Method.POST)
-                    connection.requestBody(postBody)
-                }
-                val response = connection.execute()
-                val body = response.body()
-                if (response.statusCode() !in 200..399 || !isUsableBody(body)) return@runCatching null
-                val finalUrl = response.url().toString()
-                FetchOutcome(
-                    document = Jsoup.parse(body, finalUrl),
-                    body = body,
-                    finalUrl = finalUrl,
-                    statusCode = response.statusCode(),
-                    transport = "jsoup"
-                )
-            }.getOrNull()
-        }
-
-        listOf(native.await(), standard.await())
-            .filterNotNull()
-            .maxWithOrNull(compareBy<FetchOutcome> { it.body.length }.thenBy { it.transport == "native-tls" })
+        val finalUrl = response.finalUrl.ifBlank { url }
+        return FetchOutcome(
+            document = Jsoup.parse(response.body, finalUrl),
+            body = response.body,
+            finalUrl = finalUrl,
+            statusCode = response.statusCode,
+            transport = if (response.engine == TransportEngine.NATIVE_TLS) "native-tls" else "okhttp-degraded"
+        )
     }
 
     private fun isUsableBody(body: String): Boolean {
@@ -1040,7 +1017,7 @@ class ScrapingEngine @Inject constructor(
         // 1. Standard Jsoup (with the configured headers / POST body, if any)
         repeat(DEFAULT_RETRY_COUNT) { attempt ->
             try {
-                val connection = Jsoup.connect(url)
+                val connection = HttpTransport.connect(url)
                     .headers(headers)
                     .timeout(timeout)
                     .followRedirects(true)

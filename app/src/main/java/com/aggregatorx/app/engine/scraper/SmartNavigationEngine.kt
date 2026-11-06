@@ -1,5 +1,7 @@
 package com.aggregatorx.app.engine.scraper
 
+import com.aggregatorx.app.engine.network.HttpTransport
+
 import com.aggregatorx.app.data.model.*
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.async
@@ -191,7 +193,7 @@ class SmartNavigationEngine @Inject constructor() {
 
         // Step 1: Detect a search form on the homepage (single fast request)
         try {
-            val homepage = Jsoup.connect(baseUrl)
+            val homepage = HttpTransport.connect(baseUrl)
                 .userAgent(DEFAULT_USER_AGENT)
                 .timeout(QUICK_TIMEOUT)
                 .get()
@@ -200,7 +202,7 @@ class SmartNavigationEngine @Inject constructor() {
                 val builtUrl = buildSearchUrlFromForm(baseUrl, searchForm, query)
                 // Validate it returns results
                 try {
-                    val doc = Jsoup.connect(builtUrl)
+                    val doc = HttpTransport.connect(builtUrl)
                         .userAgent(DEFAULT_USER_AGENT)
                         .timeout(QUICK_TIMEOUT)
                         .ignoreHttpErrors(true)
@@ -228,7 +230,7 @@ class SmartNavigationEngine @Inject constructor() {
                 chunk.map { searchUrl ->
                     async(Dispatchers.IO) {
                         try {
-                            val response = Jsoup.connect(searchUrl)
+                            val response = HttpTransport.connect(searchUrl)
                                 .userAgent(DEFAULT_USER_AGENT)
                                 .timeout(QUICK_TIMEOUT)
                                 .followRedirects(true)
@@ -261,7 +263,7 @@ class SmartNavigationEngine @Inject constructor() {
         val seen = mutableSetOf<String>()
 
         try {
-            val homepage = Jsoup.connect(baseUrl)
+            val homepage = HttpTransport.connect(baseUrl)
                 .userAgent(DEFAULT_USER_AGENT)
                 .timeout(DEFAULT_TIMEOUT)
                 .followRedirects(true)
@@ -296,7 +298,7 @@ class SmartNavigationEngine @Inject constructor() {
                 sortedTabs.map { (link, _) ->
                     async(Dispatchers.IO) {
                         try {
-                            val tabDoc = Jsoup.connect(link.url)
+                            val tabDoc = HttpTransport.connect(link.url)
                                 .userAgent(DEFAULT_USER_AGENT)
                                 .timeout(DEFAULT_TIMEOUT)
                                 .followRedirects(true)
@@ -538,7 +540,7 @@ class SmartNavigationEngine @Inject constructor() {
         if (searchForm != null) {
             val searchUrl = buildSearchUrlFromForm(baseUrl, searchForm, query)
             try {
-                val newDoc = Jsoup.connect(searchUrl)
+                val newDoc = HttpTransport.connect(searchUrl)
                     .userAgent(DEFAULT_USER_AGENT)
                     .timeout(DEFAULT_TIMEOUT)
                     .get()
@@ -552,7 +554,7 @@ class SmartNavigationEngine @Inject constructor() {
         val workingUrl = findSearchUrl(baseUrl, query)
         if (workingUrl != null) {
             try {
-                val newDoc = Jsoup.connect(workingUrl)
+                val newDoc = HttpTransport.connect(workingUrl)
                     .userAgent(DEFAULT_USER_AGENT)
                     .timeout(DEFAULT_TIMEOUT)
                     .get()

@@ -1,5 +1,7 @@
 package com.aggregatorx.app.engine.analyzer
 
+import com.aggregatorx.app.engine.network.HttpTransport
+
 import com.aggregatorx.app.data.model.*
 import com.aggregatorx.app.engine.network.CloudflareBypassEngine
 import com.aggregatorx.app.engine.scraper.HeadlessBrowserHelper
@@ -198,7 +200,7 @@ class EndpointDiscoveryEngine @Inject constructor(
                 .replace("{query}", java.net.URLEncoder.encode(query, "UTF-8"))
                 .let { if (it.startsWith("http")) it else "${baseUrl.trimEnd('/')}$it" }
             try {
-                val response = Jsoup.connect(url)
+                val response = HttpTransport.connect(url)
                     .userAgent(UA)
                     .timeout(DISCOVERY_TIMEOUT)
                     .ignoreHttpErrors(true)
@@ -360,7 +362,7 @@ class EndpointDiscoveryEngine @Inject constructor(
             val endpoints = mutableListOf<String>()
             try {
                 val doc = cloudflareBypassEngine.fetchJsoupDocument(baseUrl, DISCOVERY_TIMEOUT)
-                    ?: Jsoup.connect(baseUrl)
+                    ?: HttpTransport.connect(baseUrl)
                         .userAgent(UA)
                         .timeout(DISCOVERY_TIMEOUT)
                         .ignoreHttpErrors(true)
@@ -396,7 +398,7 @@ class EndpointDiscoveryEngine @Inject constructor(
         withContext(Dispatchers.IO) {
             val paths = mutableListOf<String>()
             try {
-                val response = Jsoup.connect("$baseUrl/robots.txt")
+                val response = HttpTransport.connect("$baseUrl/robots.txt")
                     .userAgent(UA)
                     .timeout(10000)
                     .ignoreHttpErrors(true)
@@ -441,7 +443,7 @@ class EndpointDiscoveryEngine @Inject constructor(
                         val path = pathTemplate.replace("{query}", encodedQuery)
                         val url = "$baseUrl$path"
                         try {
-                            val response = Jsoup.connect(url)
+                            val response = HttpTransport.connect(url)
                                 .userAgent(UA)
                                 .timeout(8000)
                                 .ignoreHttpErrors(true)
@@ -476,7 +478,7 @@ class EndpointDiscoveryEngine @Inject constructor(
         val specPaths = listOf("/swagger.json", "/openapi.json", "/api-docs", "/api/docs", "/api/spec")
         for (specPath in specPaths) {
             try {
-                val response = Jsoup.connect("$baseUrl$specPath")
+                val response = HttpTransport.connect("$baseUrl$specPath")
                     .userAgent(UA)
                     .timeout(5000)
                     .ignoreHttpErrors(true)
@@ -503,7 +505,7 @@ class EndpointDiscoveryEngine @Inject constructor(
             val sitemaps = mutableListOf<String>()
             for (path in SITEMAP_PATHS) {
                 try {
-                    val response = Jsoup.connect("$baseUrl$path")
+                    val response = HttpTransport.connect("$baseUrl$path")
                         .userAgent(UA)
                         .timeout(8000)
                         .ignoreHttpErrors(true)
