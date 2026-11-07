@@ -11,6 +11,7 @@ import com.aggregatorx.app.engine.analyzer.SmartContentClassifier
 import com.aggregatorx.app.engine.analyzer.PageType
 import com.aggregatorx.app.engine.analyzer.ContainerType
 import com.aggregatorx.app.engine.analyzer.EndpointDiscoveryEngine
+import com.aggregatorx.app.engine.analyzer.SearchConfigVerifier
 import com.aggregatorx.app.engine.analyzer.UniversalFormatParser
 import com.aggregatorx.app.engine.ai.AIDecisionEngine
 import com.aggregatorx.app.engine.nlp.NaturalLanguageQueryProcessor
@@ -88,6 +89,7 @@ class ScrapingEngine @Inject constructor(
         private const val RENDERED_FALLBACK_TIMEOUT_MS = 9_000L
         /** WebView budget for providers verified as JS-rendered (their proven path). */
         private const val VERIFIED_RENDER_TIMEOUT_MS = 18_000L
+        private const val MAX_LOAD_MORE_TIMEOUT_MS = 55_000L
         private const val MAX_SEARCH_CANDIDATES = 6
         private const val CANDIDATE_BATCH_SIZE = 3
         private const val MIN_RELEVANT_RESULTS_BEFORE_STOP = 5
@@ -282,7 +284,25 @@ class ScrapingEngine @Inject constructor(
         if (currentProcessedQuery?.originalQuery?.equals(query, ignoreCase = true) != true) {
             currentProcessedQuery = nlpProcessor.processQuery(query)
         }
-        return safeSearchProvider(provider, query, pageOffset)
+        // Bounded like the aggregate search (spec §4): the provider's own saved
+        // budget, plus the WebView click budget when its Load More replays the
+        // site's next control.
+        val config = runCatching { scrapingConfigDao.getConfigForProvider(provider.id) }.getOrNull()
+        val clickRule = pageOffset > 0 && config?.renderMode == RenderMode.FORM &&
+            config.paginationRule?.startsWith(SearchConfigVerifier.FORM_CLICK_RULE) == true
+        val budget = maxOf(providerBudgetMs(provider), if (clickRule) formClickBudgetMs(pageOffset) + PROVIDER_PARSE_MARGIN_MS else 0L)
+        val started = System.currentTimeMillis()
+        return withTimeoutOrNull(budget) { safeSearchProvider(provider, query, pageOffset) }
+            ?: ProviderSearchResults(
+                provider = provider,
+                results = emptyList(),
+                searchTime = System.currentTimeMillis() - started,
+                success = false,
+                errorMessage = "Timed out after ${budget / 1000} s (this provider's saved timeout)",
+                totalResults = 0,
+                hasMore = false,
+                status = ProviderSearchStatus.TIMED_OUT
+            )
     }
 
     private suspend fun safeSearchProvider(provider: Provider, query: String, pageOffset: Int = 0): ProviderSearchResults {
@@ -517,7 +537,12 @@ class ScrapingEngine @Inject constructor(
         // the site's own form submitted in the WebView, or the proven route
         // rendered with JavaScript. Raw HTTP for those returns the app shell.
         if (verified && renderMode == RenderMode.FORM) {
-            if (pageOffset > 0) return emptyList()
+            if (pageOffset > 0) {
+                // Load More (spec §5): replay the next-page mechanism the
+                // verifier demonstrated live on the form's own results page.
+                mergeKeepingBest(loadMoreViaFormRule(provider, query, pageOffset, config!!, analysis, trace))
+                return merged.values.sortedByDescending { it.relevanceScore }.take(TARGET_RESULTS_PER_PROVIDER)
+            }
             trace.note(provider, "WebView: submitted the site's own search form (verified as a JS-rendered form search)")
             mergeKeepingBest(renderViaForm(provider, query, config, analysis, trace))
             return merged.values.sortedByDescending { it.relevanceScore }.take(TARGET_RESULTS_PER_PROVIDER)
@@ -708,6 +733,7 @@ class ScrapingEngine @Inject constructor(
                 .replace("{query}", encoded)
                 .replace("{page}", page.toString())
                 .takeIf { it.startsWith("http", ignoreCase = true) }
+                ?.let { url -> if (config.postData == null) withSavedHiddenParams(url, config, inQueryString = true) else url }
                 ?.let { return listOf(it) }
         }
 
@@ -847,6 +873,80 @@ class ScrapingEngine @Inject constructor(
     }
 
     /**
+     * Page N of a FORM provider, via the rule proven live during verification
+     * ([SearchConfigVerifier.FORM_LINK_RAW_RULE] / [SearchConfigVerifier.FORM_LINK_RENDER_RULE]:
+     * the results page's own next-link template, fetched through the transport
+     * or rendered; [SearchConfigVerifier.FORM_CLICK_RULE]: the site's form
+     * submitted in the WebView and its own next control clicked N-1 times).
+     */
+    private suspend fun loadMoreViaFormRule(
+        provider: Provider,
+        query: String,
+        pageOffset: Int,
+        config: ScrapingConfig,
+        analysis: SiteAnalysis?,
+        trace: FetchTrace
+    ): List<SearchResult> {
+        val rule = config.paginationRule ?: return emptyList()
+        val page = 1 + pageOffset
+        val encoded = runCatching { URLEncoder.encode(query, config.encoding.ifBlank { "UTF-8" }) }
+            .getOrElse { URLEncoder.encode(query, "UTF-8") }
+        fun fill(template: String) = template.replace("{query}", encoded).replace("{page}", page.toString())
+        return when {
+            rule.startsWith(SearchConfigVerifier.FORM_LINK_RAW_RULE) -> {
+                val url = fill(rule.removePrefix(SearchConfigVerifier.FORM_LINK_RAW_RULE))
+                trace.note(provider, "Load More: page $page via the form results page's own next link (proven live)")
+                val linkConfig = config.copy(postData = null)
+                val outcome = fetchFastOutcome(url, linkConfig, query, pageOffset, provider.baseUrl)
+                if (outcome == null) {
+                    trace.note(provider, "Load More: page $page fetch returned no usable page")
+                    emptyList()
+                } else {
+                    extractFromFetchedOutcome(outcome, provider, query, linkConfig, analysis)
+                }
+            }
+            rule.startsWith(SearchConfigVerifier.FORM_LINK_RENDER_RULE) -> {
+                val url = fill(rule.removePrefix(SearchConfigVerifier.FORM_LINK_RENDER_RULE))
+                trace.note(provider, "Load More: page $page rendered from the form results page's own next link (proven live)")
+                renderViaWebView(provider, url, query, config, analysis, trace)
+            }
+            rule.startsWith(SearchConfigVerifier.FORM_CLICK_RULE) -> {
+                val control = rule.removePrefix(SearchConfigVerifier.FORM_CLICK_RULE)
+                trace.note(provider, "Load More: page $page by clicking the site's own next control ($control) in the WebView (proven live)")
+                val webRun = HeadlessBrowserHelper.renderFormSearchPages(
+                    provider.baseUrl, query, nextClicks = pageOffset, nextControl = control,
+                    timeout = formClickBudgetMs(pageOffset).toInt()
+                )
+                if (webRun == null || webRun.pages.size < pageOffset + 1) {
+                    trace.note(provider, "Load More: page $page not reached (${webRun?.stopReason ?: "WebView unavailable"})")
+                    emptyList()
+                } else {
+                    // Results already shown on earlier pages (an appending
+                    // "load more" control keeps them in the DOM) are not new.
+                    val earlier = webRun.pages.dropLast(1).flatMap { prior ->
+                        extractFromFetchedOutcome(
+                            FetchOutcome(Jsoup.parse(prior.html, prior.url), prior.html, prior.url, 200, "webview-form"),
+                            provider, query, config, analysis
+                        ).map { it.url }
+                    }.toSet()
+                    val last = webRun.pages.last()
+                    extractFromFetchedOutcome(
+                        FetchOutcome(Jsoup.parse(last.html, last.url), last.html, last.url, 200, "webview-form"),
+                        provider, query, config, analysis
+                    ).filterNot { it.url in earlier }
+                }
+            }
+            else -> {
+                trace.note(provider, "Load More: unrecognised pagination rule for a form provider ($rule)")
+                emptyList()
+            }
+        }
+    }
+
+    private fun formClickBudgetMs(pageOffset: Int): Long =
+        (VERIFIED_RENDER_TIMEOUT_MS + 8_000L * pageOffset).coerceAtMost(MAX_LOAD_MORE_TIMEOUT_MS)
+
+    /**
      * True when a raw page is a JavaScript app shell: almost no visible text but
      * scripts, an empty SPA mount node, or a noscript "enable JavaScript" notice.
      */
@@ -972,10 +1072,43 @@ class ScrapingEngine @Inject constructor(
             .replace("{query}", encoded)
             .replace("{page}", page.toString())
         if (!url.equals(templateUrl, ignoreCase = true)) return null
-        return postData
+        val body = postData
             .replace("{baseUrl}", base)
             .replace("{query}", encoded)
             .replace("{page}", page.toString())
+        return if (config.verified) withSavedHiddenParams(body, config, inQueryString = false) else body
+    }
+
+    /**
+     * The saved hidden/fixed parameters (spec §3, `hiddenParams`) are part of the
+     * site's own request: any the request does not already carry are added — to
+     * the query string of a GET, or the form body of a POST — so the saved
+     * mapping, not only the template text, decides what is sent.
+     */
+    internal fun withSavedHiddenParams(target: String, config: ScrapingConfig, inQueryString: Boolean): String {
+        val hidden = runCatching { json.parseToJsonElement(config.hiddenParams) as? JsonObject }.getOrNull()
+            ?.mapNotNull { (k, v) -> (v as? JsonPrimitive)?.contentOrNull?.let { k to it } }
+            .orEmpty()
+        if (hidden.isEmpty()) return target
+        val section = if (inQueryString) target.substringAfter('?', "").substringBefore('#') else target
+        val present = section.split('&').mapNotNull { part ->
+            part.substringBefore('=').takeIf { it.isNotBlank() }
+                ?.let { runCatching { URLDecoder.decode(it, "UTF-8") }.getOrDefault(it) }
+        }.toSet()
+        val missing = hidden.filter { (name, _) -> name !in present }
+        if (missing.isEmpty()) return target
+        val addition = missing.joinToString("&") { (name, value) ->
+            "${URLEncoder.encode(name, "UTF-8")}=${URLEncoder.encode(value, "UTF-8")}"
+        }
+        if (!inQueryString) return if (target.isBlank()) addition else "$target&$addition"
+        val fragment = target.substringAfter('#', "")
+        val withoutFragment = target.substringBefore('#')
+        val joined = when {
+            !withoutFragment.contains('?') -> "$withoutFragment?$addition"
+            withoutFragment.endsWith('?') || withoutFragment.endsWith('&') -> "$withoutFragment$addition"
+            else -> "$withoutFragment&$addition"
+        }
+        return if (fragment.isNotEmpty()) "$joined#$fragment" else joined
     }
 
     private fun isSameOrigin(firstUrl: String, secondUrl: String): Boolean = runCatching {
