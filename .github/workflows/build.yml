@@ -2,7 +2,7 @@ name: Build Debug APK
 
 on:
   push:
-    branches: [ main, master, develop ]
+    branches: [ main, master, develop, feat/master-spec-build ]
   pull_request:
     branches: [ main, master ]
   workflow_dispatch:
@@ -34,6 +34,27 @@ jobs:
           echo "y" | sdkmanager --install "platform-tools" "platforms;android-36" "build-tools;36.0.0" "cmake;3.22.1" "ndk;27.0.12077973"
           echo "sdk.dir=$ANDROID_HOME" > local.properties
 
+      - name: Set up Go (for the native TLS library)
+        uses: actions/setup-go@v5
+        with:
+          go-version-file: app/src/main/go/tlsclient/go.mod
+          cache-dependency-path: app/src/main/go/tlsclient/go.sum
+
+      - name: No prebuilt native binaries in the repo
+        run: |
+          PREBUILT=$(git ls-files '*.so')
+          if [ -n "$PREBUILT" ]; then echo "Prebuilt .so tracked in git: $PREBUILT"; exit 1; fi
+          echo "OK: no tracked .so files; libtlsclient.so and libtlsclientbridge.so are built below"
+
+      - name: Build libtlsclient.so from source (Go c-shared, NDK clang)
+        run: |
+          chmod +x scripts/build_tlsclient_android.sh
+          scripts/build_tlsclient_android.sh $NATIVE_ABIS
+        env:
+          ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+          NDK_VERSION: 27.0.12077973
+          NATIVE_ABIS: arm64-v8a armeabi-v7a x86_64
+
       - name: Cache Gradle packages
         uses: actions/cache@v5
         with:
@@ -53,6 +74,14 @@ jobs:
           GRADLE_OPTS: "-Dorg.gradle.jvmargs=-Xmx4g -XX:MaxMetaspaceSize=1g -Dorg.gradle.daemon=false -Dkotlin.incremental=false -Dkotlin.daemon.jvmargs=-Xmx2g -XX:MaxMetaspaceSize=768m"
           ANDROID_HOME: /usr/local/lib/android/sdk
           ANDROID_SDK_ROOT: /usr/local/lib/android/sdk
+
+      - name: Verify native TLS pair is packaged loadably
+        run: |
+          python3 scripts/native_pair_check.py --apk app/build/outputs/apk/debug/app-debug.apk \
+            --abis arm64-v8a,armeabi-v7a,x86_64
+
+      - name: Verify Room migrations (v3->v4->v5) match the generated schema
+        run: python3 scripts/room_schema_check.py
 
       - name: Rename and stage APK
         run: |

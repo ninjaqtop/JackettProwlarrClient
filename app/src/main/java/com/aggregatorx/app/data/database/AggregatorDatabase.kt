@@ -20,8 +20,8 @@ import com.aggregatorx.app.data.model.UserPreferences
         LikedResult::class,
         LearnedUserProfile::class
     ],
-    version = 3,
-    exportSchema = false
+    version = 5,
+    exportSchema = true
 )
 abstract class AggregatorDatabase : RoomDatabase() {
     abstract fun providerDao(): ProviderDao

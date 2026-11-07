@@ -113,3 +113,11 @@
 # ---------------------
 -keepattributes SourceFile,LineNumberTable
 -renamesourcefileattribute SourceFile
+
+# ---------------------
+# JNI (native TLS bridge binds by class + method name)
+# ---------------------
+-keepclasseswithmembernames,includedescriptorclasses class * {
+    native <methods>;
+}
+-keep class com.aggregatorx.app.engine.network.TlsClient { *; }

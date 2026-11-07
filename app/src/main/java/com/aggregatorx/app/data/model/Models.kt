@@ -111,8 +111,20 @@ data class SiteAnalysis(
     
     // Raw data
     val rawHtml: String? = null,
+    /** HTTP RESPONSE headers seen when the page was fetched — never request headers. */
     val headers: String = "{}", // JSON object
-    val cookies: String = "[]" // JSON array
+    val cookies: String = "[]", // JSON array
+
+    /**
+     * Analysis record (spec §3): the full site map (forms, endpoints, sitemaps,
+     * tech fingerprint, recon checks), the full saved-config JSON, per-field
+     * confidence, and the probe evidence. Kept separate from [headers].
+     */
+    val analysisMetadata: String = "{}",
+    /** Verification outcome shown on the analyzer report ("VERIFIED" / "FAILED" / "NOT_RUN"). */
+    val verificationStatus: String = "NOT_RUN",
+    /** The specific failure reason(s) when verification failed. */
+    val verificationReason: String? = null
 )
 
 @Serializable
@@ -165,6 +177,12 @@ data class ProviderSearchResults(
     val totalResults: Int = results.size,
     val hasMore: Boolean = false,
     val nextPageUrl: String? = null,
+    /**
+     * User-visible note on how this provider was actually fetched when it was not
+     * the primary path (native TLS raw HTTP): WebView JS rendering, the site's form
+     * in the WebView, or the logged OkHttp degradation. Null = primary path only.
+     */
+    val fallbackNote: String? = null,
     val status: ProviderSearchStatus = when {
         success && results.isNotEmpty() -> ProviderSearchStatus.RESULTS
         success -> ProviderSearchStatus.EMPTY
@@ -176,6 +194,8 @@ data class ProviderSearchResults(
 @Serializable
 enum class ProviderSearchStatus {
     READY,
+    /** Queued in the aggregate search, waiting for a concurrency slot. */
+    PENDING,
     SEARCHING,
     RESULTS,
     EMPTY,
@@ -258,13 +278,16 @@ enum class PatternType {
 }
 
 /**
- * Scraping Configuration for a specific provider
+ * Scraping Configuration for a specific provider.
+ *
+ * PRIMARY KEY = provider ID (spec §3): one row per provider and `REPLACE`
+ * inserts are true upserts. Everything search needs to reproduce the site's
+ * own request is stored here, exactly as mapped and verified by the Analyzer.
  */
 @Entity(tableName = "scraping_configs")
 @Serializable
 data class ScrapingConfig(
     @PrimaryKey
-    val id: String = UUID.randomUUID().toString(),
     val providerId: String,
     val searchUrlTemplate: String, // e.g., "{baseUrl}/search?q={query}&page={page}"
     val resultSelector: String,
@@ -279,16 +302,62 @@ data class ScrapingConfig(
     val ratingSelector: String? = null,
     val categorySelector: String? = null,
     val nextPageSelector: String? = null,
-    val headers: String = "{}", // JSON object of custom headers
-    val cookies: String = "{}", // JSON object of cookies
-    val postData: String? = null, // For POST requests
+    val headers: String = "{}", // JSON object of custom request headers
+    val cookies: String = "{}", // JSON object of cookies the site requires
+    val postData: String? = null, // POST body template ({query}/{page}) when the site's form is POST
     val encoding: String = "UTF-8",
     val userAgent: String = com.aggregatorx.app.engine.util.EngineUtils.DEFAULT_USER_AGENT,
+    /** Adaptive per-provider timeout measured during probing (bounded 10–45 s). */
     val timeout: Int = 30000,
     val retryCount: Int = 3,
     val retryDelay: Long = 1000,
-    val rateLimitMs: Long = 500
-)
+    val rateLimitMs: Long = 500,
+    /** "GET" or "POST" — the site's own search method. */
+    val method: String = "GET",
+    /** The site's real query parameter name (e.g. "q", "s", "keyword"). */
+    val queryParam: String? = null,
+    /** JSON object of hidden/fixed parameters baked into the request. */
+    val hiddenParams: String = "{}",
+    /**
+     * Pagination rule demonstrated during verification:
+     * "param:<name>" (query parameter), "path:<pattern with {page}>", or null.
+     */
+    val paginationRule: String? = null,
+    /** First page number the site uses for its pagination rule. */
+    val paginationStart: Int = 1,
+    /** True when the search endpoint returns JSON. */
+    val isJson: Boolean = false,
+    /** Dot path of the result array ("" = root array). JSON providers only. */
+    val jsonResultPath: String? = null,
+    val jsonTitleField: String? = null,
+    val jsonUrlField: String? = null,
+    val jsonThumbnailField: String? = null,
+    /** JSON: item-vs-category signals learned at config time (see ResultClassification). */
+    val classificationData: String = "{}",
+    /** True only when this config passed live verification. */
+    val verified: Boolean = false,
+    val verifiedAt: Long = 0L,
+    /** Overall verification confidence (0..1). */
+    val confidence: Float = 0f,
+    /**
+     * How verification proved this search works, so search repeats it exactly:
+     * [RenderMode.RAW] (plain HTTP through HttpTransport), [RenderMode.RENDER]
+     * (the route only yields results after JavaScript runs: render it in the
+     * embedded WebView) or [RenderMode.FORM] (the site's own form submitted in
+     * the WebView).
+     */
+    val renderMode: String = RenderMode.RAW
+) {
+    /** The row key is the provider ID; kept for call sites that read `config.id`. */
+    val id: String get() = providerId
+}
+
+/** Values of [ScrapingConfig.renderMode]. */
+object RenderMode {
+    const val RAW = "RAW"
+    const val RENDER = "RENDER"
+    const val FORM = "FORM"
+}
 
 /**
  * Search History Entry

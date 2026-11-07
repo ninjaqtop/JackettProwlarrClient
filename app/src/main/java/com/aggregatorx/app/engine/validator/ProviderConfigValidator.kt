@@ -1,5 +1,7 @@
 package com.aggregatorx.app.engine.validator
 
+import com.aggregatorx.app.engine.network.HttpTransport
+
 import com.aggregatorx.app.data.model.Provider
 import com.aggregatorx.app.data.model.ProviderCategory
 import com.aggregatorx.app.data.model.ScrapingConfig
@@ -176,7 +178,7 @@ object ProviderConfigValidator {
             if (EngineUtils.extractDomain(url).isBlank()) {
                 return TestResult(success = false, message = "Invalid URL", responseTime = 0L)
             }
-            val response = TlsClient.execute(
+            val response = HttpTransport.executeTls(
                 TlsRequest(
                     url = url,
                     headers = mapOf("User-Agent" to EngineUtils.DEFAULT_USER_AGENT),
@@ -228,7 +230,7 @@ object ProviderConfigValidator {
                     .replace("{baseUrl}", baseUrl)
                     .replace("{query}", URLEncoder.encode(testQuery, "UTF-8"))
             }
-            val response = TlsClient.execute(
+            val response = HttpTransport.executeTls(
                 TlsRequest(
                     url = searchUrl,
                     headers = mapOf("User-Agent" to EngineUtils.DEFAULT_USER_AGENT),

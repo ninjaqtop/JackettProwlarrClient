@@ -1,5 +1,7 @@
 package com.aggregatorx.app.engine
 
+import com.aggregatorx.app.engine.network.HttpTransport
+
 import com.aggregatorx.app.data.model.*
 import com.aggregatorx.app.engine.analyzer.*
 import com.aggregatorx.app.engine.util.EngineUtils
@@ -303,7 +305,7 @@ class UnifiedContentEngine @Inject constructor(
             if (useProxy && proxyVPNEngine.getCurrentProxy() != null) {
                 proxyVPNEngine.fetchDocumentWithProxy(url)
             } else {
-                Jsoup.connect(url)
+                HttpTransport.connect(url)
                     .userAgent(USER_AGENT)
                     .timeout(TIMEOUT)
                     .followRedirects(true)
@@ -313,7 +315,7 @@ class UnifiedContentEngine @Inject constructor(
         } catch (e: Exception) {
             // Fallback to direct connection
             try {
-                Jsoup.connect(url)
+                HttpTransport.connect(url)
                     .userAgent(USER_AGENT)
                     .timeout(TIMEOUT)
                     .get()

@@ -1,9 +1,12 @@
 package com.aggregatorx.app.engine.analyzer
 
+import com.aggregatorx.app.engine.network.HttpTransport
+
 import android.util.Log
 import com.aggregatorx.app.engine.network.CloudflareBypassEngine
 import com.aggregatorx.app.engine.network.TlsClient
 import com.aggregatorx.app.engine.network.TlsRequest
+import com.aggregatorx.app.engine.scraper.LiveSearchCapture
 import com.aggregatorx.app.engine.util.EngineUtils
 import kotlinx.coroutines.Dispatchers
 import kotlinx.coroutines.withContext
@@ -61,16 +64,19 @@ class SiteReconEngine @Inject constructor(
     /** One timed fetch result; [body] is null when the fetch failed. */
     private data class TimedFetch(val body: String?, val finalUrl: String, val statusCode: Int)
 
-    suspend fun mapSite(baseUrl: String, homepageHtml: String?): SiteRecon = withContext(Dispatchers.IO) {
+    suspend fun mapSite(baseUrl: String, homepageHtml: String?, providerId: String = ""): SiteRecon = withContext(Dispatchers.IO) {
         val base = baseUrl.trimEnd('/')
         val baseHost = runCatching { URL(base).host }.getOrNull().orEmpty()
         val timings = mutableListOf<Long>()
         val startedAt = System.currentTimeMillis()
+        val toolkit = ReconToolkit(base, baseHost, startedAt + RECON_BUDGET_MS)
+        val sitemapsRead = mutableListOf<String>()
+        ReconProgress.start(providerId.ifBlank { baseHost }, RECON_BUDGET_MS)
 
         fun timedFetch(url: String, timeoutMs: Int, acceptJson: Boolean = false): TimedFetch {
             val t0 = System.currentTimeMillis()
             val response = runCatching {
-                TlsClient.execute(
+                HttpTransport.executeTls(
                     TlsRequest(
                         url = url,
                         headers = buildMap {
@@ -117,9 +123,11 @@ class SiteReconEngine @Inject constructor(
                 .forEach { path -> urls += "$base$path" }
         }
 
+        ReconProgress.stage(ReconProgress.Stage.ROBOTS, "reading robots.txt and the sitemaps it declares")
         var sitemapUrlCount = 0
         for (sitemapUrl in sitemapLocations.distinct().take(MAX_SITEMAP_FILES)) {
             val xml = timedFetch(sitemapUrl, SITEMAP_TIMEOUT_MS).body ?: continue
+            sitemapsRead += sitemapUrl
             val locs = LOC_REGEX.findAll(xml).map { it.groupValues[1].trim() }.toList()
             if (xml.contains("<sitemapindex", ignoreCase = true)) {
                 for (child in locs.filter { it.endsWith(".xml") }.take(4)) {
@@ -140,9 +148,25 @@ class SiteReconEngine @Inject constructor(
             if (urls.size >= MAX_SITEMAP_URLS) break
         }
 
+        toolkit.record(ReconCheck("robots-and-sitemaps", if (sitemapUrlCount > 0) "ok" else "empty",
+            "robots.txt ${if (robots.body != null) "read" else "unavailable"}; ${sitemapsRead.size} sitemap files read, $sitemapUrlCount URLs"))
+
+        // Historical URLs (gau / waybackurls style): the site's own past
+        // URLs carry long-lived search and pagination conventions.
+        ReconProgress.stage(ReconProgress.Stage.ARCHIVE, "mining the Wayback and CommonCrawl indexes")
+        val archived = runCatching { toolkit.mineArchive() }
+            .getOrDefault(ReconToolkit.ArchiveResult(emptyList(), 0, 0))
+        urls += archived.urls.take(MAX_ARCHIVE_URLS)
+
         // ── 2. Homepage: links, anchors, the real search form ─────────
+        // One recorded, triaged fetch of the root gives headers for the
+        // tech fingerprint (and the document when none was handed in).
+        ReconProgress.stage(ReconProgress.Stage.FETCH, "fetching the homepage")
+        val homeResponse = runCatching { toolkit.fetch(base, HOMEPAGE_TIMEOUT_MS, "homepage") }.getOrNull()
         val homepageDoc: Document? = when {
             !homepageHtml.isNullOrBlank() -> runCatching { Jsoup.parse(homepageHtml, base) }.getOrNull()
+            homeResponse != null && homeResponse.isHttpOk && homeResponse.body.isNotBlank() ->
+                runCatching { homeResponse.parse() }.getOrNull()
             else -> {
                 val t0 = System.currentTimeMillis()
                 val doc = runCatching { cloudflareBypassEngine.fetchJsoupDocument(base, HOMEPAGE_TIMEOUT_MS) }.getOrNull()
@@ -188,6 +212,37 @@ class SiteReconEngine @Inject constructor(
                 .getOrDefault(StateBlobFindings(emptyList(), null))
         }
 
+        // ── 2b. Heavy recon: fingerprint, deep crawl, scripts, params ──
+        ReconProgress.stage(ReconProgress.Stage.FINGERPRINT, "identifying the CMS / framework / search stack")
+        val tech = runCatching { toolkit.fingerprint(homeResponse, homepageDoc) }.getOrDefault(emptyList())
+
+        ReconProgress.stage(ReconProgress.Stage.CRAWL, "crawling the site's own link graph")
+        val crawl = try {
+            toolkit.crawl(homepageDoc)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            ReconToolkit.CrawlResult(emptyList(), emptySet(), emptyList())
+        }
+        urls += crawl.links
+
+        ReconProgress.stage(ReconProgress.Stage.SCRIPTS, "mining JavaScript and source maps for endpoints")
+        val harvest = runCatching { toolkit.scriptTexts(homepageDoc, crawl.docs.take(3)) }
+            .getOrDefault(ReconToolkit.ScriptHarvest(emptyList(), 0))
+        val scripts = harvest.texts
+        val jsEndpoints = runCatching { toolkit.mineJsEndpoints(scripts) }.getOrDefault(emptyList())
+        val hostedSearch = runCatching { toolkit.mineHostedSearch(scripts) }.getOrDefault(emptyList())
+
+        ReconProgress.stage(ReconProgress.Stage.TRIAGE, "triaging discovered endpoints")
+        runCatching {
+            toolkit.triageEndpoints(jsEndpoints.filter { e ->
+                listOf("/api", "/ajax", "search", ".json", "graphql", "wp-json").any { e.contains(it, ignoreCase = true) }
+            })
+        }
+        val minedParams = runCatching {
+            toolkit.mineParameters(urls, listOfNotNull(homepageDoc) + crawl.docs, scripts)
+        }.getOrDefault(emptyMap())
+
         // ── 3. Existing endpoint recon (JS analysis, CMS/API probes) ──
         val discovered = withTimeoutOrNull(DISCOVERY_TIMEOUT_MS) {
             runCatching { endpointDiscoveryEngine.discoverEndpoints(base) }.getOrNull()
@@ -200,14 +255,106 @@ class SiteReconEngine @Inject constructor(
         val pagination = detectPagination(sameHostUrls)
         val probeQuery = deriveProbeQuery(sameHostUrls, homepageDoc, anchorTexts)
 
+        // ── 2c. Burp-style live capture of the site's OWN search ──────
+        // Highest-value technique: drive the site's real search UI in the
+        // WebView with the probe term and watch what request it makes.
+        ReconProgress.stage(
+            ReconProgress.Stage.LIVE_CAPTURE,
+            "typing the probe term into the site's own search and capturing the request"
+        )
+        val capture = if (probeQuery != null && toolkit.timeLeft() > LIVE_CAPTURE_RESERVE_MS) {
+            try {
+                withTimeoutOrNull(LIVE_CAPTURE_TIMEOUT_MS + 5_000) {
+                    LiveSearchCapture.capture(base, probeQuery, LIVE_CAPTURE_TIMEOUT_MS.toInt())
+                }
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                null
+            }
+        } else null
+        toolkit.record(
+            ReconCheck(
+                "live-search-capture",
+                when {
+                    capture == null -> "skipped"
+                    capture.searchRequests.isNotEmpty() -> "ok"
+                    else -> "empty"
+                },
+                when {
+                    probeQuery == null -> "no probe term from the site's own content, so its search could not be driven"
+                    capture == null -> "the WebView capture could not run inside the remaining recon budget"
+                    else -> capture.detail + "; " +
+                        "${capture.allRequests.size} requests intercepted, " +
+                        "${capture.searchRequests.size} carried the probe term, " +
+                        "${capture.suggestRequests.size} were autocomplete traffic"
+                }
+            )
+        )
+
+        // ── 2d. Indexer definition lookup (Jackett / Prowlarr) ────────
+        ReconProgress.stage(ReconProgress.Stage.INDEXER_DEFINITION, "looking this host up in the Cardigann definitions")
+        val definition = runCatching {
+            IndexerDefinitionLibrary.lookup(baseHost, startedAt + RECON_BUDGET_MS - DEFINITION_RESERVE_MS)
+        }.getOrNull()
+        toolkit.record(
+            ReconCheck(
+                "indexer-definition-lookup",
+                if (definition != null) "ok" else "empty",
+                definition?.evidence
+                    ?: "no Jackett or Prowlarr Cardigann definition declares $baseHost in its links/legacylinks"
+            )
+        )
+
+        // ── 2e. Soft-404 calibration, then the wordlist and params ────
+        val baseline = runCatching { toolkit.calibrateSoftNotFound() }
+            .getOrDefault(SoftNotFoundBaseline())
+
         // ── Candidates ─────────────────────────────────────────────────
         val candidates = mutableListOf<SearchCandidate>()
+
+        // (0) The request the site's own search actually made, captured live.
+        // Nothing beats watching the site do it: route, method, body, headers
+        // and cookies are observed rather than inferred.
+        capture?.searchRequests?.forEach { captured ->
+            candidates += SearchCandidate(
+                urlTemplate = captured.urlTemplate,
+                postData = captured.bodyTemplate,
+                source = CandidateSource.LIVE_CAPTURE,
+                headers = captured.headers,
+                cookie = captured.cookie,
+                queryParam = captured.queryParam,
+                isJson = captured.isJson,
+                evidence = captured.evidence
+            )
+        }
+
+        // (0b) A matching Cardigann indexer definition: the search path,
+        // parameters and row selectors hundreds of trackers are known by.
+        definition?.let { d ->
+            candidates += SearchCandidate(
+                urlTemplate = d.urlTemplate.replace("{baseUrl}", base),
+                postData = d.postBody,
+                source = CandidateSource.INDEXER_DEFINITION,
+                queryParam = d.queryParam,
+                rowsSelector = d.rowsSelector,
+                definitionTitleSelector = d.titleSelector,
+                definitionLinkSelector = d.linkSelector,
+                evidence = d.evidence
+            )
+        }
 
         // The site's real search forms — highest trust, ranked first.
         // Sites often carry several (header + dedicated search page
         // forms, GET + POST variants); each distinct one is a candidate.
         if (homepageDoc != null) {
             runCatching { harvestSearchForms(homepageDoc, base, pagination.param) }
+                .getOrDefault(emptyList())
+                .forEach { candidates += it }
+        }
+        // Forms on crawled inner pages (a dedicated /search page, etc.).
+        for (doc in crawl.docs) {
+            runCatching { harvestSearchForms(doc, base, pagination.param) }
                 .getOrDefault(emptyList())
                 .forEach { candidates += it }
         }
@@ -242,6 +389,69 @@ class SiteReconEngine @Inject constructor(
             candidates += SearchCandidate(urlTemplate = it, source = CandidateSource.SITEMAP_DERIVED)
         }
 
+        // Hosted search services the page published credentials for.
+        hostedSearch.forEach { hosted ->
+            candidates += SearchCandidate(
+                urlTemplate = hosted.url,
+                postData = hosted.body,
+                source = CandidateSource.HOSTED_SEARCH,
+                headers = hosted.headers,
+                isJson = true,
+                evidence = hosted.evidence
+            )
+        }
+
+        // Wordlist routes (ffuf / gobuster / dirsearch style), fingerprint
+        // prioritized and soft-404 calibrated — only live-verified hits. A hit
+        // whose shape came from the stack fingerprint is labelled as such.
+        ReconProgress.stage(ReconProgress.Stage.WORDLIST, "probing search routes against the soft-404 baseline")
+        val stackRoutes = runCatching { StackSignatures.routesFor(tech) }.getOrDefault(emptyList())
+            .map { base.trimEnd('/') + it }.toSet()
+        val wordlist = runCatching { toolkit.probeWordlist(probeQuery, tech, baseline) }
+            .getOrDefault(ReconToolkit.WordlistOutcome(emptyList(), emptyList(), 0))
+        wordlist.hits.forEach { hit ->
+            candidates += SearchCandidate(
+                urlTemplate = hit.template,
+                source = if (hit.template in stackRoutes) CandidateSource.STACK_SIGNATURE else CandidateSource.WORDLIST,
+                isJson = hit.isJson,
+                evidence = hit.evidence
+            )
+        }
+
+        // Active parameter discovery (Arjun style) on the paths the site's own
+        // pages and the wordlist pointed at.
+        ReconProgress.stage(ReconProgress.Stage.PARAMS, "testing which query parameter the site's search really uses")
+        val paramPaths = buildList {
+            wordlist.hits.forEach { add(it.template.substringBefore('?')) }
+            add("$base/search")
+            add(base)
+        }.distinct().filter { it.startsWith("http") }
+        val activeParams = runCatching { toolkit.discoverActiveParams(paramPaths, probeQuery, baseline) }
+            .getOrDefault(emptyList())
+        activeParams.forEach { found ->
+            val sep = if (found.path.contains('?')) "&" else "?"
+            candidates += SearchCandidate(
+                urlTemplate = "${found.path}$sep${found.param}={query}&${pagination.param ?: "page"}={page}",
+                source = CandidateSource.ACTIVE_PARAM,
+                queryParam = found.param,
+                evidence = found.evidence
+            )
+        }
+
+        // Search-shaped URLs the site itself used in the past.
+        archived.urls.asSequence()
+            .filter { it.contains('?') }
+            .mapNotNull { archivedSearchTemplate(it) }
+            .distinct()
+            .take(MAX_ARCHIVE_CANDIDATES)
+            .forEach { template ->
+                candidates += SearchCandidate(
+                    urlTemplate = template,
+                    source = CandidateSource.ARCHIVE,
+                    evidence = "a search-shaped URL this site used in the past, from the web archives"
+                )
+            }
+
         // Endpoints named by the page's own scripts and state blobs.
         candidates += scriptCandidates
         stateFindings.endpoints.forEach { endpoint ->
@@ -274,6 +484,7 @@ class SiteReconEngine @Inject constructor(
         }
 
         // ── Ordering / dedup / caps ────────────────────────────────────
+        ReconProgress.stage(ReconProgress.Stage.RANK, "ranking and de-duplicating candidates")
         val ordered = candidates
             .distinctBy { it.urlTemplate to it.postData }
             .sortedWith(
@@ -282,6 +493,18 @@ class SiteReconEngine @Inject constructor(
                     .thenBy { if (it.source == CandidateSource.SITEMAP_DERIVED) 0 else 1 }
             )
             .take(MAX_CANDIDATES)
+
+        // The ledger records every candidate in rank order; the verifier fills
+        // in each one's outcome, so the report can say why the losers lost.
+        val ledger = ordered.mapIndexed { index, candidate ->
+            CandidateLedgerEntry(
+                rank = index + 1,
+                source = candidate.source.name,
+                template = candidate.postData?.let { "${candidate.urlTemplate} [POST $it]" } ?: candidate.urlTemplate,
+                outcome = "not reached",
+                reason = candidate.evidence
+            )
+        }
 
         val median = medianOf(timings)
         val suggestedTimeout = if (timings.isEmpty()) DEFAULT_TIMEOUT_MS
@@ -303,19 +526,50 @@ class SiteReconEngine @Inject constructor(
             mappedUrlCount = sameHostUrls.size,
             fetchTimingsMs = timings.toList(),
             medianResponseMs = median,
-            suggestedTimeoutMs = suggestedTimeout
-        )
+            suggestedTimeoutMs = suggestedTimeout,
+            sitemapsRead = sitemapsRead.toList(),
+            reconMap = toolkit.buildMap(
+                tech = tech,
+                crawl = crawl,
+                params = minedParams,
+                activeParams = activeParams,
+                jsEndpoints = jsEndpoints,
+                sourceMapsRead = harvest.sourceMapsRead,
+                archive = archived,
+                wordlist = wordlist,
+                baseline = baseline,
+                hostedSearch = hostedSearch,
+                capture = capture,
+                definition = definition,
+                ledger = ledger
+            ),
+            liveCapture = capture,
+            definitionMatch = definition
+        ).also { ReconProgress.stage(ReconProgress.Stage.VERIFY, "verifying ${ordered.size} candidates live") }
     }
 
     // ─── Search form harvesting ───────────────────────────────────────
 
+    /**
+     * Candidate priority (spec: live capture > indexer definition > the site's
+     * own form/OpenSearch > JSON API from JS or a stack signature >
+     * wordlist/param discovery > archive). Rank only decides the ORDER in which
+     * candidates are proven; nothing is saved without passing verification.
+     */
     private fun sourceRank(source: CandidateSource): Int = when (source) {
-        CandidateSource.FORM -> 0
-        CandidateSource.OPENSEARCH -> 1
-        CandidateSource.JSON_API -> 2
-        CandidateSource.EMBEDDED_STATE -> 3
-        CandidateSource.DISCOVERED_ENDPOINT -> 4
-        CandidateSource.SITEMAP_DERIVED -> 5
+        CandidateSource.LIVE_CAPTURE -> 0
+        CandidateSource.INDEXER_DEFINITION -> 1
+        CandidateSource.FORM -> 2
+        CandidateSource.OPENSEARCH -> 3
+        CandidateSource.JSON_API -> 4
+        CandidateSource.HOSTED_SEARCH -> 5
+        CandidateSource.EMBEDDED_STATE -> 6
+        CandidateSource.DISCOVERED_ENDPOINT -> 7
+        CandidateSource.STACK_SIGNATURE -> 8
+        CandidateSource.WORDLIST -> 9
+        CandidateSource.ACTIVE_PARAM -> 10
+        CandidateSource.SITEMAP_DERIVED -> 11
+        CandidateSource.ARCHIVE -> 12
     }
 
     /** All distinct search forms on the page (GET and POST variants). */
@@ -798,6 +1052,28 @@ class SiteReconEngine @Inject constructor(
                 !path.endsWith(".xml")
         }.take(10)
 
+    /**
+     * Turn an archived URL that carried a search parameter into a template.
+     * Only URLs whose parameter name is a known search parameter qualify —
+     * an arbitrary old URL is not a search route.
+     */
+    private fun archivedSearchTemplate(raw: String): String? {
+        val url = runCatching { URL(raw) }.getOrNull() ?: return null
+        val pairs = url.query?.split('&')?.map { it.substringBefore('=') to it.substringAfter('=', "") }
+            ?: return null
+        val search = pairs.firstOrNull { it.first.lowercase() in SEARCH_KEYS && it.second.isNotBlank() } ?: return null
+        val origin = "${url.protocol}://${url.host}" + if (url.port > 0) ":${url.port}" else ""
+        var sawPage = false
+        val rebuilt = pairs.joinToString("&") { (key, value) ->
+            when {
+                key == search.first -> "$key={query}"
+                key.lowercase() in PAGE_PARAMS -> { sawPage = true; "$key={page}" }
+                else -> "$key=$value"
+            }
+        }
+        return "$origin${url.path}?$rebuilt" + if (sawPage) "" else "&page={page}"
+    }
+
     private fun medianOf(values: List<Long>): Long {
         if (values.isEmpty()) return 0L
         val sorted = values.sorted()
@@ -818,12 +1094,27 @@ class SiteReconEngine @Inject constructor(
         private const val MAX_SITEMAP_FILES = 6
         private const val MAX_SITEMAP_URLS = 1_500
         private const val MAX_TEMPLATES = 6
-        private const val MAX_CANDIDATES = 8
+        private const val MAX_CANDIDATES = 14
         private const val MAX_FORM_CANDIDATES = 3
         private const val MAX_SCRIPT_FILES = 3
         private const val MAX_SCRIPT_CANDIDATES = 4
         private const val MAX_FEED_LINKS = 50
         private const val MAX_JSON_PROBES = 3
+        /**
+         * Whole-recon time budget (the repository's outer timeout is a backstop
+         * above it). The heavy techniques — a 60-page crawl, a ~250-route
+         * calibrated wordlist sweep, the WebView search capture, active
+         * parameter discovery and the definition lookup — need real room; the
+         * analyzer UI observes the run to completion rather than racing it.
+         */
+        private const val RECON_BUDGET_MS = 75_000L
+        /** Don't start the WebView capture without room for it to finish. */
+        private const val LIVE_CAPTURE_RESERVE_MS = 34_000L
+        private const val LIVE_CAPTURE_TIMEOUT_MS = 28_000L
+        /** Leave the definition lookup out of the last stretch of the budget. */
+        private const val DEFINITION_RESERVE_MS = 25_000L
+        private const val MAX_ARCHIVE_CANDIDATES = 3
+        private const val MAX_ARCHIVE_URLS = 400
 
         private val SCRIPT_URL_LITERAL_REGEX =
             Regex("""['"`](/(?:api|ajax|search|wp-json)[^'"`\s]*?)['"`]""", RegexOption.IGNORE_CASE)
@@ -885,7 +1176,15 @@ data class SiteRecon(
     val fetchTimingsMs: List<Long>,
     val medianResponseMs: Long,
     /** Timeout to record on the saved config, derived from measured timing. */
-    val suggestedTimeoutMs: Int
+    val suggestedTimeoutMs: Int,
+    /** Sitemap files actually read (robots-declared and conventional). */
+    val sitemapsRead: List<String> = emptyList(),
+    /** Heavy-recon evidence: fingerprint, crawl, params, JS endpoints, archive, wordlist, triage, checks. */
+    val reconMap: ReconMap = ReconMap(),
+    /** The WebView capture of the site's own search, when one ran. */
+    val liveCapture: LiveSearchCapture.CaptureResult? = null,
+    /** The matching Cardigann indexer definition, when one was found. */
+    val definitionMatch: IndexerDefinitionLibrary.DefinitionMatch? = null
 )
 
 /**
@@ -897,6 +1196,18 @@ data class SearchCandidate(
     /** Non-null for POST search forms; the encoded body containing {query}. */
     val postData: String? = null,
     val source: CandidateSource,
+    /** Request headers this route needs (captured live, or a definition's). */
+    val headers: Map<String, String> = emptyMap(),
+    /** Cookie header the site required when this route was observed working. */
+    val cookie: String? = null,
+    /** The query parameter the term travels in, when it is known. */
+    val queryParam: String? = null,
+    /** Extraction selectors a matched indexer definition supplies. */
+    val rowsSelector: String? = null,
+    val definitionTitleSelector: String? = null,
+    val definitionLinkSelector: String? = null,
+    /** Why this candidate exists — recorded in the candidate ledger. */
+    val evidence: String = "",
     /** True when a live probe proved this route returns JSON search results. */
     val isJson: Boolean = false,
     /** Dot path of the result array in the JSON payload ("" = the root is the array). */
@@ -906,4 +1217,24 @@ data class SearchCandidate(
     val jsonThumbnailField: String? = null
 )
 
-enum class CandidateSource { FORM, OPENSEARCH, SITEMAP_DERIVED, DISCOVERED_ENDPOINT, JSON_API, EMBEDDED_STATE }
+enum class CandidateSource {
+    /** The site's own search request, captured on the wire in the WebView. */
+    LIVE_CAPTURE,
+    /** A matching Jackett/Prowlarr Cardigann indexer definition. */
+    INDEXER_DEFINITION,
+    FORM,
+    OPENSEARCH,
+    JSON_API,
+    /** A hosted search service whose public credentials the page published. */
+    HOSTED_SEARCH,
+    EMBEDDED_STATE,
+    DISCOVERED_ENDPOINT,
+    /** A route shape implied by the fingerprinted stack and proven live. */
+    STACK_SIGNATURE,
+    WORDLIST,
+    /** A parameter that proved query-dependent under active probing. */
+    ACTIVE_PARAM,
+    SITEMAP_DERIVED,
+    /** A search-shaped URL the site used in the past (Wayback/CommonCrawl). */
+    ARCHIVE
+}

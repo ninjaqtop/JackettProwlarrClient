@@ -1,5 +1,7 @@
 package com.aggregatorx.app.engine.scraper
 
+import com.aggregatorx.app.engine.network.HttpTransport
+
 import com.aggregatorx.app.data.model.*
 import com.aggregatorx.app.engine.util.EngineUtils
 import kotlinx.coroutines.delay
@@ -34,7 +36,7 @@ class FallbackEngine @Inject constructor() {
         val strategies = generateStrategies()
         try {
             return executeWithFallback(strategies) { ctx ->
-                Jsoup.connect(url)
+                HttpTransport.connect(url)
                     .userAgent(ctx.userAgent)
                     .header("Referer", ctx.referer)
                     .header("Accept-Encoding", "gzip, deflate, br")

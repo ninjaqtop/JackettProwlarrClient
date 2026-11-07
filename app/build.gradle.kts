@@ -11,6 +11,8 @@ plugins {
 android {
     namespace = "com.aggregatorx.app"
     compileSdk = 36
+    // Same NDK the CI installs and scripts/build_tlsclient_android.sh compiles the Go lib with.
+    ndkVersion = "27.0.12077973"
 
     defaultConfig {
         applicationId = "com.aggregatorx.app"
@@ -25,13 +27,16 @@ android {
             useSupportLibrary = true
         }
 
+        // Must match the ABIs CI builds libtlsclient.so for
+        // (scripts/build_tlsclient_android.sh, .github/workflows/build.yml).
         ndk {
-            abiFilters += "arm64-v8a"
+            abiFilters += listOf("arm64-v8a", "armeabi-v7a", "x86_64")
         }
 
         externalNativeBuild {
             cmake {
-                cppFlags += ""
+                cppFlags += "-std=c++17"
+                arguments += "-DANDROID_STL=c++_static"
             }
         }
     }
@@ -68,6 +73,11 @@ android {
     }
 
     packaging {
+        jniLibs {
+            // libtlsclient.so (built from source into jniLibs) is also CMake's IMPORTED
+            // link input for the bridge; package it exactly once.
+            pickFirsts += "lib/*/libtlsclient.so"
+        }
         resources {
             excludes += "/META-INF/{AL2.0,LGPL2.1}"
             excludes += "META-INF/versions/9/previous-compilation-data.bin"
@@ -151,4 +161,10 @@ dependencies {
 
 kapt {
     correctErrorTypes = true
+}
+
+// Room writes the generated schema JSON here; CI checks the v3->v4 migration's
+// CREATE statement against it (scripts/room_schema_check.py).
+ksp {
+    arg("room.schemaLocation", "$projectDir/schemas")
 }

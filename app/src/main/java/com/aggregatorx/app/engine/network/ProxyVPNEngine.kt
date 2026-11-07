@@ -344,7 +344,13 @@ class ProxyVPNEngine @Inject constructor() {
     }
     
     /**
-     * Create a Jsoup connection with proxy and VPN headers
+     * Create a Jsoup connection with proxy and VPN headers.
+     *
+     * Deliberately NOT on HttpTransport: it routes through a third-party HTTP
+     * proxy, which the native TLS client does not support. Its only caller chain
+     * is media playback (VideoStreamResolver.fetchDocumentWithProxy) and the
+     * unwired UnifiedContentEngine — never search, the Analyzer, recon or
+     * verification (spec §6 scope).
      */
     fun createProxyConnection(url: String): Connection {
         val proxy = getCurrentProxy()
@@ -461,9 +467,11 @@ class ProxyVPNEngine @Inject constructor() {
             delay(300L * attempts)
         }
         
-        // Final attempt without proxy
+        // Final attempt without proxy: no proxy is involved any more, so it
+        // rides the app's one transport (native TLS primary, logged
+        // degradation) instead of a separate Jsoup/HttpURLConnection stack.
         try {
-            return@withContext Jsoup.connect(url)
+            return@withContext HttpTransport.connect(url)
                 .userAgent(USER_AGENT)
                 .timeout(15000)
                 .get()

@@ -70,6 +70,7 @@ fun SearchScreen(
     val myAiResults          by viewModel.myAiResults.collectAsState()
     val videoExtractionState by viewModel.videoExtractionState.collectAsState()
     val downloads            by viewModel.downloads.collectAsState()
+    val transportHealth      by com.aggregatorx.app.engine.network.HttpTransport.health.collectAsState()
     val context              = LocalContext.current
     val listState            = rememberLazyListState()
     val scope                = rememberCoroutineScope()
@@ -133,6 +134,12 @@ fun SearchScreen(
         // ── SCROLLABLE CONTENT ────────────────────────────────────────────
         Column(modifier = Modifier.fillMaxSize()) {
             Spacer(Modifier.height(contentTopPad))
+
+            // Spec §6: degradation from the native TLS client to plain OkHttp
+            // is never silent — it is shown here with its reason.
+            if (transportHealth.degraded) {
+                TransportDegradedBanner(transportHealth)
+            }
 
             // ── CONTENT ──────────────────────────────────────────────────
             when {
@@ -559,7 +566,8 @@ fun QuickTabsRow(
                 activeTab = activeTab,
                 onSelect  = onTabSelected,
                 count     = pr.results.size,
-                isLoading = pr.status == ProviderSearchStatus.SEARCHING || pr.provider.id in loadingProviderIds,
+                isLoading = pr.status == ProviderSearchStatus.SEARCHING || pr.status == ProviderSearchStatus.PENDING ||
+                    pr.provider.id in loadingProviderIds,
                 status    = pr.status,
                 onRefresh = { onRefreshProvider(pr.provider.id) }
             )
@@ -609,7 +617,7 @@ fun QuickTab(
                         .clip(CircleShape)
                         .background(
                             when (status) {
-                                ProviderSearchStatus.READY -> TextTertiary
+                                ProviderSearchStatus.READY, ProviderSearchStatus.PENDING -> TextTertiary
                                 ProviderSearchStatus.EMPTY -> AccentOrange
                                 ProviderSearchStatus.FAILED, ProviderSearchStatus.TIMED_OUT -> AccentRed
                                 ProviderSearchStatus.RESULTS -> AccentGreen
@@ -837,6 +845,19 @@ fun ResultsFeed(
                 )
             }
 
+            pr.fallbackNote?.let { note ->
+                item(key = "fallback_$providerId") {
+                    Text(
+                        "Fallback: $note",
+                        color = AccentOrange,
+                        fontSize = 10.sp,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp)
+                    )
+                }
+            }
+
             items(pageResults, key = { "${providerId}_${it.url.hashCode()}" }) { result ->
                 ShieldedResultCard(
                     result = result, isLiked = result.url in likedUrls,
@@ -870,7 +891,7 @@ private fun ProviderStatusCard(
     onRefresh: () -> Unit
 ) {
     val statusColor = when (providerResult.status) {
-        ProviderSearchStatus.READY -> TextTertiary
+        ProviderSearchStatus.READY, ProviderSearchStatus.PENDING -> TextTertiary
         ProviderSearchStatus.SEARCHING -> CyberCyan
         ProviderSearchStatus.EMPTY -> AccentOrange
         ProviderSearchStatus.FAILED, ProviderSearchStatus.TIMED_OUT -> AccentRed
@@ -878,6 +899,7 @@ private fun ProviderStatusCard(
     }
     val statusText = when (providerResult.status) {
         ProviderSearchStatus.READY -> "Ready to search"
+        ProviderSearchStatus.PENDING -> "Pending (queued)"
         ProviderSearchStatus.SEARCHING -> "Searching live site"
         ProviderSearchStatus.EMPTY -> providerResult.errorMessage ?: "No results for this query"
         ProviderSearchStatus.TIMED_OUT -> "Timed out; other providers continued"
@@ -924,6 +946,17 @@ private fun ProviderStatusCard(
                     overflow = TextOverflow.Ellipsis
                 )
                 Text(statusText, color = TextTertiary, fontSize = 10.sp, maxLines = 2)
+                // Every fallback (WebView JS rendering, the site's form in the
+                // WebView, OkHttp degradation) is shown, never silent.
+                providerResult.fallbackNote?.let { note ->
+                    Text(
+                        "Fallback: $note",
+                        color = AccentOrange,
+                        fontSize = 10.sp,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
             }
             if (providerResult.status != ProviderSearchStatus.SEARCHING) {
                 IconButton(onClick = onRefresh, enabled = !isRefreshing, modifier = Modifier.size(32.dp)) {
@@ -1689,6 +1722,27 @@ fun FeatureChip(
                 color = color,
                 style = MaterialTheme.typography.labelMedium
             )
+        }
+    }
+}
+
+
+@Composable
+private fun TransportDegradedBanner(health: com.aggregatorx.app.engine.network.TransportHealth) {
+    Surface(
+        modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp, vertical = 4.dp),
+        color = DarkCard,
+        shape = RoundedCornerShape(8.dp)
+    ) {
+        Column(Modifier.padding(horizontal = 10.dp, vertical = 6.dp)) {
+            Text(
+                if (health.nativeLoaded) "TLS FALLBACK IN USE" else "NATIVE TLS UNAVAILABLE — DEGRADED",
+                color = if (health.nativeLoaded) AccentOrange else AccentRed,
+                fontSize = 10.sp,
+                fontWeight = FontWeight.Bold,
+                letterSpacing = 1.sp
+            )
+            Text(health.summary(), color = TextSecondary, fontSize = 10.sp, maxLines = 3)
         }
     }
 }
