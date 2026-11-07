@@ -104,6 +104,15 @@ object TlsClient {
         get() = unavailableReasonInternal.ifBlank { null }
 
     /**
+     * JNI entry point implemented in app/src/main/cpp/native-lib.cpp as
+     * `Java_com_aggregatorx_app_engine_network_TlsClient_requestNative` (instance
+     * method on this object, so the native side receives the singleton as `jobject`).
+     * The bridge is compiled from source by CMake for this exact class; CI checks the
+     * exported symbol name against this package (scripts/native_pair_check.py).
+     */
+    private external fun requestNative(json: String): String
+
+    /**
      * Blocking native request. Callers must run this off the main thread and bound
      * it — [HttpTransport] does both.
      */
@@ -118,7 +127,7 @@ object TlsClient {
 
         return try {
             val requestJson = json.encodeToString(request)
-            val responseJson = com.aggregatorx.apq.engine.network.TlsClient.requestNative(requestJson)
+            val responseJson = requestNative(requestJson)
             json.decodeFromString<TlsResponse>(responseJson)
         } catch (e: UnsatisfiedLinkError) {
             bindError = e

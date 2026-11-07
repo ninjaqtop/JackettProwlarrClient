@@ -41,3 +41,7 @@ Thumbs.db
 # Jupyter
 *.ipynb_checkpoints/
 new-workspace.jupyterlab-workspace
+
+# Native TLS library: built from source in CI by scripts/build_tlsclient_android.sh
+app/src/main/jniLibs/*/libtlsclient.so
+app/src/main/cpp/generated/
