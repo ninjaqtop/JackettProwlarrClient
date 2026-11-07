@@ -87,4 +87,20 @@ object DatabaseMigrations {
             db.execSQL("ALTER TABLE `site_analysis` ADD COLUMN `verificationReason` TEXT")
         }
     }
+
+    /** v5 column added to `scraping_configs` by [MIGRATION_4_5]; checked against Room's schema in CI. */
+    const val ADD_RENDER_MODE_V5 = "ALTER TABLE `scraping_configs` ADD COLUMN `renderMode` TEXT NOT NULL DEFAULT 'RAW'"
+
+    /**
+     * Version 5: `scraping_configs.renderMode` records whether verification proved the
+     * search over raw HTTP, only after JavaScript rendering, or via the site's form in
+     * the WebView, so search repeats the proven path. Existing rows are RAW (their
+     * route was proven, or will be re-proven, over raw HTTP); a JS-rendered page still
+     * falls back to the WebView at search time when raw HTTP yields nothing parseable.
+     */
+    val MIGRATION_4_5 = object : Migration(4, 5) {
+        override fun migrate(db: SupportSQLiteDatabase) {
+            db.execSQL(ADD_RENDER_MODE_V5)
+        }
+    }
 }

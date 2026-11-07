@@ -177,6 +177,12 @@ data class ProviderSearchResults(
     val totalResults: Int = results.size,
     val hasMore: Boolean = false,
     val nextPageUrl: String? = null,
+    /**
+     * User-visible note on how this provider was actually fetched when it was not
+     * the primary path (native TLS raw HTTP): WebView JS rendering, the site's form
+     * in the WebView, or the logged OkHttp degradation. Null = primary path only.
+     */
+    val fallbackNote: String? = null,
     val status: ProviderSearchStatus = when {
         success && results.isNotEmpty() -> ProviderSearchStatus.RESULTS
         success -> ProviderSearchStatus.EMPTY
@@ -332,10 +338,25 @@ data class ScrapingConfig(
     val verified: Boolean = false,
     val verifiedAt: Long = 0L,
     /** Overall verification confidence (0..1). */
-    val confidence: Float = 0f
+    val confidence: Float = 0f,
+    /**
+     * How verification proved this search works, so search repeats it exactly:
+     * [RenderMode.RAW] (plain HTTP through HttpTransport), [RenderMode.RENDER]
+     * (the route only yields results after JavaScript runs: render it in the
+     * embedded WebView) or [RenderMode.FORM] (the site's own form submitted in
+     * the WebView).
+     */
+    val renderMode: String = RenderMode.RAW
 ) {
     /** The row key is the provider ID; kept for call sites that read `config.id`. */
     val id: String get() = providerId
+}
+
+/** Values of [ScrapingConfig.renderMode]. */
+object RenderMode {
+    const val RAW = "RAW"
+    const val RENDER = "RENDER"
+    const val FORM = "FORM"
 }
 
 /**

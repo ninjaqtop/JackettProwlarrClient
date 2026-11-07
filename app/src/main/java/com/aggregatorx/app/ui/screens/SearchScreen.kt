@@ -845,6 +845,19 @@ fun ResultsFeed(
                 )
             }
 
+            pr.fallbackNote?.let { note ->
+                item(key = "fallback_$providerId") {
+                    Text(
+                        "Fallback: $note",
+                        color = AccentOrange,
+                        fontSize = 10.sp,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis,
+                        modifier = Modifier.padding(horizontal = 12.dp, vertical = 2.dp)
+                    )
+                }
+            }
+
             items(pageResults, key = { "${providerId}_${it.url.hashCode()}" }) { result ->
                 ShieldedResultCard(
                     result = result, isLiked = result.url in likedUrls,
@@ -933,6 +946,17 @@ private fun ProviderStatusCard(
                     overflow = TextOverflow.Ellipsis
                 )
                 Text(statusText, color = TextTertiary, fontSize = 10.sp, maxLines = 2)
+                // Every fallback (WebView JS rendering, the site's form in the
+                // WebView, OkHttp degradation) is shown, never silent.
+                providerResult.fallbackNote?.let { note ->
+                    Text(
+                        "Fallback: $note",
+                        color = AccentOrange,
+                        fontSize = 10.sp,
+                        maxLines = 3,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
             }
             if (providerResult.status != ProviderSearchStatus.SEARCHING) {
                 IconButton(onClick = onRefresh, enabled = !isRefreshing, modifier = Modifier.size(32.dp)) {

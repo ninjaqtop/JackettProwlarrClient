@@ -205,7 +205,8 @@ class AggregatorRepository @Inject constructor(
 
     suspend fun searchProviderPage(providerId: String, query: String, pageOffset: Int): ProviderSearchResults? {
         val provider = providerDao.getProviderById(providerId) ?: return null
-        return scrapingEngine.searchProviderSmart(provider, query, pageOffset)
+        // Same display filter + classification gate as the aggregate search.
+        return scrapingEngine.searchProviderPage(provider, query, pageOffset)
     }
     
     suspend fun aggregateSearchResults(
@@ -315,7 +316,7 @@ class AggregatorRepository @Inject constructor(
                     VerifierCandidate(
                         existing,
                         "Existing saved config",
-                        isFormRoute = existing.postData != null
+                        isFormRoute = existing.postData != null || existing.renderMode == RenderMode.FORM
                     )
                 ),
                 recon?.probeQuery,

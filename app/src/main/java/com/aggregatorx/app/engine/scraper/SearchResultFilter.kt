@@ -62,10 +62,12 @@ object SearchResultFilter {
             hasQueryAffinity(result, query, processedQuery)
         }
 
-        val selected = relevant.ifEmpty {
-            structurallyValid.filter { it.relevanceScore >= MIN_RELEVANCE_SCORE }
-        }
-        return selected
+        // No query-affinity match means no results: the old fallback here
+        // ("nothing matched → show everything scoring >= 5") is exactly how a
+        // nonsense query or a site's "popular items" filler reached the screen.
+        // Spec §4: the filter keeps ONLY results matching the query, and a
+        // nonsense query ends in an honest empty state.
+        return relevant
             .sortedByDescending { it.relevanceScore }
             .take(limit)
     }

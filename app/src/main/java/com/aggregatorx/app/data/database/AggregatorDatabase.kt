@@ -20,7 +20,7 @@ import com.aggregatorx.app.data.model.UserPreferences
         LikedResult::class,
         LearnedUserProfile::class
     ],
-    version = 4,
+    version = 5,
     exportSchema = true
 )
 abstract class AggregatorDatabase : RoomDatabase() {

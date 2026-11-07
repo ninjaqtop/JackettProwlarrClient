@@ -3,6 +3,7 @@ package com.aggregatorx.app.engine.analyzer
 import com.aggregatorx.app.engine.network.HttpTransport
 
 import com.aggregatorx.app.data.model.Provider
+import com.aggregatorx.app.data.model.RenderMode
 import com.aggregatorx.app.data.model.ScrapingConfig
 import com.aggregatorx.app.engine.ml.DeterministicAnalysisHelper
 import com.aggregatorx.app.engine.network.TlsClient
@@ -323,6 +324,7 @@ class SearchConfigVerifier @Inject constructor() {
             )
         }
         effectiveConfig = finalizeConfig(effectiveConfig, extraction.pairs, page2, confidence.overall)
+            .copy(renderMode = RenderMode.RAW)
 
         val verdict = ProbeVerdict(
             sourceLabel = label,
@@ -403,7 +405,8 @@ class SearchConfigVerifier @Inject constructor() {
                     val renderedPage2 = Page2Proof(false, extraction.effectiveConfig, null, 0,
                         "page 2 not fetched for a rendered form search (pagination left unrecorded)", 0L)
                     return CandidateAttempt.Passed(
-                        config = finalizeConfig(extraction.effectiveConfig, extraction.pairs, renderedPage2, confidence.overall),
+                        config = finalizeConfig(extraction.effectiveConfig, extraction.pairs, renderedPage2, confidence.overall)
+                            .copy(renderMode = RenderMode.FORM),
                         verdict = ProbeVerdict(
                             sourceLabel = label,
                             probedUrl = provider.baseUrl,
@@ -491,7 +494,8 @@ class SearchConfigVerifier @Inject constructor() {
         val renderedPage2 = Page2Proof(false, extraction.effectiveConfig, null, 0,
             "page 2 not fetched for a rendered-only route (pagination left unrecorded)", 0L)
         return CandidateAttempt.Passed(
-            config = finalizeConfig(extraction.effectiveConfig, extraction.pairs, renderedPage2, confidence.overall),
+            config = finalizeConfig(extraction.effectiveConfig, extraction.pairs, renderedPage2, confidence.overall)
+                .copy(renderMode = RenderMode.RENDER),
             verdict = ProbeVerdict(
                 sourceLabel = label,
                 probedUrl = probeUrl,

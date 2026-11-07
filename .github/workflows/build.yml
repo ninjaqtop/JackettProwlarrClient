@@ -80,7 +80,7 @@ jobs:
           python3 scripts/native_pair_check.py --apk app/build/outputs/apk/debug/app-debug.apk \
             --abis arm64-v8a,armeabi-v7a,x86_64
 
-      - name: Verify Room v3->v4 migration matches the generated schema
+      - name: Verify Room migrations (v3->v4->v5) match the generated schema
         run: python3 scripts/room_schema_check.py
 
       - name: Rename and stage APK
