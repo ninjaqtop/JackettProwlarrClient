@@ -110,7 +110,8 @@ class SearchConfigVerifier @Inject constructor() {
                 is CandidateAttempt.Passed -> return@withContext VerificationOutcome.Verified(
                     config = result.config,
                     verdict = result.verdict,
-                    repaired = result.repaired
+                    repaired = result.repaired,
+                    losingReasons = reasons.toList()
                 )
                 is CandidateAttempt.Failed -> {
                     reasons += result.reason
@@ -152,7 +153,8 @@ class SearchConfigVerifier @Inject constructor() {
                     is CandidateAttempt.Passed -> return@withContext VerificationOutcome.Verified(
                         config = result.config,
                         verdict = result.verdict,
-                        repaired = result.repaired
+                        repaired = result.repaired,
+                        losingReasons = reasons.toList()
                     )
                     is CandidateAttempt.Failed -> reasons += result.reason
                     null -> {
@@ -1385,7 +1387,13 @@ sealed class VerificationOutcome {
     data class Verified(
         val config: ScrapingConfig,
         val verdict: ProbeVerdict,
-        val repaired: Boolean
+        val repaired: Boolean,
+        /**
+         * Why each candidate ranked ABOVE the winner lost, in rank order, so
+         * the analyzer report can say what was tried and rejected rather than
+         * only what succeeded.
+         */
+        val losingReasons: List<String> = emptyList()
     ) : VerificationOutcome()
 
     data class Rejected(

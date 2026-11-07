@@ -260,7 +260,7 @@ class SiteReconEngine @Inject constructor(
         // WebView with the probe term and watch what request it makes.
         ReconProgress.stage(
             ReconProgress.Stage.LIVE_CAPTURE,
-            "typing \"${'$'}{probeQuery ?: "?"}\" into the site's own search and capturing the request"
+            "typing the probe term into the site's own search and capturing the request"
         )
         val capture = if (probeQuery != null && toolkit.timeLeft() > LIVE_CAPTURE_RESERVE_MS) {
             try {
@@ -285,9 +285,9 @@ class SiteReconEngine @Inject constructor(
                     probeQuery == null -> "no probe term from the site's own content, so its search could not be driven"
                     capture == null -> "the WebView capture could not run inside the remaining recon budget"
                     else -> capture.detail + "; " +
-                        "${'$'}{capture.allRequests.size} requests intercepted, " +
-                        "${'$'}{capture.searchRequests.size} carried the probe term, " +
-                        "${'$'}{capture.suggestRequests.size} were autocomplete traffic"
+                        "${capture.allRequests.size} requests intercepted, " +
+                        "${capture.searchRequests.size} carried the probe term, " +
+                        "${capture.suggestRequests.size} were autocomplete traffic"
                 }
             )
         )
@@ -302,7 +302,7 @@ class SiteReconEngine @Inject constructor(
                 "indexer-definition-lookup",
                 if (definition != null) "ok" else "empty",
                 definition?.evidence
-                    ?: "no Jackett or Prowlarr Cardigann definition declares ${'$'}baseHost in its links/legacylinks"
+                    ?: "no Jackett or Prowlarr Cardigann definition declares $baseHost in its links/legacylinks"
             )
         )
 
@@ -423,7 +423,7 @@ class SiteReconEngine @Inject constructor(
         ReconProgress.stage(ReconProgress.Stage.PARAMS, "testing which query parameter the site's search really uses")
         val paramPaths = buildList {
             wordlist.hits.forEach { add(it.template.substringBefore('?')) }
-            add("${'$'}base/search")
+            add("$base/search")
             add(base)
         }.distinct().filter { it.startsWith("http") }
         val activeParams = runCatching { toolkit.discoverActiveParams(paramPaths, probeQuery, baseline) }
@@ -431,7 +431,7 @@ class SiteReconEngine @Inject constructor(
         activeParams.forEach { found ->
             val sep = if (found.path.contains('?')) "&" else "?"
             candidates += SearchCandidate(
-                urlTemplate = "${'$'}{found.path}${'$'}sep${'$'}{found.param}={query}&${'$'}{pagination.param ?: "page"}={page}",
+                urlTemplate = "${found.path}$sep${found.param}={query}&${pagination.param ?: "page"}={page}",
                 source = CandidateSource.ACTIVE_PARAM,
                 queryParam = found.param,
                 evidence = found.evidence
@@ -500,7 +500,7 @@ class SiteReconEngine @Inject constructor(
             CandidateLedgerEntry(
                 rank = index + 1,
                 source = candidate.source.name,
-                template = candidate.postData?.let { "${'$'}{candidate.urlTemplate} [POST ${'$'}it]" } ?: candidate.urlTemplate,
+                template = candidate.postData?.let { "${candidate.urlTemplate} [POST $it]" } ?: candidate.urlTemplate,
                 outcome = "not reached",
                 reason = candidate.evidence
             )
@@ -545,7 +545,7 @@ class SiteReconEngine @Inject constructor(
             ),
             liveCapture = capture,
             definitionMatch = definition
-        ).also { ReconProgress.stage(ReconProgress.Stage.VERIFY, "verifying ${'$'}{ordered.size} candidates live") }
+        ).also { ReconProgress.stage(ReconProgress.Stage.VERIFY, "verifying ${ordered.size} candidates live") }
     }
 
     // ─── Search form harvesting ───────────────────────────────────────
@@ -1062,16 +1062,16 @@ class SiteReconEngine @Inject constructor(
         val pairs = url.query?.split('&')?.map { it.substringBefore('=') to it.substringAfter('=', "") }
             ?: return null
         val search = pairs.firstOrNull { it.first.lowercase() in SEARCH_KEYS && it.second.isNotBlank() } ?: return null
-        val origin = "${'$'}{url.protocol}://${'$'}{url.host}" + if (url.port > 0) ":${'$'}{url.port}" else ""
+        val origin = "${url.protocol}://${url.host}" + if (url.port > 0) ":${url.port}" else ""
         var sawPage = false
         val rebuilt = pairs.joinToString("&") { (key, value) ->
             when {
-                key == search.first -> "${'$'}key={query}"
-                key.lowercase() in PAGE_PARAMS -> { sawPage = true; "${'$'}key={page}" }
-                else -> "${'$'}key=${'$'}value"
+                key == search.first -> "$key={query}"
+                key.lowercase() in PAGE_PARAMS -> { sawPage = true; "$key={page}" }
+                else -> "$key=$value"
             }
         }
-        return "${'$'}origin${'$'}{url.path}?${'$'}rebuilt" + if (sawPage) "" else "&page={page}"
+        return "$origin${url.path}?$rebuilt" + if (sawPage) "" else "&page={page}"
     }
 
     private fun medianOf(values: List<Long>): Long {

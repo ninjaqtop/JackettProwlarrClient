@@ -1,6 +1,7 @@
 package com.aggregatorx.app.data.repository
 
 import com.aggregatorx.app.data.model.ScrapingConfig
+import com.aggregatorx.app.engine.analyzer.CandidateLedgerEntry
 import com.aggregatorx.app.engine.analyzer.ReconMap
 import com.aggregatorx.app.engine.analyzer.SearchConfigVerifier
 import com.aggregatorx.app.engine.analyzer.SiteRecon
@@ -37,6 +38,9 @@ object AnalysisRecord {
     fun verified(outcome: VerificationOutcome.Verified, probeQuery: String?): JsonObject {
         val v = outcome.verdict
         return buildJsonObject {
+            put("losingCandidates", buildJsonArray {
+                outcome.losingReasons.forEach { add(JsonPrimitive(it)) }
+            })
             put("status", JsonPrimitive("VERIFIED"))
             put("reason", JsonPrimitive(v.reason))
             put("sourceLabel", JsonPrimitive(v.sourceLabel))
@@ -80,6 +84,29 @@ object AnalysisRecord {
         put("previousConfigKept", JsonPrimitive(previousConfigKept))
     }
 
+    /**
+     * Resolve the recon map's candidate ledger against what verification
+     * actually did: the winner is marked won, every candidate whose label the
+     * verifier reported a reason for is marked lost with that reason, and the
+     * rest stay "not reached" (verification stops at the first winner).
+     */
+    private fun resolveLedger(recon: SiteRecon?, winner: ScrapingConfig?, reasons: List<String>): List<CandidateLedgerEntry> {
+        val ledger = recon?.reconMap?.candidateLedger ?: return emptyList()
+        return ledger.map { entry ->
+            val template = entry.template.substringBefore(" [POST")
+            val won = winner != null && template == winner.searchUrlTemplate
+            val lost = reasons.firstOrNull { reason ->
+                // The verifier prefixes each reason with the candidate's label.
+                reason.contains(template.take(80), ignoreCase = true)
+            }
+            when {
+                won -> entry.copy(outcome = "won", reason = "verified live and saved as the provider's config")
+                lost != null -> entry.copy(outcome = "lost", reason = lost)
+                else -> entry
+            }
+        }
+    }
+
     fun build(
         previous: String,
         recon: SiteRecon?,
@@ -92,7 +119,17 @@ object AnalysisRecord {
         val merged = LinkedHashMap(base)
         merged["mapping"] = config?.let { mapping(it) } ?: JsonNull
         merged["siteMap"] = recon?.let { siteMap(it) } ?: JsonNull
-        merged["recon"] = recon?.let { json.encodeToJsonElement(ReconMap.serializer(), it.reconMap) } ?: JsonNull
+        // The recon map, with the candidate ledger resolved to real outcomes.
+        val reasons = buildList {
+            (verification["reasons"] as? JsonArray)?.forEach { r -> (r as? JsonPrimitive)?.content?.let { add(it) } }
+            (verification["losingCandidates"] as? JsonArray)?.forEach { r -> (r as? JsonPrimitive)?.content?.let { add(it) } }
+        }
+        merged["recon"] = recon?.let { r ->
+            json.encodeToJsonElement(
+                ReconMap.serializer(),
+                r.reconMap.copy(candidateLedger = resolveLedger(r, config, reasons))
+            )
+        } ?: JsonNull
         merged["config"] = config?.let { json.encodeToJsonElement(ScrapingConfig.serializer(), it) } ?: JsonNull
         merged["verification"] = verification
         merged["recordedAt"] = JsonPrimitive(System.currentTimeMillis())
@@ -137,6 +174,8 @@ object AnalysisRecord {
                     put("template", JsonPrimitive(c.urlTemplate))
                     put("postData", JsonPrimitive(c.postData))
                     put("source", JsonPrimitive(c.source.name))
+                    put("evidence", JsonPrimitive(c.evidence))
+                    put("queryParam", JsonPrimitive(c.queryParam))
                     put("isJson", JsonPrimitive(c.isJson))
                     put("jsonResultPath", JsonPrimitive(c.jsonResultPath))
                     put("jsonTitleField", JsonPrimitive(c.jsonTitleField))
