@@ -16,6 +16,7 @@ import kotlinx.serialization.json.Json
 import org.json.JSONArray
 import org.json.JSONObject
 import org.jsoup.Jsoup
+import org.jsoup.nodes.Element
 import java.net.URL
 import java.net.URLEncoder
 import java.util.UUID
@@ -118,14 +119,17 @@ class AggregatorRepository @Inject constructor(
         analysis: SiteAnalysis,
         mapping: SiteMapConfigAnalyzer.SiteMapConfig
     ): ScrapingConfig {
-        val template = mapping.searchUrlTemplate ?: buildSearchUrlTemplate(provider.baseUrl, analysis)
+        val searchRequest = mapping.searchUrlTemplate
+            ?.let { GeneratedSearchRequest(urlTemplate = it, postData = mapping.postData) }
+            ?: buildSearchRequestTemplate(provider.baseUrl, analysis)
         return ScrapingConfig(
             // Key the row by provider ID: the entity PK is the provider's ID, so the
             // REPLACE insert in analyzeProvider is a true per-provider upsert (the
             // preceding deleteConfigForProvider also clears any legacy random-ID rows).
             id = provider.id,
             providerId = provider.id,
-            searchUrlTemplate = template,
+            searchUrlTemplate = searchRequest.urlTemplate,
+            postData = searchRequest.postData,
             resultSelector = mapping.resultSelector ?: analysis.resultItemSelector ?: ".item, .result, article",
             titleSelector = mapping.titleSelector ?: analysis.titleSelector ?: "h2, .title, a",
             urlSelector = mapping.linkSelector ?: "a[href]",
@@ -173,22 +177,99 @@ class AggregatorRepository @Inject constructor(
         return root.toString()
     }
 
-    private fun buildSearchUrlTemplate(baseUrl: String, analysis: SiteAnalysis): String {
+    private data class GeneratedSearchRequest(
+        val urlTemplate: String,
+        val postData: String? = null
+    )
+
+    private fun buildSearchRequestTemplate(baseUrl: String, analysis: SiteAnalysis): GeneratedSearchRequest {
         val doc = analysis.rawHtml?.takeIf { it.isNotBlank() }?.let { runCatching { Jsoup.parse(it, analysis.url) }.getOrNull() }
         val form = doc?.let { document ->
             analysis.searchFormSelector?.let { selector -> runCatching { document.selectFirst(selector) }.getOrNull() }
                 ?: document.selectFirst("form:has(input[type=search]), form:has(input[name=q]), form:has(input[name=query]), form:has(input[name=search]), form:has(input[name=s])")
         }
-        if (form != null && !form.attr("method").equals("post", ignoreCase = true)) {
+        if (form != null) {
             val action = form.absUrl("action").ifBlank { analysis.url.ifBlank { baseUrl } }
             val input = form.select("input[type=search], input[name=q], input[name=query], input[name=search], input[name=s], input[name=keyword], input[name=term]").firstOrNull()
             val queryName = input?.attr("name")?.takeIf { it.isNotBlank() } ?: "q"
+            if (form.attr("method").equals("post", ignoreCase = true)) {
+                // POST search form: the bare action is the URL template and the
+                // body template rides in postData, mirroring the sync branch's
+                // buildSearchRequestTemplate, instead of refusing the form and
+                // falling back to a generic GET route that cannot search it.
+                return GeneratedSearchRequest(
+                    urlTemplate = action,
+                    postData = buildPostData(form, queryName)
+                )
+            }
             val fixed = form.select("input[name]").filter { it !== input && it.attr("type").lowercase() in FORM_FIELD_TYPES_IGNORED && it.attr("value").isNotBlank() }
                 .joinToString("&") { "${URLEncoder.encode(it.attr("name"), "UTF-8")}=${URLEncoder.encode(it.attr("value"), "UTF-8")}" }
-            return action + (if (action.contains('?')) "&" else "?") +
-                (if (fixed.isBlank()) "" else "$fixed&") + "${URLEncoder.encode(queryName, "UTF-8")}={query}&page={page}"
+            return GeneratedSearchRequest(
+                action + (if (action.contains('?')) "&" else "?") +
+                    (if (fixed.isBlank()) "" else "$fixed&") + "${URLEncoder.encode(queryName, "UTF-8")}={query}&page={page}"
+            )
         }
-        return "$baseUrl/search?q={query}&page={page}"
+        return GeneratedSearchRequest("$baseUrl/search?q={query}&page={page}")
+    }
+
+    /**
+     * Body template for a POST search form: every named field the form would
+     * submit (submit/button/image/file/password inputs and unchecked
+     * checkbox/radio inputs excluded), with the query field replaced by
+     * {query} and a page field by {page}; page={page} is appended when the
+     * form has no page field. Mirrors the sync branch's
+     * buildSearchRequestTemplate field handling.
+     */
+    private fun buildPostData(form: Element, queryName: String): String {
+        val pairs = form.select("input[name], select[name], textarea[name]").mapNotNull { element ->
+            val name = element.attr("name").trim()
+            if (name.isBlank()) return@mapNotNull null
+            val tag = element.tagName().lowercase()
+            val type = element.attr("type").lowercase()
+            if (tag == "input" && type in setOf("submit", "button", "image", "file", "password")) {
+                return@mapNotNull null
+            }
+            if (tag == "input" && type in setOf("checkbox", "radio") && !element.hasAttr("checked")) {
+                return@mapNotNull null
+            }
+            val isQueryField = name.equals(queryName, ignoreCase = true)
+            val isPageField = name.equals("page", ignoreCase = true) ||
+                name.equals("paged", ignoreCase = true) ||
+                name.equals("p", ignoreCase = true) ||
+                name.equals("page_num", ignoreCase = true)
+            val value = when {
+                isQueryField -> "{query}"
+                isPageField -> "{page}"
+                tag == "select" -> element.selectFirst("option[selected]")?.attr("value")
+                    ?: element.selectFirst("option")?.attr("value")
+                    ?: ""
+                tag == "textarea" -> element.text()
+                else -> element.attr("value")
+            }
+            if (value.isNotBlank() || isQueryField || isPageField) name to value else null
+        }.distinctBy { it.first }
+
+        val parts = pairs
+            .filter { !it.first.equals(queryName, ignoreCase = true) }
+            .map { (fieldName, fieldValue) -> "${encodeTemplateField(fieldName)}=${encodeTemplateField(fieldValue)}" }
+            .toMutableList()
+        parts.add("${encodeTemplateField(queryName)}={query}")
+        if (pairs.none { it.second == "{page}" }) {
+            parts.add("page={page}")
+        }
+        return parts.joinToString("&")
+    }
+
+    private fun encodeTemplateField(value: String): String {
+        val encoded = URLEncoder.encode(
+            value
+                .replace("{query}", "__AGGREGATOR_QUERY_TOKEN__")
+                .replace("{page}", "__AGGREGATOR_PAGE_TOKEN__"),
+            "UTF-8"
+        )
+        return encoded
+            .replace("__AGGREGATOR_QUERY_TOKEN__", "{query}")
+            .replace("__AGGREGATOR_PAGE_TOKEN__", "{page}")
     }
 
     suspend fun analyzeNewUrl(url: String): Pair<Provider, SiteAnalysis> {
