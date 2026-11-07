@@ -186,28 +186,36 @@ class SearchConfigVerifier @Inject constructor() {
      *  pages for the real probe and the nonsense control. */
     private class FormHtmlCache(private val provider: Provider) {
         private var realFetched = false
-        private var realHtml: String? = null
+        private var realPage: HeadlessBrowserHelper.SearchFormPage? = null
         private var nonsenseFetched = false
-        private var nonsenseHtml: String? = null
+        private var nonsensePage: HeadlessBrowserHelper.SearchFormPage? = null
+        /** How many times the nonsense form submission was attempted. */
+        var nonsenseAttempts = 0
+            private set
 
-        suspend fun real(probeQuery: String): String? {
+        private suspend fun submit(query: String): HeadlessBrowserHelper.SearchFormPage? = runCatching {
+            HeadlessBrowserHelper.submitSearchForm(provider.baseUrl, query)
+        }.getOrElse { e -> if (e is CancellationException) throw e; null }
+
+        suspend fun real(probeQuery: String): HeadlessBrowserHelper.SearchFormPage? {
             if (!realFetched) {
                 realFetched = true
-                realHtml = runCatching {
-                    HeadlessBrowserHelper.searchViaHeadlessForm(provider.baseUrl, probeQuery)
-                }.getOrElse { e -> if (e is CancellationException) throw e; null }
+                realPage = submit(probeQuery)
             }
-            return realHtml
+            return realPage
         }
 
-        suspend fun nonsense(): String? {
+        /** The nonsense control, retried once when no page comes back. */
+        suspend fun nonsense(): HeadlessBrowserHelper.SearchFormPage? {
             if (!nonsenseFetched) {
                 nonsenseFetched = true
-                nonsenseHtml = runCatching {
-                    HeadlessBrowserHelper.searchViaHeadlessForm(provider.baseUrl, NONSENSE_QUERY)
-                }.getOrElse { e -> if (e is CancellationException) throw e; null }
+                for (attempt in 1..2) {
+                    nonsenseAttempts = attempt
+                    nonsensePage = submit(NONSENSE_QUERY)
+                    if (nonsensePage != null) break
+                }
             }
-            return nonsenseHtml
+            return nonsensePage
         }
     }
 
@@ -270,12 +278,21 @@ class SearchConfigVerifier @Inject constructor() {
         }
 
         // Negative control: the site's own search must find ~nothing for nonsense.
+        // Retried once on a transport-level failure; still unavailable means
+        // the control is inconclusive and the candidate does NOT pass.
         val nonsenseStart = System.currentTimeMillis()
-        val nonsenseResponse = HttpTransport.executeTls(buildRequest(provider, effectiveConfig, NONSENSE_QUERY))
+        var nonsenseResponse = HttpTransport.executeTls(buildRequest(provider, effectiveConfig, NONSENSE_QUERY))
+        if (nonsenseResponse.error != null || nonsenseResponse.statusCode == 0) {
+            nonsenseResponse = HttpTransport.executeTls(buildRequest(provider, effectiveConfig, NONSENSE_QUERY))
+        }
         slowest = maxOf(slowest, System.currentTimeMillis() - nonsenseStart)
-        if (nonsenseResponse.error != null || nonsenseResponse.statusCode !in 200..399) {
+        // A 404/410 page is the site's own "nothing found" answer: it is a page,
+        // and its items are still counted below.
+        val nonsenseEmptyStatus = nonsenseResponse.statusCode == 404 || nonsenseResponse.statusCode == 410
+        if (nonsenseResponse.error != null || (nonsenseResponse.statusCode !in 200..399 && !nonsenseEmptyStatus)) {
             return CandidateAttempt.Failed(
-                "$label: nonsense control could not be completed (${nonsenseResponse.error ?: "HTTP ${nonsenseResponse.statusCode}"}) — the route did not survive verification",
+                "$label: nonsense control inconclusive: no page returned " +
+                    "(${nonsenseResponse.error ?: "HTTP ${nonsenseResponse.statusCode}"}, after a retry) — the route did not survive verification",
                 gotHttpResponse = true
             )
         }
@@ -312,7 +329,7 @@ class SearchConfigVerifier @Inject constructor() {
             VerificationCheck("route-responds", true, "HTTP ${response.statusCode} in ${responseMs} ms from ${probe.url.take(160)}"),
             VerificationCheck("results-parse", items >= MIN_ITEMS, "$items item results for the probe \"$probeQuery\" (need >= $MIN_ITEMS)"),
             VerificationCheck("items-outnumber-categories", items > categories, "$items items vs $categories category/listing links"),
-            VerificationCheck("nonsense-control-empty", true, "\"$NONSENSE_QUERY\" returned $nonsenseItems items"),
+            VerificationCheck("nonsense-control-empty", nonsensePasses(nonsenseItems, items), "\"$NONSENSE_QUERY\" returned $nonsenseItems items (real search: $items)"),
             VerificationCheck("page-2-exists", page2.proven, page2.detail)
         )
         if (confidence.overall < MIN_AUTOSAVE_CONFIDENCE) {
@@ -368,32 +385,53 @@ class SearchConfigVerifier @Inject constructor() {
         // Source A: submit the site's real form in the headless browser.
         if (candidate.isFormRoute) {
             val formStart = System.currentTimeMillis()
-            val formHtml = formHtmlCache.real(probeQuery)
+            val formPage = formHtmlCache.real(probeQuery)
             slowest = maxOf(slowest, System.currentTimeMillis() - formStart)
-            if (formHtml != null) {
-                val extraction = extractFromBody(formHtml, provider.baseUrl, provider, config, hint, allowRepair = true)
+            if (formPage != null) {
+                val pageBase = formPage.finalUrl.ifBlank { provider.baseUrl }
+                val extraction = extractFromBody(formPage.html, pageBase, provider, config, hint, allowRepair = true)
                 val (items, categories) = classify(extraction.pairs)
                 if (items >= MIN_ITEMS && items > categories) {
+                    // Negative control (spec §2): it must actually run and pass.
+                    // No page after a retry is inconclusive, and inconclusive
+                    // is a failure — never a silent pass.
                     val nonsenseStart = System.currentTimeMillis()
-                    val nonsenseHtml = formHtmlCache.nonsense()
+                    val nonsensePage = formHtmlCache.nonsense()
                     slowest = maxOf(slowest, System.currentTimeMillis() - nonsenseStart)
-                    val nonsenseItems = if (nonsenseHtml != null) {
-                        classify(
-                            extractFromBody(nonsenseHtml, provider.baseUrl, provider, extraction.effectiveConfig, hint, allowRepair = false).pairs
-                        ).first
-                    } else -1
-                    if (nonsenseItems >= 0 && !nonsensePasses(nonsenseItems, items)) {
+                    if (nonsensePage == null) {
                         return CandidateAttempt.Failed(
-                            "$label: rendered form search ignores the query — a nonsense search returned $nonsenseItems items (real search: $items)",
+                            "$label: nonsense control inconclusive: no page returned " +
+                                "(the site's form was submitted for \"$NONSENSE_QUERY\" ${formHtmlCache.nonsenseAttempts} times " +
+                                "and no results page came back), so the form search could not be proven",
                             gotHttpResponse = true
                         )
                     }
+                    val nonsenseItems = classify(
+                        extractFromBody(
+                            nonsensePage.html, nonsensePage.finalUrl.ifBlank { provider.baseUrl },
+                            provider, extraction.effectiveConfig, hint, allowRepair = false
+                        ).pairs
+                    ).first
+                    if (!nonsensePasses(nonsenseItems, items)) {
+                        return CandidateAttempt.Failed(
+                            "$label: rendered form search ignores the query — a nonsense search (\"$NONSENSE_QUERY\") returned " +
+                                "$nonsenseItems items (real search: $items), i.e. it answers nonsense with filler/popular items",
+                            gotHttpResponse = true
+                        )
+                    }
+
+                    // Live page-2 proof from the form's own results page.
+                    val firstPageUrls = extraction.pairs.map { it.second }.toSet()
+                    val page2 = proveFormPage2(provider, extraction.effectiveConfig, probeQuery, formPage, firstPageUrls, hint)
+                    slowest = maxOf(slowest, page2.elapsedMs)
+
                     val confidence = computeConfidence(
                         routeScore = 0.9f,
                         items = items,
                         categories = categories,
-                        paginationProven = extraction.paginationProven,
-                        hint = hint
+                        paginationProven = page2.proven,
+                        hint = hint,
+                        paginationSeen = extraction.paginationProven
                     )
                     if (confidence.overall < MIN_AUTOSAVE_CONFIDENCE) {
                         return CandidateAttempt.Failed(
@@ -402,38 +440,43 @@ class SearchConfigVerifier @Inject constructor() {
                             gotHttpResponse = true
                         )
                     }
-                    val renderedPage2 = Page2Proof(false, extraction.effectiveConfig, null, 0,
-                        "page 2 not fetched for a rendered form search (pagination left unrecorded)", 0L)
+                    val finalConfig = finalizeConfig(page2.config, extraction.pairs, page2, confidence.overall)
+                        .copy(renderMode = RenderMode.FORM)
                     return CandidateAttempt.Passed(
-                        config = finalizeConfig(extraction.effectiveConfig, extraction.pairs, renderedPage2, confidence.overall)
-                            .copy(renderMode = RenderMode.FORM),
+                        config = finalConfig,
                         verdict = ProbeVerdict(
                             sourceLabel = label,
-                            probedUrl = provider.baseUrl,
+                            probedUrl = pageBase,
                             itemCount = items,
                             categoryCount = categories,
-                            nonsenseItemCount = maxOf(nonsenseItems, 0),
+                            nonsenseItemCount = nonsenseItems,
                             responseMs = slowest,
                             slowestProbeMs = slowest,
                             passed = true,
                             rendered = true,
-                            paginationProven = extraction.paginationProven,
+                            paginationProven = page2.proven,
                             confidence = confidence.overall,
                             confidenceDetail = confidence.detail,
                             reason = "Verified in the headless browser via the site's own form: " +
                                 "$items item results, $categories category links, " +
-                                (if (nonsenseItems >= 0) "nonsense control returned $nonsenseItems"
-                                else "nonsense form control inconclusive (no page returned)") +
+                                "nonsense control returned $nonsenseItems, " +
+                                (if (page2.proven) "page 2 proven live (${page2.newItems} new items)" else "pagination not proven") +
                                 ", confidence ${formatScore(confidence.overall)}",
                             checks = listOf(
-                                VerificationCheck("route-responds", true, "site's own form submitted in the headless browser"),
-                                VerificationCheck("results-parse", true, "$items item results"),
+                                VerificationCheck("route-responds", true, "site's own form submitted (results page ${pageBase.take(160)})"),
+                                VerificationCheck("results-parse", true, "$items item results for the probe \"$probeQuery\""),
                                 VerificationCheck("items-outnumber-categories", true, "$items items vs $categories categories"),
-                                VerificationCheck("nonsense-control-empty", nonsenseItems >= 0,
-                                    if (nonsenseItems >= 0) "returned $nonsenseItems items" else "inconclusive: no page returned"),
-                                VerificationCheck("page-2-exists", false, renderedPage2.detail)
+                                VerificationCheck(
+                                    "nonsense-control-empty", true,
+                                    "\"$NONSENSE_QUERY\" returned $nonsenseItems items (real search: $items)" +
+                                        if (formHtmlCache.nonsenseAttempts > 1) " after a retry" else ""
+                                ),
+                                VerificationCheck("page-2-exists", page2.proven, page2.detail)
                             ),
-                            fieldConfidence = confidence.fields
+                            fieldConfidence = confidence.fields,
+                            page2Url = page2.url,
+                            page2NewItems = page2.newItems,
+                            paginationRule = finalConfig.paginationRule
                         ),
                         repaired = extraction.repaired
                     )
@@ -444,9 +487,7 @@ class SearchConfigVerifier @Inject constructor() {
         // Source B: render the candidate's own probe URL.
         val probeUrl = buildRequest(provider, config, probeQuery).url
         val renderStart = System.currentTimeMillis()
-        val renderedHtml = runCatching {
-            HeadlessBrowserHelper.fetchPageContent(probeUrl, RENDER_TIMEOUT_MS)
-        }.getOrNull()
+        val renderedHtml = renderPage(probeUrl)
         slowest = maxOf(slowest, System.currentTimeMillis() - renderStart)
         if (renderedHtml == null) {
             return CandidateAttempt.Failed(
@@ -462,27 +503,49 @@ class SearchConfigVerifier @Inject constructor() {
                 gotHttpResponse = true
             )
         }
-        // Nonsense control over raw HTTP: a JS app's raw route still has
-        // to stay silent for nonsense; if it echoes the same items, the
-        // "results" were the app's shell content, not search output.
-        val nonsenseResponse = HttpTransport.executeTls(buildRequest(provider, extraction.effectiveConfig, NONSENSE_QUERY))
-        val nonsenseItems = if (nonsenseResponse.error == null && nonsenseResponse.statusCode in 200..399) {
-            classify(
-                extractFromBody(nonsenseResponse.body, nonsenseResponse.finalUrl, provider, extraction.effectiveConfig, hint, allowRepair = false).pairs
-            ).first
-        } else -1
-        if (nonsenseItems >= 0 && !nonsensePasses(nonsenseItems, items)) {
+        // Nonsense control, rendered the same way search will run it (a raw
+        // fetch of a JS route only sees the empty app shell, which "passes"
+        // trivially). Retried once; no page means inconclusive = fail.
+        val nonsenseUrl = buildRequest(provider, extraction.effectiveConfig, NONSENSE_QUERY).url
+        val nonsenseStart = System.currentTimeMillis()
+        var nonsenseAttempts = 1
+        var nonsenseHtml = renderPage(nonsenseUrl)
+        if (nonsenseHtml == null) {
+            nonsenseAttempts = 2
+            nonsenseHtml = renderPage(nonsenseUrl)
+        }
+        slowest = maxOf(slowest, System.currentTimeMillis() - nonsenseStart)
+        if (nonsenseHtml == null) {
             return CandidateAttempt.Failed(
-                "$label: rendered results failed the nonsense control (raw route returned $nonsenseItems items for nonsense vs $items rendered for the probe)",
+                "$label: nonsense control inconclusive: no page returned (rendering ${nonsenseUrl.take(140)} failed twice), " +
+                    "so the rendered search could not be proven",
                 gotHttpResponse = true
             )
         }
+        val nonsenseItems = classify(
+            extractFromBody(nonsenseHtml, nonsenseUrl, provider, extraction.effectiveConfig, hint, allowRepair = false).pairs
+        ).first
+        if (!nonsensePasses(nonsenseItems, items)) {
+            return CandidateAttempt.Failed(
+                "$label: rendered search ignores the query — a rendered nonsense search (\"$NONSENSE_QUERY\") returned " +
+                    "$nonsenseItems items (real search: $items), i.e. it answers nonsense with filler/popular items",
+                gotHttpResponse = true
+            )
+        }
+
+        // Live page-2 proof, rendered: the template's {page} or the rendered
+        // page's own next link.
+        val firstPageUrls = extraction.pairs.map { it.second }.toSet()
+        val page2 = proveRenderedPage2(provider, extraction.effectiveConfig, probeQuery, firstPageUrls, renderedHtml, probeUrl, hint)
+        slowest = maxOf(slowest, page2.elapsedMs)
+
         val confidence = computeConfidence(
             routeScore = 0.8f,
             items = items,
             categories = categories,
-            paginationProven = extraction.paginationProven,
-            hint = hint
+            paginationProven = page2.proven,
+            hint = hint,
+            paginationSeen = extraction.paginationProven
         )
         if (confidence.overall < MIN_AUTOSAVE_CONFIDENCE) {
             return CandidateAttempt.Failed(
@@ -491,41 +554,52 @@ class SearchConfigVerifier @Inject constructor() {
                 gotHttpResponse = true
             )
         }
-        val renderedPage2 = Page2Proof(false, extraction.effectiveConfig, null, 0,
-            "page 2 not fetched for a rendered-only route (pagination left unrecorded)", 0L)
+        val finalConfig = finalizeConfig(page2.config, extraction.pairs, page2, confidence.overall)
+            .copy(renderMode = RenderMode.RENDER)
         return CandidateAttempt.Passed(
-            config = finalizeConfig(extraction.effectiveConfig, extraction.pairs, renderedPage2, confidence.overall)
-                .copy(renderMode = RenderMode.RENDER),
+            config = finalConfig,
             verdict = ProbeVerdict(
                 sourceLabel = label,
                 probedUrl = probeUrl,
                 itemCount = items,
                 categoryCount = categories,
-                nonsenseItemCount = maxOf(nonsenseItems, 0),
+                nonsenseItemCount = nonsenseItems,
                 responseMs = slowest,
                 slowestProbeMs = slowest,
                 passed = true,
                 rendered = true,
-                paginationProven = extraction.paginationProven,
+                paginationProven = page2.proven,
                 confidence = confidence.overall,
                 confidenceDetail = confidence.detail,
                 reason = "Verified after headless rendering: $items item results, $categories category links, " +
-                    (if (nonsenseItems >= 0) "nonsense control returned $nonsenseItems"
-                    else "nonsense control inconclusive over raw HTTP") +
+                    "rendered nonsense control returned $nonsenseItems, " +
+                    (if (page2.proven) "page 2 proven live (${page2.newItems} new items)" else "pagination not proven") +
                     ", confidence ${formatScore(confidence.overall)}",
                 checks = listOf(
                     VerificationCheck("route-responds", true, "rendered $probeUrl in the headless browser"),
-                    VerificationCheck("results-parse", true, "$items item results"),
+                    VerificationCheck("results-parse", true, "$items item results for the probe \"$probeQuery\""),
                     VerificationCheck("items-outnumber-categories", true, "$items items vs $categories categories"),
-                    VerificationCheck("nonsense-control-empty", nonsenseItems >= 0,
-                        if (nonsenseItems >= 0) "raw route returned $nonsenseItems items" else "inconclusive over raw HTTP"),
-                    VerificationCheck("page-2-exists", false, renderedPage2.detail)
+                    VerificationCheck(
+                        "nonsense-control-empty", true,
+                        "rendered \"$NONSENSE_QUERY\" returned $nonsenseItems items (real search: $items)" +
+                            if (nonsenseAttempts > 1) " after a retry" else ""
+                    ),
+                    VerificationCheck("page-2-exists", page2.proven, page2.detail)
                 ),
-                fieldConfidence = confidence.fields
+                fieldConfidence = confidence.fields,
+                page2Url = page2.url,
+                page2NewItems = page2.newItems,
+                paginationRule = finalConfig.paginationRule
             ),
             repaired = extraction.repaired
         )
     }
+
+    /** Render [url] in the headless browser; null when no page came back. */
+    private suspend fun renderPage(url: String): String? = runCatching {
+        HeadlessBrowserHelper.fetchPageContent(url, RENDER_TIMEOUT_MS)
+    }.getOrElse { e -> if (e is CancellationException) throw e; null }
+        ?.takeIf { it.isNotBlank() }
 
     // ─── Confidence ───────────────────────────────────────────────────
 
@@ -1009,6 +1083,170 @@ class SearchConfigVerifier @Inject constructor() {
             failures.joinToString("; "), System.currentTimeMillis() - started)
     }
 
+    /** New item results on a page-2 body that were not on page 1. */
+    private fun newItemsOn(
+        body: String,
+        pageUrl: String,
+        provider: Provider,
+        config: ScrapingConfig,
+        hint: PaginationHint,
+        seen: Set<String>
+    ): Pair<Int, Int> {
+        val pairs = extractFromBody(body, pageUrl, provider, config, hint, allowRepair = false).pairs
+        return pairs.count { (title, url) -> url !in seen && !isCategoryPair(title, url) } to pairs.size
+    }
+
+    private fun fillLinkTemplate(template: String, query: String, page: Int): String =
+        template.replace("{query}", URLEncoder.encode(query, "UTF-8")).replace("{page}", page.toString())
+
+    /**
+     * Page 2 for a FORM (site's own form, WebView) provider. The form's result
+     * page has no {page} template, so the site's own next-page mechanism is
+     * found on that page and exercised live:
+     *  1. a next link (rel=next / page parameter / /page/N/) carrying the query —
+     *     templated and fetched raw through the transport, then rendered in the
+     *     WebView if raw shows no new items;
+     *  2. otherwise the site's own next control: the form is submitted in the
+     *     WebView and its next button/link is clicked; the WebView's page 1 must
+     *     overlap the verified page 1 (same search) and page 2 must add items.
+     * The demonstrated mechanism becomes the saved rule Load More replays:
+     * "form-link-raw:<template>", "form-link-render:<template>" or
+     * "form-click:<control descriptor>".
+     */
+    private suspend fun proveFormPage2(
+        provider: Provider,
+        config: ScrapingConfig,
+        probeQuery: String,
+        firstPage: HeadlessBrowserHelper.SearchFormPage,
+        firstPageUrls: Set<String>,
+        hint: PaginationHint
+    ): Page2Proof {
+        val started = System.currentTimeMillis()
+        val failures = mutableListOf<String>()
+        val firstBase = firstPage.finalUrl.ifBlank { provider.baseUrl }
+        val linkConfig = config.copy(postData = null)
+
+        val template = deriveTemplateFromNextLink(firstPage.html, firstBase, probeQuery)
+        if (template != null) {
+            val url = fillLinkTemplate(template, probeQuery, 2)
+            val response = HttpTransport.executeTls(
+                TlsRequest(
+                    url = url,
+                    headers = mapOf("User-Agent" to EngineUtils.DEFAULT_USER_AGENT, "Referer" to firstBase),
+                    timeoutMs = config.timeout.coerceIn(PROBE_TIMEOUT_MS, MAX_PROBE_TIMEOUT_MS)
+                )
+            )
+            if (response.error == null && response.statusCode in 200..399) {
+                val (newItems, links) = newItemsOn(response.body, response.finalUrl.ifBlank { url }, provider, linkConfig, hint, firstPageUrls)
+                if (newItems >= 1) {
+                    val rule = FORM_LINK_RAW_RULE + template
+                    return Page2Proof(true, config.copy(paginationRule = rule), url, newItems,
+                        "page 2 fetched live from the form results page's own next link (${url.take(160)}): $newItems new item results; rule form-link-raw",
+                        System.currentTimeMillis() - started)
+                }
+                failures += "next link ${url.take(140)} fetched raw: no new item results ($links links)"
+            } else {
+                failures += "next link ${url.take(140)} fetched raw failed (${response.error ?: "HTTP ${response.statusCode}"})"
+            }
+            val rendered = renderPage(url)
+            if (rendered != null) {
+                val (newItems, links) = newItemsOn(rendered, url, provider, linkConfig, hint, firstPageUrls)
+                if (newItems >= 1) {
+                    val rule = FORM_LINK_RENDER_RULE + template
+                    return Page2Proof(true, config.copy(paginationRule = rule), url, newItems,
+                        "page 2 rendered live from the form results page's own next link (${url.take(160)}): $newItems new item results; rule form-link-render",
+                        System.currentTimeMillis() - started)
+                }
+                failures += "next link rendered: no new item results ($links links)"
+            } else {
+                failures += "next link could not be rendered"
+            }
+        } else {
+            failures += "no next link carrying the query on the form's results page"
+        }
+
+        // The site's own next control, clicked in the WebView.
+        val webRun = runCatching {
+            HeadlessBrowserHelper.renderFormSearchPages(provider.baseUrl, probeQuery, nextClicks = 1, timeout = FORM_PAGINATION_TIMEOUT_MS)
+        }.getOrElse { e -> if (e is CancellationException) throw e; null }
+        when {
+            webRun == null -> { failures += "WebView unavailable for the next-control check" }
+            webRun.pages.size < 2 -> { failures += "next control: ${webRun.stopReason ?: "page 2 not reached"}" }
+            else -> {
+                val webPage1 = webRun.pages[0]
+                val webPage2 = webRun.pages[1]
+                val page1Urls = extractFromBody(webPage1.html, webPage1.url, provider, config, hint, allowRepair = false)
+                    .pairs.map { it.second }.toSet()
+                if (page1Urls.none { it in firstPageUrls }) {
+                    failures += "next control: the WebView's form submission did not reach the verified results page (no overlap with page 1)"
+                } else {
+                    val (newItems, links) = newItemsOn(webPage2.html, webPage2.url, provider, config, hint, firstPageUrls + page1Urls)
+                    val control = webRun.nextControl
+                    if (newItems >= 1 && control != null) {
+                        val rule = FORM_CLICK_RULE + control
+                        return Page2Proof(true, config.copy(paginationRule = rule), webPage2.url, newItems,
+                            "page 2 reached live by clicking the site's own next control ($control) after submitting its form in the WebView: " +
+                                "$newItems new item results; rule form-click",
+                            System.currentTimeMillis() - started)
+                    }
+                    failures += "next control ($control) clicked: no new item results ($links links)"
+                }
+            }
+        }
+        return Page2Proof(false, config.copy(paginationRule = null), null, 0,
+            "page 2 not proven for the form search: " + failures.joinToString("; "),
+            System.currentTimeMillis() - started)
+    }
+
+    /**
+     * Page 2 for a RENDER (JS route) provider: the template's own {page}, or a
+     * template derived from the rendered page's next link — rendered live in the
+     * WebView exactly as Load More will render it. The rule is the usual
+     * param:/path: rule; the {page} template carries it.
+     */
+    private suspend fun proveRenderedPage2(
+        provider: Provider,
+        config: ScrapingConfig,
+        probeQuery: String,
+        firstPageUrls: Set<String>,
+        firstHtml: String,
+        firstUrl: String,
+        hint: PaginationHint
+    ): Page2Proof {
+        val started = System.currentTimeMillis()
+        val attempts = mutableListOf<ScrapingConfig>()
+        if (config.searchUrlTemplate.contains("{page}")) attempts += config
+        if (config.postData == null) {
+            deriveTemplateFromNextLink(firstHtml, firstUrl, probeQuery)
+                ?.takeIf { it != config.searchUrlTemplate }
+                ?.let { attempts += config.copy(searchUrlTemplate = it) }
+        }
+        if (attempts.isEmpty()) {
+            return Page2Proof(false, config.copy(paginationRule = null), null, 0,
+                "no page-2 mechanism on the rendered results page (no {page} parameter and no next-page link carrying the query)",
+                System.currentTimeMillis() - started)
+        }
+        val failures = mutableListOf<String>()
+        for (candidate in attempts) {
+            val url = buildRequest(provider, candidate, probeQuery, page = candidate.paginationStart + 1).url
+            val html = renderPage(url)
+            if (html == null) {
+                failures += "page 2 ${url.take(140)} could not be rendered"
+                continue
+            }
+            val (newItems, links) = newItemsOn(html, url, provider, candidate, hint, firstPageUrls)
+            if (newItems >= 1) {
+                val rule = derivePaginationRule(candidate)
+                return Page2Proof(true, candidate.copy(paginationRule = rule), url, newItems,
+                    "page 2 rendered live (${url.take(160)}): $newItems new item results; rule ${rule ?: "template {page}"}",
+                    System.currentTimeMillis() - started)
+            }
+            failures += "page 2 ${url.take(140)} rendered with no new item results ($links links)"
+        }
+        return Page2Proof(false, config.copy(paginationRule = null), null, 0,
+            failures.joinToString("; "), System.currentTimeMillis() - started)
+    }
+
     /** Turn the live page's own next-page link into a {query}/{page} template. */
     private fun deriveTemplateFromNextLink(body: String, finalUrl: String, probeQuery: String): String? {
         val doc = runCatching { Jsoup.parse(body, finalUrl) }.getOrNull() ?: return null
@@ -1044,6 +1282,8 @@ class SearchConfigVerifier @Inject constructor() {
         val path = config.searchUrlTemplate.substringBefore('?')
         if (path.contains("{page}")) return "path:" + path.substringAfter("://").substringAfter('/', "")
             .let { "/$it" }
+        // A {page} token somewhere else in the template still drives page N.
+        if (config.searchUrlTemplate.contains("{page}") || config.postData?.contains("{page}") == true) return "template:{page}"
         return null
     }
 
@@ -1096,6 +1336,12 @@ class SearchConfigVerifier @Inject constructor() {
         private const val MIN_ITEMS = 3
         private const val MAX_REPAIR_SELECTORS = 3
         private const val MAX_RENDERED_CANDIDATES = 2
+        private const val FORM_PAGINATION_TIMEOUT_MS = 35_000
+
+        /** Pagination rules for FORM providers, replayed by Load More (ScrapingEngine). */
+        const val FORM_LINK_RAW_RULE = "form-link-raw:"
+        const val FORM_LINK_RENDER_RULE = "form-link-render:"
+        const val FORM_CLICK_RULE = "form-click:"
 
         private const val TITLE_FALLBACK_SELECTOR = "h1, h2, h3, h4, .title, .name, [class*='title'], a"
         private const val REPAIR_TITLE_SELECTOR = "a, h1, h2, h3, h4, .title, [class*='title']"
