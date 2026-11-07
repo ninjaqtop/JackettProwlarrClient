@@ -180,7 +180,13 @@ class ReconToolkit(
 
     data class CrawlResult(val pages: List<String>, val links: Set<String>, val docs: List<Document>)
 
-    fun crawl(start: Document?, maxPages: Int = MAX_CRAWL_PAGES, maxDepth: Int = 2): CrawlResult {
+    /**
+     * Katana-style bounded BFS over the site's own link graph (same host only).
+     * A crawled page that is a JavaScript app shell is re-read through the
+     * embedded WebView so JS-rendered routes and their links are mapped too
+     * (at most [MAX_RENDERED_CRAWL_PAGES] renders, each bounded, within budget).
+     */
+    suspend fun crawl(start: Document?, maxPages: Int = MAX_CRAWL_PAGES, maxDepth: Int = 2): CrawlResult {
         if (start == null) {
             record(ReconCheck("deep-crawl", "skipped", "no homepage document to start from"))
             return CrawlResult(emptyList(), emptySet(), emptyList())
@@ -190,6 +196,8 @@ class ReconToolkit(
         val docs = mutableListOf<Document>()
         var frontier = linksOf(start).also { links += it }
         var depth = 1
+        var renderedPages = 0
+        val renderedUrls = mutableListOf<String>()
         while (depth <= maxDepth && frontier.isNotEmpty() && visited.size < maxPages + 1 && timeLeft() > 3_000) {
             val next = linkedSetOf<String>()
             // Search/browse-looking pages first: they carry the forms and
@@ -203,7 +211,27 @@ class ReconToolkit(
                 if (!response.isHttpOk) continue
                 val type = response.contentType().orEmpty()
                 if (type.isNotBlank() && !type.contains("html", true)) continue
-                val doc = runCatching { Jsoup.parse(response.body, response.finalUrl.ifBlank { url }) }.getOrNull() ?: continue
+                var doc = runCatching { Jsoup.parse(response.body, response.finalUrl.ifBlank { url }) }.getOrNull() ?: continue
+                if (renderedPages < MAX_RENDERED_CRAWL_PAGES && timeLeft() > RENDERED_CRAWL_TIMEOUT_MS + 4_000 &&
+                    com.aggregatorx.app.engine.scraper.JsRenderDetector.looksJavaScriptRendered(doc)
+                ) {
+                    renderedPages++
+                    val rendered = try {
+                        kotlinx.coroutines.withTimeoutOrNull(RENDERED_CRAWL_TIMEOUT_MS + 2_000) {
+                            com.aggregatorx.app.engine.scraper.HeadlessBrowserHelper
+                                .fetchPageContent(url, RENDERED_CRAWL_TIMEOUT_MS.toInt())
+                        }
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        null
+                    }
+                    if (!rendered.isNullOrBlank()) {
+                        doc = Jsoup.parse(rendered, response.finalUrl.ifBlank { url })
+                        renderedUrls += url
+                        Log.i("ReconToolkit", "crawl FALLBACK webview-rendered JS page $url")
+                    }
+                }
                 docs += doc
                 val found = linksOf(doc)
                 links += found
@@ -214,6 +242,9 @@ class ReconToolkit(
         }
         record(ReconCheck("deep-crawl", if (docs.isEmpty()) "empty" else "ok",
             "crawled ${docs.size} same-host pages (depth <= $maxDepth, cap $maxPages), ${links.size} same-host links mapped"))
+        record(ReconCheck("js-rendered-crawl", if (renderedUrls.isEmpty()) "skipped" else "ok",
+            if (renderedUrls.isEmpty()) "no crawled page needed JavaScript rendering"
+            else "rendered ${renderedUrls.size} JavaScript-only pages in the WebView: ${renderedUrls.take(3).joinToString()}"))
         return CrawlResult(visited.drop(1), links, docs)
     }
 
@@ -398,6 +429,8 @@ class ReconToolkit(
         private const val TAG = "ReconToolkit"
         private const val MIN_GAP_MS = 150L
         private const val MAX_CRAWL_PAGES = 20
+        private const val MAX_RENDERED_CRAWL_PAGES = 3
+        private const val RENDERED_CRAWL_TIMEOUT_MS = 10_000L
         private const val CRAWL_TIMEOUT_MS = 6_000
         private const val ARCHIVE_TIMEOUT_MS = 8_000
         private const val ARCHIVE_LIMIT = 600

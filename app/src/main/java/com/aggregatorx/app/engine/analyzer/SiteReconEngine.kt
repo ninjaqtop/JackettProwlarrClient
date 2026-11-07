@@ -208,8 +208,13 @@ class SiteReconEngine @Inject constructor(
 
         // ── 2b. Heavy recon: fingerprint, deep crawl, scripts, params ──
         val tech = runCatching { toolkit.fingerprint(homeResponse, homepageDoc) }.getOrDefault(emptyList())
-        val crawl = runCatching { toolkit.crawl(homepageDoc) }
-            .getOrDefault(ReconToolkit.CrawlResult(emptyList(), emptySet(), emptyList()))
+        val crawl = try {
+            toolkit.crawl(homepageDoc)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            ReconToolkit.CrawlResult(emptyList(), emptySet(), emptyList())
+        }
         urls += crawl.links
         val scripts = runCatching { toolkit.scriptTexts(homepageDoc) }.getOrDefault(emptyList())
         val jsEndpoints = runCatching { toolkit.mineJsEndpoints(scripts) }.getOrDefault(emptyList())
