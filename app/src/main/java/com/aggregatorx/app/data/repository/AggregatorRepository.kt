@@ -51,7 +51,7 @@ class AggregatorRepository @Inject constructor(
     private companion object {
         const val TAG = "AggregatorRepository"
         const val PROVIDER_ANALYSIS_TIMEOUT_MS = 60_000L
-        const val RECON_TIMEOUT_MS = 45_000L
+        const val RECON_TIMEOUT_MS = 95_000L
     }
 
     fun clearSearchCache() {
@@ -285,7 +285,7 @@ class AggregatorRepository @Inject constructor(
         // gets re-mapped, not just re-trusted.
         val recon = withTimeoutOrNull(RECON_TIMEOUT_MS) {
             try {
-                siteReconEngine.mapSite(provider.baseUrl, analysis.rawHtml)
+                siteReconEngine.mapSite(provider.baseUrl, analysis.rawHtml, provider.id)
             } catch (e: CancellationException) {
                 // The 20 s budget's own timeout is converted to null by
                 // withTimeoutOrNull as before; an outer cancellation
@@ -378,15 +378,22 @@ class AggregatorRepository @Inject constructor(
             addCandidate(
                 config = scrapingConfigForCandidate(provider, analysis, candidate, configTimeout),
                 label = when (candidate.source) {
+                    CandidateSource.LIVE_CAPTURE -> "Live capture of the site's own search"
+                    CandidateSource.INDEXER_DEFINITION -> "Indexer definition (Jackett/Prowlarr)"
                     CandidateSource.FORM -> "Site search form"
                     CandidateSource.OPENSEARCH -> "OpenSearch template"
                     CandidateSource.SITEMAP_DERIVED -> "Sitemap-derived route"
                     CandidateSource.DISCOVERED_ENDPOINT -> "Discovered endpoint"
                     CandidateSource.JSON_API -> "JSON API endpoint"
+                    CandidateSource.HOSTED_SEARCH -> "Hosted search service"
                     CandidateSource.EMBEDDED_STATE -> "Embedded state endpoint"
+                    CandidateSource.STACK_SIGNATURE -> "Stack signature route (verified live)"
                     CandidateSource.WORDLIST -> "Wordlist route (verified live)"
+                    CandidateSource.ACTIVE_PARAM -> "Query parameter proved by active probing"
+                    CandidateSource.ARCHIVE -> "Archived search URL"
                 } + if (candidate.isJson) " (JSON)" else "",
-                isFormRoute = candidate.source == CandidateSource.FORM
+                isFormRoute = candidate.source == CandidateSource.FORM ||
+                    (candidate.source == CandidateSource.LIVE_CAPTURE && candidate.postData != null)
             )
         }
 
@@ -496,6 +503,9 @@ class AggregatorRepository @Inject constructor(
                 postData = candidate.postData,
                 timeout = timeoutMs,
                 method = if (candidate.postData != null) "POST" else "GET",
+                headers = candidateHeadersJson(candidate),
+                cookies = candidateCookiesJson(candidate),
+                queryParam = candidate.queryParam,
                 isJson = true,
                 jsonResultPath = candidate.jsonResultPath,
                 jsonTitleField = candidate.jsonTitleField,
@@ -506,19 +516,47 @@ class AggregatorRepository @Inject constructor(
             ScrapingConfig(
                 providerId = provider.id,
                 searchUrlTemplate = candidate.urlTemplate,
-                resultSelector = analysis.resultItemSelector?.takeIf { it.isNotBlank() }
+                // A matched indexer definition supplies the real row and
+                // field selectors; otherwise the Analyzer's, then broad
+                // fallbacks the live verifier repairs from the results page.
+                resultSelector = candidate.rowsSelector?.takeIf { it.isNotBlank() }
+                    ?: analysis.resultItemSelector?.takeIf { it.isNotBlank() }
                     ?: "article, .result, .item, .card, .post, .entry, li",
-                titleSelector = analysis.titleSelector?.takeIf { it.isNotBlank() }
+                titleSelector = candidate.definitionTitleSelector?.takeIf { it.isNotBlank() }
+                    ?: analysis.titleSelector?.takeIf { it.isNotBlank() }
                     ?: "a, h1, h2, h3, h4, .title, [class*='title']",
-                urlSelector = "a[href]",
+                urlSelector = candidate.definitionLinkSelector?.takeIf { it.isNotBlank() } ?: "a[href]",
                 descriptionSelector = analysis.descriptionSelector,
                 thumbnailSelector = analysis.thumbnailSelector,
                 dateSelector = analysis.dateSelector,
                 ratingSelector = analysis.ratingSelector,
                 postData = candidate.postData,
-                timeout = timeoutMs
+                timeout = timeoutMs,
+                headers = candidateHeadersJson(candidate),
+                cookies = candidateCookiesJson(candidate),
+                queryParam = candidate.queryParam,
+                method = if (candidate.postData != null) "POST" else "GET"
             )
         }
+    }
+
+    /** Headers a captured/defined route needs, as the config's JSON column. */
+    private fun candidateHeadersJson(candidate: SearchCandidate): String =
+        if (candidate.headers.isEmpty()) "{}"
+        else buildJsonObject {
+            candidate.headers.forEach { (k, v) -> put(k, JsonPrimitive(v)) }
+        }.toString()
+
+    /** Cookies the site held when the route was observed working. */
+    private fun candidateCookiesJson(candidate: SearchCandidate): String {
+        val cookie = candidate.cookie?.takeIf { it.isNotBlank() } ?: return "{}"
+        val pairs = cookie.split(';').mapNotNull { part ->
+            val trimmed = part.trim()
+            val name = trimmed.substringBefore('=')
+            if (name.isBlank() || !trimmed.contains('=')) null else name to trimmed.substringAfter('=')
+        }
+        if (pairs.isEmpty()) return "{}"
+        return buildJsonObject { pairs.forEach { (k, v) -> put(k, JsonPrimitive(v)) } }.toString()
     }
 
     /**
